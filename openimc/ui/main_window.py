@@ -1100,7 +1100,9 @@ class MainWindow(QtWidgets.QMainWindow):
             self,
             "About OpenIMC",
             "OpenIMC © 2025 University of Southern California — Licensed under GPL v3 or later\n\n"
-            "NO WARRANTY. See LICENSE for details."
+            "NO WARRANTY. See LICENSE for details.\n\n"
+            "Source code: <a href='https://github.com/dean-tessone/OpenIMC'>https://github.com/dean-tessone/OpenIMC</a>\n\n"
+            "Documentation: <a href='https://dean-tessone.github.io/OpenIMC/index.html'>https://dean-tessone.github.io/OpenIMC/index.html</a>"
         )
     
     # ---------- Display settings ----------

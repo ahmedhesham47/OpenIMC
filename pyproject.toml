@@ -8,7 +8,7 @@ version = "0.1.0"
 description = "OpenIMC - Open-source Imaging Mass Cytometry analysis platform"
 readme = "README.md"
 requires-python = ">=3.8"
-license = {text = "See LICENSE file"}
+license = "GPL-3.0-or-later"
 authors = [
     {name = "OpenIMC Contributors"}
 ]
@@ -65,7 +65,13 @@ cellsam = [
 ]
 
 [project.scripts]
-openimc = "openimc.cli:main"
+openimc-gui = "openimc.__main__:run_gui"
+openimc = "openimc.__main__:cli"
+
+# Setuptools configuration
+[tool.setuptools.packages.find]
+include = ["openimc*"]
+exclude = ["tests*", "docs*", "examples*", "scripts*", "third_party*", "logs*"]
 
 # Pytest configuration
 [tool.pytest.ini_options]

@@ -18,10 +18,73 @@
 # along with this program.  If not, see <https://www.gnu.org/licenses/>.
 
 """
-Entry point for running OpenIMC CLI as a module: python -m openimc
+Entry point for running OpenIMC CLI and GUI as a module: python -m openimc
 """
 from openimc.cli import main
 
-if __name__ == '__main__':
+
+def run_gui():
+    """Run the OpenIMC GUI application."""
+    import sys
+    import os
+    import platform
+
+    # CRITICAL: Configure dask BEFORE any imports that might trigger dask.dataframe
+    # This must be done at the very start of the application
+    os.environ.setdefault('DASK_DATAFRAME__QUERY_PLANNING', 'False')
+
+    # Suppress warnings from dependencies
+    import warnings
+    # Suppress dask dataframe legacy implementation warning
+    warnings.filterwarnings('ignore', category=FutureWarning, message='.*legacy.*Dask DataFrame.*')
+    # Suppress xarray_schema pkg_resources deprecation warning
+    warnings.filterwarnings('ignore', category=UserWarning, message='.*pkg_resources.*deprecated.*')
+    # Suppress squidpy anndata __version__ deprecation warning
+    warnings.filterwarnings('ignore', category=FutureWarning, message='.*__version__.*deprecated.*')
+
+    try:
+        import dask
+        dask.config.set({'dataframe.query-planning': False})
+    except (ImportError, AttributeError):
+        pass
+
+    from PyQt5 import QtWidgets, QtGui
+
+    app = QtWidgets.QApplication(sys.argv)
+
+    # Load font size preference or use default
+    from openimc.ui.dialogs.display_settings_dialog import (
+        get_font_size_preference,
+        get_default_font_size
+    )
+    
+    saved_font_size = get_font_size_preference()
+    default_font_size = get_default_font_size()
+    font_size = saved_font_size if saved_font_size is not None else default_font_size
+    
+    # Set consistent font size across all windows for readability on small and large screens
+    # Use pixel size for better cross-platform consistency, especially on Windows
+    font = QtGui.QFont()
+    if platform.system() == 'Windows':
+        font.setPixelSize(font_size)  # Pixel size for Windows
+    else:
+        font.setPointSize(font_size)  # Point size for Mac/Linux
+    app.setFont(font)
+
+    # Import modular MainWindow wrapper
+    from openimc.ui.main_window import MainWindow  # type: ignore
+
+    win = MainWindow()
+    win.show()
+
+    sys.exit(app.exec_())
+
+
+def cli():
+    """Run the OpenIMC CLI application."""
     main()
+
+
+if __name__ == '__main__':
+    cli()
 
