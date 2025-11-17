@@ -5050,7 +5050,11 @@ class ClusterExplorerDialog(QtWidgets.QDialog):
                     break
                 
                 # Get cell data
-                cell_data = self.feature_dataframe.iloc[cell_idx]
+                # cell_idx is an index label, not an integer position, so use loc instead of iloc
+                if cell_idx not in self.feature_dataframe.index:
+                    print(f"Warning: Cell index {cell_idx} not found in feature dataframe, skipping")
+                    continue
+                cell_data = self.feature_dataframe.loc[cell_idx]
                 acq_id = cell_data['acquisition_id']
                 
                 # Get mask and image

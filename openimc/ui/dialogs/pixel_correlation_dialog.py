@@ -1181,7 +1181,7 @@ class PixelCorrelationDialog(QtWidgets.QDialog):
             
             # Use ProcessPoolExecutor for true parallelization
             # Use spawn method to ensure isolation
-            num_workers = min(mp.cpu_count(), total_tasks)
+            num_workers = max(1, min(mp.cpu_count() - 2, total_tasks))
             if num_workers > 1 and total_tasks > 1:
                 ctx = mp.get_context('spawn')
                 with ctx.Pool(processes=num_workers) as pool:

@@ -57,6 +57,7 @@ Examples:
 """
 import argparse
 import json
+import multiprocessing as mp
 import os
 import sys
 from pathlib import Path
@@ -117,6 +118,20 @@ try:
     _HAVE_CELLSAM = True
 except (ImportError, OSError):
     _HAVE_CELLSAM = False
+
+
+# Helper function to get default number of workers
+def get_default_workers():
+    """Get default number of workers (max_workers - 2, minimum 1)."""
+    return max(1, mp.cpu_count() - 2)
+
+
+# Helper function to normalize workers argument
+def normalize_workers(workers):
+    """Normalize workers argument: if None, return default (max_workers - 2)."""
+    if workers is None:
+        return get_default_workers()
+    return max(1, workers)
 
 
 # Wrapper functions for backward compatibility
@@ -2165,6 +2180,7 @@ Examples:
     preprocess_parser.add_argument('--denoise-n-sd', type=float, default=5.0, help='Number of standard deviations for n_sd_local_median method only (ignored for median3, default: 5.0)')
     preprocess_parser.add_argument('--denoise-settings', type=str, help='JSON file or string with denoise settings per channel (can be combined with --denoise to override specific channels)')
     preprocess_parser.add_argument('--channel-format', choices=['CHW', 'HWC'], default='CHW', help='Channel format for OME-TIFF files (default: CHW)')
+    preprocess_parser.add_argument('--workers', type=int, default=None, help=f'Number of parallel workers (default: {get_default_workers()})')
     preprocess_parser.set_defaults(func=preprocess_command)
     
     # Segment command
@@ -2200,6 +2216,7 @@ Examples:
     segment_parser.add_argument('--denoise-method', choices=['median3', 'n_sd_local_median'], default='median3', help='Hot pixel removal method: median3 (3x3 median filter) or n_sd_local_median (replace pixels above N SD over local median, default: median3)')
     segment_parser.add_argument('--denoise-n-sd', type=float, default=5.0, help='Number of standard deviations for n_sd_local_median method only (ignored for median3, default: 5.0)')
     segment_parser.add_argument('--denoise-settings', type=str, help='JSON file or string with denoise settings per channel (can be combined with --denoise to override specific channels)')
+    segment_parser.add_argument('--workers', type=int, default=None, help=f'Number of parallel workers (default: {get_default_workers()})')
     segment_parser.set_defaults(func=segment_command)
     
     # Extract features command
@@ -2217,6 +2234,7 @@ Examples:
     extract_parser.add_argument('--denoise-method', choices=['median3', 'n_sd_local_median'], default='median3', help='Hot pixel removal method: median3 (3x3 median filter) or n_sd_local_median (replace pixels above N SD over local median, default: median3)')
     extract_parser.add_argument('--denoise-n-sd', type=float, default=5.0, help='Number of standard deviations for n_sd_local_median method only (ignored for median3, default: 5.0)')
     extract_parser.add_argument('--denoise-settings', type=str, help='JSON file or string with denoise settings per channel (can be combined with --denoise to override specific channels)')
+    extract_parser.add_argument('--workers', type=int, default=None, help=f'Number of parallel workers (default: {get_default_workers()})')
     extract_parser.set_defaults(func=extract_features_command)
     
     # Cluster command
@@ -2237,6 +2255,7 @@ Examples:
     cluster_parser.add_argument('--cluster-selection-method', choices=['eom', 'leaf'], default='eom', help='Cluster selection method for HDBSCAN (default: eom)')
     cluster_parser.add_argument('--hdbscan-metric', choices=['euclidean', 'manhattan'], default='euclidean', help='Distance metric for HDBSCAN (default: euclidean)')
     cluster_parser.add_argument('--seed', type=int, default=42, help='Random seed for reproducibility (default: 42)')
+    cluster_parser.add_argument('--workers', type=int, default=None, help=f'Number of parallel workers (default: {get_default_workers()})')
     cluster_parser.set_defaults(func=cluster_command)
     
     # Spatial command
@@ -2249,6 +2268,7 @@ Examples:
     spatial_parser.add_argument('--pixel-size-um', type=float, default=1.0, help='Pixel size in micrometers (default: 1.0, used for distance_um conversion)')
     spatial_parser.add_argument('--detect-communities', action='store_true', help='Also detect spatial communities')
     spatial_parser.add_argument('--seed', type=int, default=42, help='Random seed for reproducibility (default: 42)')
+    spatial_parser.add_argument('--workers', type=int, default=None, help=f'Number of parallel workers (default: {get_default_workers()})')
     spatial_parser.set_defaults(func=spatial_command)
     
     # Spatial AnnData command (build graph)
@@ -2263,6 +2283,7 @@ Examples:
     spatial_anndata_parser.add_argument('--roi-id', type=str, help='Specific ROI ID to process (processes all if not specified)')
     spatial_anndata_parser.add_argument('--seed', type=int, default=42, help='Random seed for reproducibility (default: 42)')
     spatial_anndata_parser.add_argument('--combined', action='store_true', help='Export as single combined file (default: separate files per ROI)')
+    spatial_anndata_parser.add_argument('--workers', type=int, default=None, help=f'Number of parallel workers (default: {get_default_workers()})')
     spatial_anndata_parser.set_defaults(func=spatial_anndata_command)
     
     # Spatial neighborhood enrichment command
@@ -2279,6 +2300,7 @@ Examples:
     nhood_parser.add_argument('--aggregation', choices=['mean', 'sum'], default='mean', help='Aggregation method for multiple ROIs (default: mean)')
     nhood_parser.add_argument('--seed', type=int, default=42, help='Random seed for reproducibility (default: 42)')
     nhood_parser.add_argument('--combined', action='store_true', help='Export as single combined file (default: separate files per ROI)')
+    nhood_parser.add_argument('--workers', type=int, default=None, help=f'Number of parallel workers (default: {get_default_workers()})')
     nhood_parser.set_defaults(func=spatial_nhood_enrichment_command)
     
     # Spatial co-occurrence command
@@ -2296,6 +2318,7 @@ Examples:
     cooccur_parser.add_argument('--reference-cluster', type=str, help='Optional reference cluster for co-occurrence')
     cooccur_parser.add_argument('--seed', type=int, default=42, help='Random seed for reproducibility (default: 42)')
     cooccur_parser.add_argument('--combined', action='store_true', help='Export as single combined file (default: separate files per ROI)')
+    cooccur_parser.add_argument('--workers', type=int, default=None, help=f'Number of parallel workers (default: {get_default_workers()})')
     cooccur_parser.set_defaults(func=spatial_cooccurrence_command)
     
     # Spatial autocorrelation command
@@ -2312,6 +2335,7 @@ Examples:
     autocorr_parser.add_argument('--aggregation', choices=['mean', 'sum'], default='mean', help='Aggregation method for multiple ROIs (default: mean)')
     autocorr_parser.add_argument('--seed', type=int, default=42, help='Random seed for reproducibility (default: 42)')
     autocorr_parser.add_argument('--combined', action='store_true', help='Export as single combined file (default: separate files per ROI)')
+    autocorr_parser.add_argument('--workers', type=int, default=None, help=f'Number of parallel workers (default: {get_default_workers()})')
     autocorr_parser.set_defaults(func=spatial_autocorr_command)
     
     # Spatial Ripley command
@@ -2329,6 +2353,7 @@ Examples:
     ripley_parser.add_argument('--max-dist', type=float, default=50.0, help='Maximum distance in micrometers (default: 50.0)')
     ripley_parser.add_argument('--seed', type=int, default=42, help='Random seed for reproducibility (default: 42)')
     ripley_parser.add_argument('--combined', action='store_true', help='Export as single combined file (default: separate files per ROI)')
+    ripley_parser.add_argument('--workers', type=int, default=None, help=f'Number of parallel workers (default: {get_default_workers()})')
     ripley_parser.set_defaults(func=spatial_ripley_command)
     
     # Export AnnData command
@@ -2336,6 +2361,7 @@ Examples:
     export_anndata_parser.add_argument('input', help='Input H5AD file or directory containing H5AD files')
     export_anndata_parser.add_argument('output', help='Output H5AD file (if combined) or directory (if separate)')
     export_anndata_parser.add_argument('--combined', action='store_true', help='Export as single combined file (default: separate files per ROI)')
+    export_anndata_parser.add_argument('--workers', type=int, default=None, help=f'Number of parallel workers (default: {get_default_workers()})')
     export_anndata_parser.set_defaults(func=export_anndata_command)
     
     # Batch correction command
@@ -2352,6 +2378,7 @@ Examples:
     batch_parser.add_argument('--lambda-reg', type=float, default=1.0, help='Regularization parameter for Harmony (default: 1.0)')
     batch_parser.add_argument('--max-iter', type=int, default=10, help='Maximum iterations for Harmony (default: 10)')
     batch_parser.add_argument('--pca-variance', type=float, default=0.9, help='Proportion of variance to retain in PCA for Harmony (default: 0.9)')
+    batch_parser.add_argument('--workers', type=int, default=None, help=f'Number of parallel workers (default: {get_default_workers()})')
     batch_parser.set_defaults(func=batch_correction_command)
     
     # Pixel correlation command
@@ -2363,6 +2390,7 @@ Examples:
     pixel_corr_parser.add_argument('--channels', type=str, help='Comma-separated list of channels to analyze (uses all if not specified)')
     pixel_corr_parser.add_argument('--mask', type=str, help='Path to segmentation mask file (optional, for within-cell analysis)')
     pixel_corr_parser.add_argument('--multiple-testing-correction', type=str, choices=['bonferroni', 'fdr_bh', 'fdr_by'], help='Multiple testing correction method')
+    pixel_corr_parser.add_argument('--workers', type=int, default=None, help=f'Number of parallel workers (default: {get_default_workers()})')
     pixel_corr_parser.set_defaults(func=pixel_correlation_command)
     
     # QC analysis command
@@ -2374,6 +2402,7 @@ Examples:
     qc_parser.add_argument('--channels', type=str, help='Comma-separated list of channels to analyze (uses all if not specified)')
     qc_parser.add_argument('--mode', choices=['pixel', 'cell'], default='pixel', help='Analysis mode (default: pixel)')
     qc_parser.add_argument('--mask', type=str, help='Path to segmentation mask file (required for cell mode)')
+    qc_parser.add_argument('--workers', type=int, default=None, help=f'Number of parallel workers (default: {get_default_workers()})')
     qc_parser.set_defaults(func=qc_analysis_command)
     
     # Spillover correction command
@@ -2383,6 +2412,7 @@ Examples:
     spillover_parser.add_argument('output', help='Output CSV file with corrected features')
     spillover_parser.add_argument('--method', choices=['nnls', 'pgd'], default='pgd', help='Compensation method (default: pgd)')
     spillover_parser.add_argument('--arcsinh-cofactor', type=float, help='Optional cofactor for arcsinh transformation')
+    spillover_parser.add_argument('--workers', type=int, default=None, help=f'Number of parallel workers (default: {get_default_workers()})')
     spillover_parser.set_defaults(func=spillover_correction_command)
     
     # Generate spillover matrix command
@@ -2392,6 +2422,7 @@ Examples:
     spillover_gen_parser.add_argument('--donor-map', type=str, help='JSON file or string mapping acquisition IDs to donor channel names')
     spillover_gen_parser.add_argument('--cap', type=float, default=0.3, help='Maximum spillover coefficient (default: 0.3)')
     spillover_gen_parser.add_argument('--aggregate', choices=['median', 'mean'], default='median', help='Aggregation method (default: median)')
+    spillover_gen_parser.add_argument('--workers', type=int, default=None, help=f'Number of parallel workers (default: {get_default_workers()})')
     spillover_gen_parser.set_defaults(func=generate_spillover_matrix_command)
     
     # Deconvolution command
@@ -2403,6 +2434,7 @@ Examples:
     deconv_parser.add_argument('--x0', type=float, default=7.0, help='Parameter for kernel calculation (default: 7.0)')
     deconv_parser.add_argument('--iterations', type=int, default=4, help='Number of Richardson-Lucy iterations (default: 4)')
     deconv_parser.add_argument('--output-format', choices=['float', 'uint16'], default='float', help='Output format (default: float)')
+    deconv_parser.add_argument('--workers', type=int, default=None, help=f'Number of parallel workers (default: {get_default_workers()})')
     deconv_parser.set_defaults(func=deconvolution_command)
     
     # Spatial enrichment command
@@ -2414,6 +2446,7 @@ Examples:
     enrichment_parser.add_argument('--n-permutations', type=int, default=100, help='Number of permutations for null distribution (default: 100)')
     enrichment_parser.add_argument('--roi-column', type=str, help='Column name for ROI grouping (auto-detected if not specified)')
     enrichment_parser.add_argument('--seed', type=int, default=42, help='Random seed for reproducibility (default: 42)')
+    enrichment_parser.add_argument('--workers', type=int, default=None, help=f'Number of parallel workers (default: {get_default_workers()})')
     enrichment_parser.set_defaults(func=spatial_enrichment_command)
     
     # Spatial distance command
@@ -2423,6 +2456,7 @@ Examples:
     distance_parser.add_argument('output', help='Output CSV file with distance distribution results')
     distance_parser.add_argument('--cluster-column', type=str, default='cluster', help='Column name containing cluster labels (default: cluster)')
     distance_parser.add_argument('--roi-column', type=str, help='Column name for ROI grouping (auto-detected if not specified)')
+    distance_parser.add_argument('--workers', type=int, default=None, help=f'Number of parallel workers (default: {get_default_workers()})')
     distance_parser.set_defaults(func=spatial_distance_command)
     
     # Cluster figures command
@@ -2434,6 +2468,7 @@ Examples:
     cluster_figures_parser.add_argument('--width', type=float, default=8.0, help='Figure width in inches (default: 8.0)')
     cluster_figures_parser.add_argument('--height', type=float, default=6.0, help='Figure height in inches (default: 6.0)')
     cluster_figures_parser.add_argument('--seed', type=int, default=42, help='Random seed for UMAP reproducibility (default: 42)')
+    cluster_figures_parser.add_argument('--workers', type=int, default=None, help=f'Number of parallel workers (default: {get_default_workers()})')
     cluster_figures_parser.set_defaults(func=cluster_figures_command)
     
     # Spatial figures command
@@ -2445,11 +2480,13 @@ Examples:
     spatial_figures_parser.add_argument('--font-size', type=float, default=10.0, help='Font size in points (default: 10.0)')
     spatial_figures_parser.add_argument('--width', type=float, default=8.0, help='Figure width in inches (default: 8.0)')
     spatial_figures_parser.add_argument('--height', type=float, default=6.0, help='Figure height in inches (default: 6.0)')
+    spatial_figures_parser.add_argument('--workers', type=int, default=None, help=f'Number of parallel workers (default: {get_default_workers()})')
     spatial_figures_parser.set_defaults(func=spatial_figures_command)
     
     # Workflow command
     workflow_parser = subparsers.add_parser('workflow', help='Execute a complete workflow from a YAML configuration file')
     workflow_parser.add_argument('config', help='Path to YAML configuration file')
+    workflow_parser.add_argument('--workers', type=int, default=None, help=f'Number of parallel workers (default: {get_default_workers()})')
     workflow_parser.set_defaults(func=workflow_command)
     
     # Parse arguments

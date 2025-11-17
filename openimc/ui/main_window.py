@@ -3927,7 +3927,7 @@ class MainWindow(QtWidgets.QMainWindow):
         
         # Use multiprocessing for custom denoising and normalization
         channel_data = []
-        max_workers = min(mp.cpu_count(), len(all_channels))
+        max_workers = max(1, min(mp.cpu_count() - 2, len(all_channels)))
         
         try:
             with mp.Pool(processes=max_workers) as pool:
@@ -4122,7 +4122,7 @@ class MainWindow(QtWidgets.QMainWindow):
             
             # Use multiprocessing for custom denoising and normalization
             channel_data = []
-            max_workers = min(mp.cpu_count(), len(all_channels))
+            max_workers = max(1, min(mp.cpu_count() - 2, len(all_channels)))
             
             try:
                 with mp.Pool(processes=max_workers) as pool:
@@ -5881,7 +5881,7 @@ class MainWindow(QtWidgets.QMainWindow):
             return None
         
         # Use multiprocessing for parallel loading and preprocessing
-        max_workers = min(mp.cpu_count(), len(mp_args))
+        max_workers = max(1, min(mp.cpu_count() - 2, len(mp_args)))
         
         batch_images = []
         batch_channels = []
@@ -7093,7 +7093,7 @@ class MainWindow(QtWidgets.QMainWindow):
                 return
             
             # Use multiprocessing for parallel loading and feature extraction
-            max_workers = min(mp.cpu_count(), len(mp_args))
+            max_workers = max(1, min(mp.cpu_count() - 2, len(mp_args)))
             progress_dlg.update_progress(0, "Starting parallel loading and extraction", f"Using {max_workers} CPU cores")
             
             all_features = []

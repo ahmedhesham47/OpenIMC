@@ -372,7 +372,7 @@ class QCAnalysisDialog(QtWidgets.QDialog):
         self.workers_spin = QtWidgets.QSpinBox()
         self.workers_spin.setMinimum(1)
         self.workers_spin.setMaximum(mp.cpu_count())
-        self.workers_spin.setValue(mp.cpu_count())  # Default to max CPUs
+        self.workers_spin.setValue(max(1, mp.cpu_count() - 2))  # Default to max CPUs - 2
         workers_layout.addWidget(self.workers_spin)
         workers_layout.addStretch()
         options_layout.addLayout(workers_layout)

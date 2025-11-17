@@ -1,5 +1,7 @@
 # OpenIMC
 
+![OpenIMC Logo](docs/source/_static/images/OpenIMC_Logo.png)
+
 OpenIMC is a comprehensive, open-source PyQt5-based platform for analyzing Imaging Mass Cytometry (IMC) data. It provides an intuitive graphical interface for visualizing, processing, and analyzing multi-channel imaging data from mass cytometry experiments with advanced machine learning capabilities.
 
 ## Documentation
