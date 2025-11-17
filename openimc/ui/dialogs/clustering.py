@@ -20,11 +20,12 @@
 from typing import List
 import os
 import pandas as pd
+import multiprocessing as mp
 
 import numpy as np
 import matplotlib.pyplot as plt
 from matplotlib.lines import Line2D
-from PyQt5 import QtWidgets
+from PyQt5 import QtWidgets, QtCore
 from matplotlib.figure import Figure
 from matplotlib.backends.backend_qt5agg import FigureCanvasQTAgg as FigureCanvas
 from scipy.cluster.hierarchy import dendrogram, linkage, fcluster
@@ -599,6 +600,20 @@ class CellClusteringDialog(QtWidgets.QDialog):
         self.annotate_btn.setEnabled(False)
         phenotype_layout.addWidget(self.annotate_btn)
         
+        # Merge clusters button
+        self.merge_clusters_btn = QtWidgets.QPushButton("Merge Clusters")
+        self.merge_clusters_btn.clicked.connect(self._open_merge_clusters_dialog)
+        self.merge_clusters_btn.setEnabled(False)
+        self.merge_clusters_btn.setToolTip("Merge two clusters into one")
+        phenotype_layout.addWidget(self.merge_clusters_btn)
+        
+        # Drop clusters button
+        self.drop_clusters_btn = QtWidgets.QPushButton("Drop Clusters")
+        self.drop_clusters_btn.clicked.connect(self._open_drop_clusters_dialog)
+        self.drop_clusters_btn.setEnabled(False)
+        self.drop_clusters_btn.setToolTip("Remove clusters (mark as noise/unassigned)")
+        phenotype_layout.addWidget(self.drop_clusters_btn)
+        
         # Patient annotation button (also in phenotype section for consistency)
         self.patient_annotate_btn2 = QtWidgets.QPushButton("Customize Patient Labels...")
         self.patient_annotate_btn2.setToolTip("Customize labels for patient/source file annotation")
@@ -863,6 +878,8 @@ class CellClusteringDialog(QtWidgets.QDialog):
             # Enable buttons
             self.explore_btn.setEnabled(True)
             self.annotate_btn.setEnabled(True)
+            self.merge_clusters_btn.setEnabled(True)
+            self.drop_clusters_btn.setEnabled(True)
             self.save_plot_btn.setEnabled(True)
             self.save_output_btn.setEnabled(True)
             # Enable patient annotation buttons if source_file data is available
@@ -1995,6 +2012,9 @@ class CellClusteringDialog(QtWidgets.QDialog):
         # Use unscaled data if available, otherwise use clustered_data
         base_data = self.clustered_data_unscaled if self.clustered_data_unscaled is not None else self.clustered_data
         
+        # Filter out dropped clusters (cluster 0)
+        base_data = base_data[base_data['cluster'] != 0].copy()
+        
         # Determine source and prepare data ordering and optional grouping
         source = self.heatmap_source_combo.currentText() if hasattr(self, 'heatmap_source_combo') else 'Clusters'
         data_to_plot = base_data.copy()
@@ -2351,6 +2371,12 @@ class CellClusteringDialog(QtWidgets.QDialog):
                 cluster_labels = cluster_labels_series.reindex(self.tsne_index).values
             else:
                 cluster_labels = self.clustered_data['cluster'].values
+            
+            # Filter out dropped clusters (cluster 0)
+            valid_mask = cluster_labels != 0
+            cluster_labels = cluster_labels[valid_mask]
+            tsne_embedding_filtered = self.tsne_embedding[valid_mask]
+            
             unique_clusters = sorted(np.unique(cluster_labels))
             colors = _get_vivid_colors(len(unique_clusters))
             cluster_color_map = {cluster_id: colors[i] for i, cluster_id in enumerate(unique_clusters)}
@@ -2358,7 +2384,7 @@ class CellClusteringDialog(QtWidgets.QDialog):
             labels = []
             for cluster_id in unique_clusters:
                 mask = cluster_labels == cluster_id
-                sc = ax.scatter(self.tsne_embedding[mask, 0], self.tsne_embedding[mask, 1],
+                sc = ax.scatter(tsne_embedding_filtered[mask, 0], tsne_embedding_filtered[mask, 1],
                                 c=[cluster_color_map[cluster_id]],
                                 alpha=point_alpha, s=point_size, edgecolors='none')
                 # Create custom legend handle with fixed size (18)
@@ -2378,12 +2404,21 @@ class CellClusteringDialog(QtWidgets.QDialog):
             ncol = max(1, (n_clusters + 9) // 10) if n_clusters > 10 else 1
             ax.legend(handles, labels, loc='best', frameon=True, fontsize=8, ncol=ncol)
         elif color_by == 'Source File' and 'source_file' in self.feature_dataframe.columns:
+            # Filter out dropped clusters (cluster 0) for source file coloring
+            if hasattr(self, 'tsne_index') and self.tsne_index is not None:
+                cluster_labels_series = self.clustered_data['cluster']
+                cluster_labels = cluster_labels_series.reindex(self.tsne_index).values
+            else:
+                cluster_labels = self.clustered_data['cluster'].values
+            valid_mask = cluster_labels != 0
+            tsne_embedding_filtered = self.tsne_embedding[valid_mask]
+            
             # Color by source file to visualize batch effects (using custom patient labels)
             if hasattr(self, 'tsne_index') and self.tsne_index is not None:
                 source_file_series = self.feature_dataframe.loc[self.tsne_index, 'source_file']
-                source_files = source_file_series.values
+                source_files = source_file_series.values[valid_mask]
             else:
-                source_files = self.feature_dataframe['source_file'].values
+                source_files = self.feature_dataframe['source_file'].values[valid_mask]
             unique_files = sorted([f for f in np.unique(source_files) if pd.notna(f)])
             if len(unique_files) > 0:
                 colors = plt.cm.tab20(np.linspace(0, 1, len(unique_files)))
@@ -2393,7 +2428,7 @@ class CellClusteringDialog(QtWidgets.QDialog):
                 for file_name in unique_files:
                     mask = source_files == file_name
                     if np.any(mask):  # Only add if there are points for this file
-                        sc = ax.scatter(self.tsne_embedding[mask, 0], self.tsne_embedding[mask, 1],
+                        sc = ax.scatter(tsne_embedding_filtered[mask, 0], tsne_embedding_filtered[mask, 1],
                                         c=[file_color_map[file_name]],
                                         alpha=point_alpha, s=point_size, edgecolors='none')
                         # Create custom legend handle with fixed size
@@ -2415,14 +2450,23 @@ class CellClusteringDialog(QtWidgets.QDialog):
                     legend.set_visible(True)
             else:
                 # Fallback if no source files
-                ax.scatter(self.tsne_embedding[:, 0], self.tsne_embedding[:, 1], c='blue', alpha=point_alpha, s=point_size, edgecolors='none')
+                ax.scatter(tsne_embedding_filtered[:, 0], tsne_embedding_filtered[:, 1], c='blue', alpha=point_alpha, s=point_size, edgecolors='none')
         elif color_by == 'Phenotype' and self.clustered_data is not None and 'cluster_phenotype' in self.clustered_data.columns:
+            # Filter out dropped clusters (cluster 0) for phenotype coloring
+            if hasattr(self, 'tsne_index') and self.tsne_index is not None:
+                cluster_labels_series = self.clustered_data['cluster']
+                cluster_labels = cluster_labels_series.reindex(self.tsne_index).values
+            else:
+                cluster_labels = self.clustered_data['cluster'].values
+            valid_mask = cluster_labels != 0
+            tsne_embedding_filtered = self.tsne_embedding[valid_mask]
+            
             # Color by cluster phenotype
             if hasattr(self, 'tsne_index') and self.tsne_index is not None:
                 phenotype_series = self.clustered_data['cluster_phenotype'].reindex(self.tsne_index)
-                phenotypes = phenotype_series.fillna('Unassigned').values
+                phenotypes = phenotype_series.fillna('Unassigned').values[valid_mask]
             else:
-                phenotypes = self.clustered_data['cluster_phenotype'].fillna('Unassigned').values
+                phenotypes = self.clustered_data['cluster_phenotype'].fillna('Unassigned').values[valid_mask]
             unique_phenotypes = sorted([p for p in np.unique(phenotypes) if pd.notna(p)])
             colors = _get_vivid_colors(len(unique_phenotypes))
             phenotype_color_map = {p: colors[i] for i, p in enumerate(unique_phenotypes)}
@@ -2430,7 +2474,7 @@ class CellClusteringDialog(QtWidgets.QDialog):
             labels = []
             for phenotype in unique_phenotypes:
                 mask = phenotypes == phenotype
-                sc = ax.scatter(self.tsne_embedding[mask, 0], self.tsne_embedding[mask, 1],
+                sc = ax.scatter(tsne_embedding_filtered[mask, 0], tsne_embedding_filtered[mask, 1],
                                 c=[phenotype_color_map[phenotype]],
                                 alpha=point_alpha, s=point_size, edgecolors='none')
                 # Create custom legend handle with fixed size
@@ -2447,12 +2491,21 @@ class CellClusteringDialog(QtWidgets.QDialog):
                 labels.append(str(phenotype))
             ax.legend(handles, labels, loc='best', frameon=True, fontsize=8, title='Phenotype')
         elif color_by == 'Manual Phenotype' and 'manual_phenotype' in self.feature_dataframe.columns:
+            # Filter out dropped clusters (cluster 0) for manual phenotype coloring
+            if hasattr(self, 'tsne_index') and self.tsne_index is not None:
+                cluster_labels_series = self.clustered_data['cluster']
+                cluster_labels = cluster_labels_series.reindex(self.tsne_index).values
+            else:
+                cluster_labels = self.clustered_data['cluster'].values
+            valid_mask = cluster_labels != 0
+            tsne_embedding_filtered = self.tsne_embedding[valid_mask]
+            
             # Color by manual phenotype
             if hasattr(self, 'tsne_index') and self.tsne_index is not None:
                 manual_phenotype_series = self.feature_dataframe.loc[self.tsne_index, 'manual_phenotype']
-                manual_phenotypes = manual_phenotype_series.fillna('Unassigned').values
+                manual_phenotypes = manual_phenotype_series.fillna('Unassigned').values[valid_mask]
             else:
-                manual_phenotypes = self.feature_dataframe['manual_phenotype'].fillna('Unassigned').values
+                manual_phenotypes = self.feature_dataframe['manual_phenotype'].fillna('Unassigned').values[valid_mask]
             unique_phenotypes = sorted([p for p in np.unique(manual_phenotypes) if pd.notna(p)])
             colors = _get_vivid_colors(len(unique_phenotypes))
             phenotype_color_map = {p: colors[i] for i, p in enumerate(unique_phenotypes)}
@@ -2460,7 +2513,7 @@ class CellClusteringDialog(QtWidgets.QDialog):
             labels = []
             for phenotype in unique_phenotypes:
                 mask = manual_phenotypes == phenotype
-                sc = ax.scatter(self.tsne_embedding[mask, 0], self.tsne_embedding[mask, 1],
+                sc = ax.scatter(tsne_embedding_filtered[mask, 0], tsne_embedding_filtered[mask, 1],
                                 c=[phenotype_color_map[phenotype]],
                                 alpha=point_alpha, s=point_size, edgecolors='none')
                 # Create custom legend handle with fixed size
@@ -2477,15 +2530,33 @@ class CellClusteringDialog(QtWidgets.QDialog):
                 labels.append(str(phenotype))
             ax.legend(handles, labels, loc='best', frameon=True, fontsize=8, title='Manual Phenotype')
         elif hasattr(self, 'tsne_raw_data') and color_by in getattr(self, 'tsne_selected_columns', []):
+            # Filter out dropped clusters (cluster 0) for feature coloring
+            if hasattr(self, 'tsne_index') and self.tsne_index is not None:
+                cluster_labels_series = self.clustered_data['cluster']
+                cluster_labels = cluster_labels_series.reindex(self.tsne_index).values
+            else:
+                cluster_labels = self.clustered_data['cluster'].values
+            valid_mask = cluster_labels != 0
+            tsne_embedding_filtered = self.tsne_embedding[valid_mask]
+            
             # Continuous coloring by selected feature (aligned to t-SNE order)
-            vals = self.tsne_raw_data[color_by].values
-            sc = ax.scatter(self.tsne_embedding[:, 0], self.tsne_embedding[:, 1], c=vals,
+            vals = self.tsne_raw_data[color_by].values[valid_mask]
+            sc = ax.scatter(tsne_embedding_filtered[:, 0], tsne_embedding_filtered[:, 1], c=vals,
                             cmap='viridis', alpha=point_alpha, s=point_size, edgecolors='none')
             cbar = self.figure.colorbar(sc, ax=ax)
             cbar.set_label(color_by)
         else:
+            # Filter out dropped clusters (cluster 0) for fallback
+            if hasattr(self, 'tsne_index') and self.tsne_index is not None:
+                cluster_labels_series = self.clustered_data['cluster']
+                cluster_labels = cluster_labels_series.reindex(self.tsne_index).values
+            else:
+                cluster_labels = self.clustered_data['cluster'].values
+            valid_mask = cluster_labels != 0
+            tsne_embedding_filtered = self.tsne_embedding[valid_mask]
+            
             # Fallback single color
-            ax.scatter(self.tsne_embedding[:, 0], self.tsne_embedding[:, 1], c='blue', alpha=point_alpha, s=point_size, edgecolors='none')
+            ax.scatter(tsne_embedding_filtered[:, 0], tsne_embedding_filtered[:, 1], c='blue', alpha=point_alpha, s=point_size, edgecolors='none')
         
         ax.set_xlabel('t-SNE 1', fontsize=10)
         ax.set_ylabel('t-SNE 2', fontsize=10)
@@ -2834,6 +2905,12 @@ class CellClusteringDialog(QtWidgets.QDialog):
                 cluster_labels = cluster_labels_series.reindex(self.umap_index).values
             else:
                 cluster_labels = self.clustered_data['cluster'].values
+            
+            # Filter out dropped clusters (cluster 0)
+            valid_mask = cluster_labels != 0
+            cluster_labels = cluster_labels[valid_mask]
+            umap_embedding_filtered = self.umap_embedding[valid_mask]
+            
             unique_clusters = sorted(np.unique(cluster_labels))
             colors = _get_vivid_colors(len(unique_clusters))
             cluster_color_map = {cluster_id: colors[i] for i, cluster_id in enumerate(unique_clusters)}
@@ -2841,7 +2918,7 @@ class CellClusteringDialog(QtWidgets.QDialog):
             labels = []
             for cluster_id in unique_clusters:
                 mask = cluster_labels == cluster_id
-                sc = ax.scatter(self.umap_embedding[mask, 0], self.umap_embedding[mask, 1],
+                sc = ax.scatter(umap_embedding_filtered[mask, 0], umap_embedding_filtered[mask, 1],
                                 c=[cluster_color_map[cluster_id]],
                                 alpha=point_alpha, s=point_size, edgecolors='none')
                 # Create custom legend handle with fixed size (18)
@@ -2862,12 +2939,21 @@ class CellClusteringDialog(QtWidgets.QDialog):
             ncol = max(1, (n_clusters + 9) // 10) if n_clusters > 10 else 1
             ax.legend(handles, labels, loc='best', frameon=True, fontsize=8, ncol=ncol)
         elif color_by == 'Source File' and 'source_file' in self.feature_dataframe.columns:
+            # Filter out dropped clusters (cluster 0) for source file coloring
+            if hasattr(self, 'umap_index') and self.umap_index is not None:
+                cluster_labels_series = self.clustered_data['cluster']
+                cluster_labels = cluster_labels_series.reindex(self.umap_index).values
+            else:
+                cluster_labels = self.clustered_data['cluster'].values
+            valid_mask = cluster_labels != 0
+            umap_embedding_filtered = self.umap_embedding[valid_mask]
+            
             # Color by source file to visualize batch effects (using custom patient labels)
             if hasattr(self, 'umap_index') and self.umap_index is not None:
                 source_file_series = self.feature_dataframe.loc[self.umap_index, 'source_file']
-                source_files = source_file_series.values
+                source_files = source_file_series.values[valid_mask]
             else:
-                source_files = self.feature_dataframe['source_file'].values
+                source_files = self.feature_dataframe['source_file'].values[valid_mask]
             unique_files = sorted([f for f in np.unique(source_files) if pd.notna(f)])
             if len(unique_files) > 0:
                 colors = plt.cm.tab20(np.linspace(0, 1, len(unique_files)))
@@ -2877,7 +2963,7 @@ class CellClusteringDialog(QtWidgets.QDialog):
                 for file_name in unique_files:
                     mask = source_files == file_name
                     if np.any(mask):  # Only add if there are points for this file
-                        sc = ax.scatter(self.umap_embedding[mask, 0], self.umap_embedding[mask, 1],
+                        sc = ax.scatter(umap_embedding_filtered[mask, 0], umap_embedding_filtered[mask, 1],
                                         c=[file_color_map[file_name]],
                                         alpha=point_alpha, s=point_size, edgecolors='none')
                         # Create custom legend handle with fixed size
@@ -2899,14 +2985,23 @@ class CellClusteringDialog(QtWidgets.QDialog):
                     legend.set_visible(True)
             else:
                 # Fallback if no source files
-                ax.scatter(self.umap_embedding[:, 0], self.umap_embedding[:, 1], c='blue', alpha=point_alpha, s=point_size, edgecolors='none')
+                ax.scatter(umap_embedding_filtered[:, 0], umap_embedding_filtered[:, 1], c='blue', alpha=point_alpha, s=point_size, edgecolors='none')
         elif color_by == 'Phenotype' and self.clustered_data is not None and 'cluster_phenotype' in self.clustered_data.columns:
+            # Filter out dropped clusters (cluster 0) for phenotype coloring
+            if hasattr(self, 'umap_index') and self.umap_index is not None:
+                cluster_labels_series = self.clustered_data['cluster']
+                cluster_labels = cluster_labels_series.reindex(self.umap_index).values
+            else:
+                cluster_labels = self.clustered_data['cluster'].values
+            valid_mask = cluster_labels != 0
+            umap_embedding_filtered = self.umap_embedding[valid_mask]
+            
             # Color by cluster phenotype
             if hasattr(self, 'umap_index') and self.umap_index is not None:
                 phenotype_series = self.clustered_data['cluster_phenotype'].reindex(self.umap_index)
-                phenotypes = phenotype_series.fillna('Unassigned').values
+                phenotypes = phenotype_series.fillna('Unassigned').values[valid_mask]
             else:
-                phenotypes = self.clustered_data['cluster_phenotype'].fillna('Unassigned').values
+                phenotypes = self.clustered_data['cluster_phenotype'].fillna('Unassigned').values[valid_mask]
             unique_phenotypes = sorted([p for p in np.unique(phenotypes) if pd.notna(p)])
             colors = _get_vivid_colors(len(unique_phenotypes))
             phenotype_color_map = {p: colors[i] for i, p in enumerate(unique_phenotypes)}
@@ -2914,7 +3009,7 @@ class CellClusteringDialog(QtWidgets.QDialog):
             labels = []
             for phenotype in unique_phenotypes:
                 mask = phenotypes == phenotype
-                sc = ax.scatter(self.umap_embedding[mask, 0], self.umap_embedding[mask, 1],
+                sc = ax.scatter(umap_embedding_filtered[mask, 0], umap_embedding_filtered[mask, 1],
                                 c=[phenotype_color_map[phenotype]],
                                 alpha=point_alpha, s=point_size, edgecolors='none')
                 # Create custom legend handle with fixed size
@@ -2931,12 +3026,21 @@ class CellClusteringDialog(QtWidgets.QDialog):
                 labels.append(str(phenotype))
             ax.legend(handles, labels, loc='best', frameon=True, fontsize=8, title='Phenotype')
         elif color_by == 'Manual Phenotype' and 'manual_phenotype' in self.feature_dataframe.columns:
+            # Filter out dropped clusters (cluster 0) for manual phenotype coloring
+            if hasattr(self, 'umap_index') and self.umap_index is not None:
+                cluster_labels_series = self.clustered_data['cluster']
+                cluster_labels = cluster_labels_series.reindex(self.umap_index).values
+            else:
+                cluster_labels = self.clustered_data['cluster'].values
+            valid_mask = cluster_labels != 0
+            umap_embedding_filtered = self.umap_embedding[valid_mask]
+            
             # Color by manual phenotype
             if hasattr(self, 'umap_index') and self.umap_index is not None:
                 manual_phenotype_series = self.feature_dataframe.loc[self.umap_index, 'manual_phenotype']
-                manual_phenotypes = manual_phenotype_series.fillna('Unassigned').values
+                manual_phenotypes = manual_phenotype_series.fillna('Unassigned').values[valid_mask]
             else:
-                manual_phenotypes = self.feature_dataframe['manual_phenotype'].fillna('Unassigned').values
+                manual_phenotypes = self.feature_dataframe['manual_phenotype'].fillna('Unassigned').values[valid_mask]
             unique_phenotypes = sorted([p for p in np.unique(manual_phenotypes) if pd.notna(p)])
             colors = _get_vivid_colors(len(unique_phenotypes))
             phenotype_color_map = {p: colors[i] for i, p in enumerate(unique_phenotypes)}
@@ -2944,7 +3048,7 @@ class CellClusteringDialog(QtWidgets.QDialog):
             labels = []
             for phenotype in unique_phenotypes:
                 mask = manual_phenotypes == phenotype
-                sc = ax.scatter(self.umap_embedding[mask, 0], self.umap_embedding[mask, 1],
+                sc = ax.scatter(umap_embedding_filtered[mask, 0], umap_embedding_filtered[mask, 1],
                                 c=[phenotype_color_map[phenotype]],
                                 alpha=point_alpha, s=point_size, edgecolors='none')
                 # Create custom legend handle with fixed size
@@ -2961,15 +3065,33 @@ class CellClusteringDialog(QtWidgets.QDialog):
                 labels.append(str(phenotype))
             ax.legend(handles, labels, loc='best', frameon=True, fontsize=8, title='Manual Phenotype')
         elif hasattr(self, 'umap_raw_data') and color_by in getattr(self, 'umap_selected_columns', []):
+            # Filter out dropped clusters (cluster 0) for feature coloring
+            if hasattr(self, 'umap_index') and self.umap_index is not None:
+                cluster_labels_series = self.clustered_data['cluster']
+                cluster_labels = cluster_labels_series.reindex(self.umap_index).values
+            else:
+                cluster_labels = self.clustered_data['cluster'].values
+            valid_mask = cluster_labels != 0
+            umap_embedding_filtered = self.umap_embedding[valid_mask]
+            
             # Continuous coloring by selected feature (aligned to UMAP order)
-            vals = self.umap_raw_data[color_by].values
-            sc = ax.scatter(self.umap_embedding[:, 0], self.umap_embedding[:, 1], c=vals,
+            vals = self.umap_raw_data[color_by].values[valid_mask]
+            sc = ax.scatter(umap_embedding_filtered[:, 0], umap_embedding_filtered[:, 1], c=vals,
                             cmap='viridis', alpha=point_alpha, s=point_size, edgecolors='none')
             cbar = self.figure.colorbar(sc, ax=ax)
             cbar.set_label(color_by)
         else:
+            # Filter out dropped clusters (cluster 0) for fallback
+            if hasattr(self, 'umap_index') and self.umap_index is not None:
+                cluster_labels_series = self.clustered_data['cluster']
+                cluster_labels = cluster_labels_series.reindex(self.umap_index).values
+            else:
+                cluster_labels = self.clustered_data['cluster'].values
+            valid_mask = cluster_labels != 0
+            umap_embedding_filtered = self.umap_embedding[valid_mask]
+            
             # Fallback single color
-            ax.scatter(self.umap_embedding[:, 0], self.umap_embedding[:, 1], c='blue', alpha=point_alpha, s=point_size, edgecolors='none')
+            ax.scatter(umap_embedding_filtered[:, 0], umap_embedding_filtered[:, 1], c='blue', alpha=point_alpha, s=point_size, edgecolors='none')
         
         ax.set_xlabel('UMAP 1')
         ax.set_ylabel('UMAP 2')
@@ -3126,9 +3248,12 @@ class CellClusteringDialog(QtWidgets.QDialog):
             return
 
         try:
+            # Filter out dropped clusters (cluster 0)
+            filtered_clustered_data = self.clustered_data[self.clustered_data['cluster'] != 0].copy()
+            
             # Align metadata to clustered_data order
-            meta_series = self.feature_dataframe.loc[self.clustered_data.index, group_col]
-            clusters = self.clustered_data['cluster']
+            meta_series = self.feature_dataframe.loc[filtered_clustered_data.index, group_col]
+            clusters = filtered_clustered_data['cluster']
             # Build counts per group and cluster
             ct = pd.crosstab(meta_series, clusters).sort_index()
             # Convert to frequencies
@@ -3168,15 +3293,18 @@ class CellClusteringDialog(QtWidgets.QDialog):
             return
         
         try:
+            # Filter out dropped clusters (cluster 0)
+            filtered_clustered_data = self.clustered_data[self.clustered_data['cluster'] != 0].copy()
+            
             # Get numeric feature columns only (exclude cluster/phenotype/text metadata)
-            feature_cols = self._select_feature_columns(self.clustered_data)
+            feature_cols = self._select_feature_columns(filtered_clustered_data)
             
             if not feature_cols:
                 QtWidgets.QMessageBox.warning(self, "No Features", "No features available for differential expression analysis.")
                 return
             
             # Calculate mean expression per cluster for each feature
-            cluster_means = self.clustered_data.groupby('cluster')[feature_cols].mean()
+            cluster_means = filtered_clustered_data.groupby('cluster')[feature_cols].mean()
             
             # Calculate differential expression (z-score across clusters for each feature)
             # This shows which features are most variable across clusters
@@ -3411,7 +3539,8 @@ class CellClusteringDialog(QtWidgets.QDialog):
             return
         
         self.stats_cluster_combo.clear()
-        unique_cluster_ids = sorted(self.clustered_data['cluster'].unique())
+        # Filter out dropped clusters (cluster 0)
+        unique_cluster_ids = sorted([cid for cid in self.clustered_data['cluster'].unique() if cid != 0])
         for cluster_id in unique_cluster_ids:
             cluster_name = self._get_cluster_display_name(cluster_id)
             self.stats_cluster_combo.addItem(cluster_name, cluster_id)
@@ -3586,6 +3715,9 @@ class CellClusteringDialog(QtWidgets.QDialog):
                 self.clustered_data_unscaled is not None and 
                 'cluster' in self.clustered_data_unscaled.columns
             ) else self.clustered_data
+            
+            # Filter out dropped clusters (cluster 0)
+            plot_data_source = plot_data_source[plot_data_source['cluster'] != 0].copy()
             
             # Filter markers to only those available in the data
             available_markers = [m for m in self.selected_markers if m in plot_data_source.columns]
@@ -4553,6 +4685,220 @@ class CellClusteringDialog(QtWidgets.QDialog):
             
             QtWidgets.QMessageBox.information(self, "Annotations Applied", "Cluster annotations have been applied.")
 
+    def _open_merge_clusters_dialog(self):
+        """Open a dialog to merge two clusters."""
+        if self.clustered_data is None:
+            QtWidgets.QMessageBox.warning(self, "No Clusters", "Please run clustering first.")
+            return
+        
+        unique_clusters = sorted([c for c in self.clustered_data['cluster'].unique() if c != 0])  # Exclude noise cluster
+        if len(unique_clusters) < 2:
+            QtWidgets.QMessageBox.warning(self, "Not Enough Clusters", "At least two clusters (excluding noise) are required to merge.")
+            return
+        
+        # Build and show dialog
+        dlg = QtWidgets.QDialog(self)
+        dlg.setWindowTitle("Merge Clusters")
+        dlg.setMinimumWidth(400)
+        v = QtWidgets.QVBoxLayout(dlg)
+        
+        # Instructions
+        instructions = QtWidgets.QLabel("Select two clusters to merge. The second cluster will be merged into the first.")
+        instructions.setWordWrap(True)
+        v.addWidget(instructions)
+        
+        # First cluster selector
+        form = QtWidgets.QFormLayout()
+        cluster_options = [self._get_cluster_display_name(cid) for cid in unique_clusters]
+        merge_cluster1_combo = QtWidgets.QComboBox()
+        merge_cluster1_combo.addItems(cluster_options)
+        form.addRow("First cluster (target):", merge_cluster1_combo)
+        
+        # Second cluster selector
+        merge_cluster2_combo = QtWidgets.QComboBox()
+        merge_cluster2_combo.addItems(cluster_options)
+        form.addRow("Second cluster (to merge):", merge_cluster2_combo)
+        v.addLayout(form)
+        
+        # Buttons
+        btns = QtWidgets.QHBoxLayout()
+        ok = QtWidgets.QPushButton("Merge")
+        cancel = QtWidgets.QPushButton("Cancel")
+        ok.clicked.connect(dlg.accept)
+        cancel.clicked.connect(dlg.reject)
+        btns.addStretch()
+        btns.addWidget(ok)
+        btns.addWidget(cancel)
+        v.addLayout(btns)
+        
+        if dlg.exec_() == QtWidgets.QDialog.Accepted:
+            # Get selected cluster IDs
+            idx1 = merge_cluster1_combo.currentIndex()
+            idx2 = merge_cluster2_combo.currentIndex()
+            
+            if idx1 == idx2:
+                QtWidgets.QMessageBox.warning(self, "Invalid Selection", "Please select two different clusters.")
+                return
+            
+            cluster1_id = unique_clusters[idx1]
+            cluster2_id = unique_clusters[idx2]
+            
+            # Perform merge
+            self._merge_clusters(cluster1_id, cluster2_id)
+            
+            # Refresh plots
+            self._refresh_all_plots()
+            
+            QtWidgets.QMessageBox.information(self, "Clusters Merged", 
+                f"Cluster {cluster2_id} has been merged into cluster {cluster1_id}.")
+    
+    def _open_drop_clusters_dialog(self):
+        """Open a dialog to drop/remove clusters."""
+        if self.clustered_data is None:
+            QtWidgets.QMessageBox.warning(self, "No Clusters", "Please run clustering first.")
+            return
+        
+        unique_clusters = sorted([c for c in self.clustered_data['cluster'].unique() if c != 0])  # Exclude noise cluster
+        if len(unique_clusters) == 0:
+            QtWidgets.QMessageBox.warning(self, "No Clusters", "No clusters available to drop (excluding noise cluster).")
+            return
+        
+        # Build and show dialog
+        dlg = QtWidgets.QDialog(self)
+        dlg.setWindowTitle("Drop Clusters")
+        dlg.setMinimumWidth(400)
+        v = QtWidgets.QVBoxLayout(dlg)
+        
+        # Instructions
+        instructions = QtWidgets.QLabel("Select clusters to drop. Dropped clusters will be marked as noise/unassigned (cluster 0).")
+        instructions.setWordWrap(True)
+        v.addWidget(instructions)
+        
+        # Cluster list with checkboxes
+        cluster_list = QtWidgets.QListWidget()
+        cluster_list.setSelectionMode(QtWidgets.QAbstractItemView.MultiSelection)
+        for cid in unique_clusters:
+            display_name = self._get_cluster_display_name(cid)
+            item = QtWidgets.QListWidgetItem(display_name)
+            item.setData(QtCore.Qt.UserRole, cid)
+            cluster_list.addItem(item)
+        v.addWidget(cluster_list)
+        
+        # Buttons
+        btns = QtWidgets.QHBoxLayout()
+        ok = QtWidgets.QPushButton("Drop Selected")
+        cancel = QtWidgets.QPushButton("Cancel")
+        ok.clicked.connect(dlg.accept)
+        cancel.clicked.connect(dlg.reject)
+        btns.addStretch()
+        btns.addWidget(ok)
+        btns.addWidget(cancel)
+        v.addLayout(btns)
+        
+        if dlg.exec_() == QtWidgets.QDialog.Accepted:
+            # Get selected cluster IDs
+            selected_items = cluster_list.selectedItems()
+            if not selected_items:
+                QtWidgets.QMessageBox.warning(self, "No Selection", "Please select at least one cluster to drop.")
+                return
+            
+            cluster_ids_to_drop = [item.data(QtCore.Qt.UserRole) for item in selected_items]
+            
+            # Perform drop
+            self._drop_clusters(cluster_ids_to_drop)
+            
+            # Refresh plots
+            self._refresh_all_plots()
+            
+            dropped_names = [self._get_cluster_display_name(cid) for cid in cluster_ids_to_drop]
+            QtWidgets.QMessageBox.information(self, "Clusters Dropped", 
+                f"Dropped {len(cluster_ids_to_drop)} cluster(s): {', '.join(dropped_names)}")
+    
+    def _merge_clusters(self, target_cluster_id, source_cluster_id):
+        """Merge source_cluster_id into target_cluster_id."""
+        if self.clustered_data is None:
+            return
+        
+        # Update cluster labels in clustered_data
+        mask = self.clustered_data['cluster'] == source_cluster_id
+        self.clustered_data.loc[mask, 'cluster'] = target_cluster_id
+        
+        # Update cluster labels in clustered_data_unscaled if it exists
+        if self.clustered_data_unscaled is not None and 'cluster' in self.clustered_data_unscaled.columns:
+            mask_unscaled = self.clustered_data_unscaled['cluster'] == source_cluster_id
+            self.clustered_data_unscaled.loc[mask_unscaled, 'cluster'] = target_cluster_id
+        
+        # Update feature_dataframe if cluster column exists
+        if 'cluster' in self.feature_dataframe.columns:
+            mask_feature = self.feature_dataframe['cluster'] == source_cluster_id
+            self.feature_dataframe.loc[mask_feature, 'cluster'] = target_cluster_id
+        
+        # Update cluster_annotation_map: merge annotations if both have them
+        if source_cluster_id in self.cluster_annotation_map:
+            source_annotation = self.cluster_annotation_map[source_cluster_id]
+            if target_cluster_id not in self.cluster_annotation_map:
+                # If target doesn't have annotation, use source's annotation
+                self.cluster_annotation_map[target_cluster_id] = source_annotation
+            # Remove source cluster from annotation map
+            del self.cluster_annotation_map[source_cluster_id]
+        
+        # Update cluster_backend_names similarly
+        if source_cluster_id in self.cluster_backend_names:
+            source_backend_name = self.cluster_backend_names[source_cluster_id]
+            if target_cluster_id not in self.cluster_backend_names:
+                self.cluster_backend_names[target_cluster_id] = source_backend_name
+            del self.cluster_backend_names[source_cluster_id]
+        
+        # Reapply cluster annotations to update cluster_phenotype column
+        if self.cluster_annotation_map:
+            self._apply_cluster_annotations()
+    
+    def _drop_clusters(self, cluster_ids_to_drop):
+        """Drop clusters by setting their labels to 0 (noise/unassigned)."""
+        if self.clustered_data is None:
+            return
+        
+        # Filter out cluster 0 (noise) if it was somehow selected
+        cluster_ids_to_drop = [cid for cid in cluster_ids_to_drop if cid != 0]
+        if not cluster_ids_to_drop:
+            return
+        
+        # Update cluster labels in clustered_data
+        mask = self.clustered_data['cluster'].isin(cluster_ids_to_drop)
+        self.clustered_data.loc[mask, 'cluster'] = 0
+        
+        # Update cluster labels in clustered_data_unscaled if it exists
+        if self.clustered_data_unscaled is not None and 'cluster' in self.clustered_data_unscaled.columns:
+            mask_unscaled = self.clustered_data_unscaled['cluster'].isin(cluster_ids_to_drop)
+            self.clustered_data_unscaled.loc[mask_unscaled, 'cluster'] = 0
+        
+        # Update feature_dataframe if cluster column exists
+        if 'cluster' in self.feature_dataframe.columns:
+            mask_feature = self.feature_dataframe['cluster'].isin(cluster_ids_to_drop)
+            self.feature_dataframe.loc[mask_feature, 'cluster'] = 0
+        
+        # Remove dropped clusters from annotation maps
+        for cluster_id in cluster_ids_to_drop:
+            if cluster_id in self.cluster_annotation_map:
+                del self.cluster_annotation_map[cluster_id]
+            if cluster_id in self.cluster_backend_names:
+                del self.cluster_backend_names[cluster_id]
+        
+        # Reapply cluster annotations to update cluster_phenotype column
+        if self.cluster_annotation_map:
+            self._apply_cluster_annotations()
+    
+    def _refresh_all_plots(self):
+        """Refresh all plots to reflect cluster changes."""
+        current_view = self.view_combo.currentText() if hasattr(self, 'view_combo') else 'Heatmap'
+        
+        # Update stats cluster combo if it exists
+        if hasattr(self, 'stats_cluster_combo'):
+            self._update_stats_cluster_combo()
+        
+        # Refresh the current view
+        self._on_view_changed(current_view)
+
     def _open_patient_annotation_dialog(self):
         """Open a dialog to customize patient/source file labels."""
         # Determine which column to use for patient annotation
@@ -4873,6 +5219,16 @@ class ClusterExplorerDialog(QtWidgets.QDialog):
         self.cell_images = []
         self._label_provider = label_provider
         
+        # Cache for global min/max values per channel (for RGB normalization)
+        # Format: {channel_name: (min_value, max_value)}
+        self._global_channel_minmax_cache = {}
+        self._cache_initialized = False
+        
+        # RGB channel brightness/scaling factors (default 1.0 = no change)
+        self.rgb_r_scale = 1.0
+        self.rgb_g_scale = 1.0
+        self.rgb_b_scale = 1.0
+        
         self._create_ui()
         
     def _create_ui(self):
@@ -4906,7 +5262,12 @@ class ClusterExplorerDialog(QtWidgets.QDialog):
         self.rgb_checkbox.toggled.connect(self._on_rgb_mode_toggled)
         controls_layout.addWidget(self.rgb_checkbox)
         
-        # RGB channel selection (initially hidden)
+        # RGB channel selection and brightness controls (initially hidden)
+        self.rgb_channels_widget = QtWidgets.QWidget()
+        rgb_main_layout = QtWidgets.QVBoxLayout(self.rgb_channels_widget)
+        rgb_main_layout.setContentsMargins(0, 0, 0, 0)
+        
+        # Channel selection row
         self.rgb_channels_layout = QtWidgets.QHBoxLayout()
         self.rgb_channels_layout.addWidget(QtWidgets.QLabel("R:"))
         self.rgb_r_combo = QtWidgets.QComboBox()
@@ -4919,10 +5280,53 @@ class ClusterExplorerDialog(QtWidgets.QDialog):
         self.rgb_channels_layout.addWidget(QtWidgets.QLabel("B:"))
         self.rgb_b_combo = QtWidgets.QComboBox()
         self.rgb_channels_layout.addWidget(self.rgb_b_combo)
+        rgb_main_layout.addLayout(self.rgb_channels_layout)
         
-        # Add RGB channel selection to a widget that can be shown/hidden
-        self.rgb_channels_widget = QtWidgets.QWidget()
-        self.rgb_channels_widget.setLayout(self.rgb_channels_layout)
+        # Brightness/scaling controls row
+        self.rgb_brightness_layout = QtWidgets.QHBoxLayout()
+        self.rgb_brightness_layout.addWidget(QtWidgets.QLabel("Brightness:"))
+        
+        # R channel brightness
+        r_brightness_layout = QtWidgets.QHBoxLayout()
+        r_brightness_layout.addWidget(QtWidgets.QLabel("R:"))
+        self.rgb_r_scale_spinbox = QtWidgets.QDoubleSpinBox()
+        self.rgb_r_scale_spinbox.setRange(0.0, 5.0)
+        self.rgb_r_scale_spinbox.setSingleStep(0.1)
+        self.rgb_r_scale_spinbox.setValue(1.0)
+        self.rgb_r_scale_spinbox.setDecimals(1)
+        self.rgb_r_scale_spinbox.setToolTip("Brightness scaling for red channel (1.0 = normal, >1.0 = brighter, <1.0 = dimmer)")
+        self.rgb_r_scale_spinbox.valueChanged.connect(self._on_rgb_scale_changed)
+        r_brightness_layout.addWidget(self.rgb_r_scale_spinbox)
+        self.rgb_brightness_layout.addLayout(r_brightness_layout)
+        
+        # G channel brightness
+        g_brightness_layout = QtWidgets.QHBoxLayout()
+        g_brightness_layout.addWidget(QtWidgets.QLabel("G:"))
+        self.rgb_g_scale_spinbox = QtWidgets.QDoubleSpinBox()
+        self.rgb_g_scale_spinbox.setRange(0.0, 5.0)
+        self.rgb_g_scale_spinbox.setSingleStep(0.1)
+        self.rgb_g_scale_spinbox.setValue(1.0)
+        self.rgb_g_scale_spinbox.setDecimals(1)
+        self.rgb_g_scale_spinbox.setToolTip("Brightness scaling for green channel (1.0 = normal, >1.0 = brighter, <1.0 = dimmer)")
+        self.rgb_g_scale_spinbox.valueChanged.connect(self._on_rgb_scale_changed)
+        g_brightness_layout.addWidget(self.rgb_g_scale_spinbox)
+        self.rgb_brightness_layout.addLayout(g_brightness_layout)
+        
+        # B channel brightness
+        b_brightness_layout = QtWidgets.QHBoxLayout()
+        b_brightness_layout.addWidget(QtWidgets.QLabel("B:"))
+        self.rgb_b_scale_spinbox = QtWidgets.QDoubleSpinBox()
+        self.rgb_b_scale_spinbox.setRange(0.0, 5.0)
+        self.rgb_b_scale_spinbox.setSingleStep(0.1)
+        self.rgb_b_scale_spinbox.setValue(1.0)
+        self.rgb_b_scale_spinbox.setDecimals(1)
+        self.rgb_b_scale_spinbox.setToolTip("Brightness scaling for blue channel (1.0 = normal, >1.0 = brighter, <1.0 = dimmer)")
+        self.rgb_b_scale_spinbox.valueChanged.connect(self._on_rgb_scale_changed)
+        b_brightness_layout.addWidget(self.rgb_b_scale_spinbox)
+        self.rgb_brightness_layout.addLayout(b_brightness_layout)
+        
+        rgb_main_layout.addLayout(self.rgb_brightness_layout)
+        
         self.rgb_channels_widget.hide()
         controls_layout.addWidget(self.rgb_channels_widget)
         
@@ -4933,6 +5337,12 @@ class ClusterExplorerDialog(QtWidgets.QDialog):
         
         controls_layout.addStretch()
         layout.addLayout(controls_layout)
+        
+        # Suggested markers label (will be populated when cluster is selected)
+        self.suggested_markers_label = QtWidgets.QLabel("")
+        self.suggested_markers_label.setWordWrap(True)
+        self.suggested_markers_label.setStyleSheet("QLabel { color: #0066cc; font-style: italic; padding: 5px; }")
+        layout.addWidget(self.suggested_markers_label)
         
         # Image grid
         self.scroll_area = QtWidgets.QScrollArea()
@@ -4948,6 +5358,11 @@ class ClusterExplorerDialog(QtWidgets.QDialog):
         button_layout = QtWidgets.QHBoxLayout()
         button_layout.addStretch()
         
+        self.export_btn = QtWidgets.QPushButton("Export to HDF5")
+        self.export_btn.setToolTip("Export cell images, features, channels, and masks to HDF5 file")
+        self.export_btn.clicked.connect(self._export_to_hdf5)
+        button_layout.addWidget(self.export_btn)
+        
         self.close_btn = QtWidgets.QPushButton("Close")
         self.close_btn.clicked.connect(self.accept)
         button_layout.addWidget(self.close_btn)
@@ -4957,6 +5372,9 @@ class ClusterExplorerDialog(QtWidgets.QDialog):
         # Initialize
         self._populate_channels()
         self._on_cluster_changed()
+        
+        # Initialize global min/max cache for RGB normalization (in background)
+        self._initialize_global_minmax_cache()
     
     def _populate_channels(self):
         """Populate channel combo box with available channels."""
@@ -4985,38 +5403,264 @@ class ClusterExplorerDialog(QtWidgets.QDialog):
         if self.current_cluster:
             label = self._get_cluster_label(self.current_cluster['cluster_id'])
             self.status_label.setText(f"Selected {label} with {self.current_cluster['size']} cells")
+            
+            # Calculate and suggest markers for this cluster
+            self._suggest_markers_for_cluster(self.current_cluster['cluster_id'])
+    
+    def _suggest_markers_for_cluster(self, cluster_id):
+        """Calculate and suggest markers that are highly expressed or low/negative in this cluster."""
+        try:
+            # Get clustered data from parent dialog (label_provider)
+            if self._label_provider is None or not hasattr(self._label_provider, 'clustered_data'):
+                self.suggested_markers_label.setText("")
+                return
+            
+            clustered_data = self._label_provider.clustered_data
+            if clustered_data is None or 'cluster' not in clustered_data.columns:
+                self.suggested_markers_label.setText("")
+                return
+            
+            # Get intensity feature columns only (exclude morphology features)
+            # Intensity features typically end with _mean, _median, _integrated, etc.
+            intensity_suffixes = ['_mean', '_median', '_integrated', '_std', '_p10', '_p90', '_frac_pos', '_mad']
+            all_cols = clustered_data.columns
+            intensity_cols = [col for col in all_cols 
+                             if any(col.endswith(suffix) for suffix in intensity_suffixes)]
+            
+            # Also exclude metadata columns
+            metadata_cols = ['cluster', 'cluster_phenotype', 'manual_phenotype', 'acquisition_id', 
+                           'acquisition_label', 'source_file', 'source_well', 'well', 'cell_id']
+            intensity_cols = [col for col in intensity_cols if col not in metadata_cols]
+            
+            if not intensity_cols:
+                self.suggested_markers_label.setText("")
+                return
+            
+            # Calculate mean expression per cluster for intensity features
+            cluster_means = clustered_data.groupby('cluster')[intensity_cols].mean()
+            
+            # Calculate z-scores across clusters for each feature
+            feature_means = cluster_means.mean(axis=0)  # Mean across clusters
+            feature_stds = cluster_means.std(axis=0)    # Std across clusters
+            feature_stds = feature_stds.replace(0, 1)   # Avoid division by zero
+            
+            # Z-score: (cluster_mean - overall_mean) / overall_std
+            cluster_z_scores = (cluster_means.loc[cluster_id] - feature_means) / feature_stds
+            
+            # Sort by z-score to find highly expressed (high z) and low/negative (low z)
+            sorted_markers = cluster_z_scores.sort_values(ascending=False)
+            
+            # Get top 3 highly expressed markers (z-score > 1.0)
+            high_markers = sorted_markers[sorted_markers > 1.0].head(3)
+            # Get top 3 low/negative markers (z-score < -1.0)
+            low_markers = sorted_markers[sorted_markers < -1.0].tail(3).sort_values(ascending=True)
+            
+            # Extract channel names from feature names (remove suffix)
+            def extract_channel_name(feature_name):
+                for suffix in intensity_suffixes:
+                    if feature_name.endswith(suffix):
+                        return feature_name[:-len(suffix)]
+                return feature_name
+            
+            # Build suggestion text
+            suggestions = []
+            if len(high_markers) > 0:
+                high_channels = [extract_channel_name(m) for m in high_markers.index]
+                suggestions.append(f"High: {', '.join(high_channels)}")
+            
+            if len(low_markers) > 0:
+                low_channels = [extract_channel_name(m) for m in low_markers.index]
+                suggestions.append(f"Low: {', '.join(low_channels)}")
+            
+            if suggestions:
+                suggestion_text = "Suggested markers: " + " | ".join(suggestions)
+                self.suggested_markers_label.setText(suggestion_text)
+                
+                # Also update channel combo to highlight suggested channels
+                # Select the first highly expressed marker if available
+                if len(high_markers) > 0:
+                    suggested_channel = extract_channel_name(high_markers.index[0])
+                    # Find and select this channel in the combo box
+                    index = self.channel_combo.findText(suggested_channel)
+                    if index >= 0:
+                        self.channel_combo.setCurrentIndex(index)
+            else:
+                self.suggested_markers_label.setText("No strong marker patterns detected")
+                
+        except Exception as e:
+            print(f"[ClusterExplorer] Error suggesting markers: {e}")
+            import traceback
+            traceback.print_exc()
+            self.suggested_markers_label.setText("")
     
     def _on_rgb_mode_toggled(self):
         """Handle RGB mode checkbox toggle."""
         if self.rgb_checkbox.isChecked():
             self.rgb_channels_widget.show()
             self.channel_combo.setEnabled(False)
+            # Ensure cache is initialized when RGB mode is enabled
+            if not self._cache_initialized:
+                self._initialize_global_minmax_cache()
         else:
             self.rgb_channels_widget.hide()
             self.channel_combo.setEnabled(True)
     
+    def _on_rgb_scale_changed(self):
+        """Handle RGB brightness scaling changes."""
+        self.rgb_r_scale = self.rgb_r_scale_spinbox.value()
+        self.rgb_g_scale = self.rgb_g_scale_spinbox.value()
+        self.rgb_b_scale = self.rgb_b_scale_spinbox.value()
+        
+        # If images are already loaded, reload them with new scaling
+        if self.cell_images and self.rgb_checkbox.isChecked():
+            # Reload images with new scaling
+            self._load_cell_images()
+    
+    def _initialize_global_minmax_cache(self):
+        """Initialize the global min/max cache for all channels across all acquisitions.
+        
+        This is a slow operation that scans all images, so it's done once and cached.
+        """
+        if self._cache_initialized:
+            return
+        
+        print("[ClusterExplorer] Initializing global min/max cache for RGB normalization...")
+        self.status_label.setText("Computing global intensity ranges (this may take a moment)...")
+        QtWidgets.QApplication.processEvents()  # Update UI
+        
+        try:
+            parent_window = self.parent()
+            if parent_window is None:
+                return
+            
+            # Get all unique channels from feature dataframe
+            intensity_suffixes = ['_mean', '_std', '_p10', '_p90', '_integrated', '_frac_pos', '_median', '_mad']
+            channels = set()
+            for col in self.feature_dataframe.columns:
+                for suffix in intensity_suffixes:
+                    if col.endswith(suffix):
+                        channel = col[:-len(suffix)]
+                        channels.add(channel)
+                        break
+            
+            if not channels:
+                print("[ClusterExplorer] No channels found for cache initialization")
+                self._cache_initialized = True
+                return
+            
+            # Get all unique acquisition IDs from feature dataframe
+            if 'acquisition_id' not in self.feature_dataframe.columns:
+                print("[ClusterExplorer] No acquisition_id column found")
+                self._cache_initialized = True
+                return
+            
+            unique_acq_ids = self.feature_dataframe['acquisition_id'].unique()
+            
+            # Initialize min/max for each channel
+            channel_mins = {ch: float('inf') for ch in channels}
+            channel_maxs = {ch: float('-inf') for ch in channels}
+            
+            # Iterate through all acquisitions and channels to find global min/max
+            total_acqs = len(unique_acq_ids)
+            processed = 0
+            
+            for acq_id in unique_acq_ids:
+                processed += 1
+                if processed % 10 == 0:
+                    progress = f"Processing {processed}/{total_acqs} acquisitions..."
+                    self.status_label.setText(progress)
+                    QtWidgets.QApplication.processEvents()
+                
+                # Get loader for this acquisition
+                loader = parent_window._get_loader_for_acquisition(acq_id)
+                if loader is None:
+                    continue
+                
+                # Get original acquisition ID
+                original_acq_id = parent_window._get_original_acq_id(acq_id)
+                
+                # Check which channels are available for this acquisition
+                try:
+                    available_channels = loader.get_channels(original_acq_id)
+                except Exception:
+                    continue
+                
+                # For each channel, load the image and update min/max
+                for channel in channels:
+                    if channel not in available_channels:
+                        continue
+                    
+                    try:
+                        img = loader.get_image(original_acq_id, channel)
+                        if img is not None and img.size > 0:
+                            img_min = float(np.min(img))
+                            img_max = float(np.max(img))
+                            
+                            if img_min < channel_mins[channel]:
+                                channel_mins[channel] = img_min
+                            if img_max > channel_maxs[channel]:
+                                channel_maxs[channel] = img_max
+                    except Exception as e:
+                        # Skip channels that can't be loaded
+                        continue
+            
+            # Store in cache
+            for channel in channels:
+                if channel_mins[channel] != float('inf') and channel_maxs[channel] != float('-inf'):
+                    self._global_channel_minmax_cache[channel] = (channel_mins[channel], channel_maxs[channel])
+            
+            self._cache_initialized = True
+            print(f"[ClusterExplorer] Cache initialized for {len(self._global_channel_minmax_cache)} channels")
+            self.status_label.setText("Ready to load cell images")
+            
+        except Exception as e:
+            print(f"[ClusterExplorer] Error initializing cache: {e}")
+            import traceback
+            traceback.print_exc()
+            self._cache_initialized = True  # Mark as initialized to avoid retrying
+            self.status_label.setText("Cache initialization failed, using per-image normalization")
+    
     def _load_cell_images(self):
         """Load and display cell images for the selected cluster."""
+        print(f"[ClusterExplorer] _load_cell_images called")
+        
         if not self.current_cluster:
+            print(f"[ClusterExplorer] ERROR: No current cluster selected")
             return
+        
+        print(f"[ClusterExplorer] Current cluster: {self.current_cluster['cluster_id']}, size: {self.current_cluster['size']}")
         
         channel = self.channel_combo.currentText()
         if not channel:
             QtWidgets.QMessageBox.warning(self, "No Channel", "Please select a channel.")
             return
         
+        print(f"[ClusterExplorer] Selected channel: {channel}")
+        
         try:
             # Get parent window to access loader and segmentation masks
             parent_window = self.parent()
+            print(f"[ClusterExplorer] Parent window type: {type(parent_window)}")
+            
             if not hasattr(parent_window, 'segmentation_masks'):
+                print(f"[ClusterExplorer] ERROR: Parent window has no 'segmentation_masks' attribute")
                 QtWidgets.QMessageBox.warning(self, "No Data", "Cannot access image data. Please ensure segmentation masks are loaded.")
                 return
             
+            print(f"[ClusterExplorer] segmentation_masks keys: {list(parent_window.segmentation_masks.keys())[:5]}... (showing first 5)")
+            print(f"[ClusterExplorer] Total segmentation masks: {len(parent_window.segmentation_masks)}")
+            
             # Check if we have any loaders available (single loader or multiple loaders)
-            has_loader = (hasattr(parent_window, 'loader') and parent_window.loader is not None) or \
-                        (hasattr(parent_window, 'mcd_loaders') and len(parent_window.mcd_loaders) > 0)
+            has_single_loader = hasattr(parent_window, 'loader') and parent_window.loader is not None
+            has_multi_loaders = hasattr(parent_window, 'mcd_loaders') and len(parent_window.mcd_loaders) > 0
+            has_loader = has_single_loader or has_multi_loaders
+            
+            print(f"[ClusterExplorer] Loader check - single: {has_single_loader}, multi: {has_multi_loaders}, total: {has_loader}")
+            if has_multi_loaders:
+                print(f"[ClusterExplorer] mcd_loaders count: {len(parent_window.mcd_loaders)}")
             
             if not has_loader:
+                print(f"[ClusterExplorer] ERROR: No loaders available")
                 QtWidgets.QMessageBox.warning(self, "No Data", "Cannot access image data. Please ensure data files are loaded.")
                 return
             
@@ -5029,11 +5673,14 @@ class ClusterExplorerDialog(QtWidgets.QDialog):
             
             # Get cell data for this cluster
             cluster_cells = self.current_cluster['cells']
+            print(f"[ClusterExplorer] Cluster cells list length: {len(cluster_cells)}")
+            print(f"[ClusterExplorer] First few cell indices: {cluster_cells[:5] if len(cluster_cells) > 0 else 'N/A'}")
             
             # Use all cells from the cluster (support multiple files)
             filtered_cells = cluster_cells
             
             if not filtered_cells:
+                print(f"[ClusterExplorer] ERROR: No cells in filtered_cells")
                 QtWidgets.QMessageBox.information(
                     self,
                     "No Cells Available",
@@ -5044,103 +5691,271 @@ class ClusterExplorerDialog(QtWidgets.QDialog):
             # Limit to first 10 cells for performance
             max_cells = min(10, len(filtered_cells))
             crop_size = 30  # 30x30 pixel crop
+            print(f"[ClusterExplorer] Processing up to {max_cells} cells")
+            
+            cells_processed = 0
+            cells_skipped_no_index = 0
+            cells_skipped_no_mask = 0
+            cells_skipped_no_cell_mask = 0
+            cells_skipped_no_loader = 0
+            cells_loaded = 0
             
             for i, cell_idx in enumerate(filtered_cells[:max_cells]):
                 if i >= max_cells:
                     break
                 
+                cells_processed += 1
+                print(f"[ClusterExplorer] Processing cell {i+1}/{max_cells}: cell_idx={cell_idx}")
+                
                 # Get cell data
                 # cell_idx is an index label, not an integer position, so use loc instead of iloc
                 if cell_idx not in self.feature_dataframe.index:
-                    print(f"Warning: Cell index {cell_idx} not found in feature dataframe, skipping")
+                    print(f"[ClusterExplorer] WARNING: Cell index {cell_idx} not found in feature dataframe index")
+                    print(f"[ClusterExplorer]   Feature dataframe index type: {type(self.feature_dataframe.index)}")
+                    print(f"[ClusterExplorer]   Feature dataframe index length: {len(self.feature_dataframe.index)}")
+                    print(f"[ClusterExplorer]   First few indices: {list(self.feature_dataframe.index[:5])}")
+                    cells_skipped_no_index += 1
                     continue
+                
                 cell_data = self.feature_dataframe.loc[cell_idx]
                 acq_id = cell_data['acquisition_id']
+                cell_id = int(cell_data['cell_id'])
+                print(f"[ClusterExplorer]   Cell data retrieved - acq_id: {acq_id}, cell_id: {cell_id}")
                 
-                # Get mask and image
-                if acq_id in parent_window.segmentation_masks:
-                    mask = parent_window.segmentation_masks[acq_id]
-                    cell_id = int(cell_data['cell_id'])
-                    
-                    # Create cell mask
-                    cell_mask = (mask == cell_id).astype(np.uint8)
-                    
-                    if np.any(cell_mask):
-                        try:
-                            # Calculate cell center using regionprops
-                            props = regionprops(cell_mask)
-                            if props:
-                                center_y, center_x = props[0].centroid
-                                center_y, center_x = int(center_y), int(center_x)
-                                
-                                # Define crop boundaries
-                                half_crop = crop_size // 2
-                                y_start = max(0, center_y - half_crop)
-                                y_end = min(mask.shape[0], center_y + half_crop)
-                                x_start = max(0, center_x - half_crop)
-                                x_end = min(mask.shape[1], center_x + half_crop)
-                                
-                                # Crop the cell mask
-                                cropped_mask = cell_mask[y_start:y_end, x_start:x_end]
-                                
-                                # Get the correct loader for this acquisition
-                                loader = parent_window._get_loader_for_acquisition(acq_id)
-                                if loader is None:
-                                    print(f"Warning: No loader found for acquisition {acq_id}, skipping cell {cell_id}")
-                                    continue
-                                
-                                # Get original acquisition ID (needed for multi-file support)
-                                original_acq_id = parent_window._get_original_acq_id(acq_id)
-                                
-                                if self.rgb_checkbox.isChecked():
-                                    # Load RGB composite using user-selected channels
-                                    rgb_img = self._load_rgb_image(parent_window, acq_id, loader, original_acq_id)
-                                    if rgb_img is not None:
-                                        # Crop RGB image
-                                        cropped_rgb = rgb_img[y_start:y_end, x_start:x_end]
-                                        # Apply mask
-                                        for c in range(3):
-                                            cropped_rgb[:, :, c] *= cropped_mask
-                                        
-                                        # Create image widget with acquisition and cell info
-                                        acq_label = self._get_acquisition_label(acq_id)
-                                        img_widget = self._create_image_widget(cropped_rgb, f"{acq_label} - Cell {cell_id}", is_rgb=True)
-                                        grid_layout.addWidget(img_widget, i // 4, i % 4)
-                                        
-                                        self.cell_images.append({
-                                            'cell_id': cell_id,
-                                            'acquisition_id': acq_id,
-                                            'image': cropped_rgb
-                                        })
+                # Convert old acquisition ID format to new unique format (for multi-file support)
+                # Old format: "slide_0_acq_1", New format: "slide_0_acq_1__file_e149256f"
+                unique_acq_id = acq_id
+                if acq_id not in parent_window.segmentation_masks:
+                    # Try to find the unique acquisition ID that starts with the old ID + "__file_"
+                    matching_keys = [key for key in parent_window.segmentation_masks.keys() 
+                                   if key.startswith(acq_id + "__file_")]
+                    if matching_keys:
+                        # If multiple matches, we need to determine which file this cell came from
+                        # Check if we can determine from source_file column or use the first match
+                        if len(matching_keys) == 1:
+                            unique_acq_id = matching_keys[0]
+                            print(f"[ClusterExplorer]   Mapped old acq_id '{acq_id}' to unique acq_id '{unique_acq_id}'")
+                        else:
+                            # Multiple files have the same acquisition ID - need to determine which file
+                            # Try to use source_file from cell_data if available
+                            source_file = cell_data.get('source_file', None)
+                            if source_file:
+                                # Find the unique_acq_id that corresponds to this source_file
+                                # We need to check which file path matches
+                                for key in matching_keys:
+                                    # Get the file path for this unique_acq_id
+                                    if hasattr(parent_window, 'acq_to_file') and key in parent_window.acq_to_file:
+                                        file_path = parent_window.acq_to_file[key]
+                                        if source_file in file_path or file_path.endswith(source_file):
+                                            unique_acq_id = key
+                                            print(f"[ClusterExplorer]   Mapped old acq_id '{acq_id}' to unique acq_id '{unique_acq_id}' using source_file '{source_file}'")
+                                            break
                                 else:
-                                    # Load single channel using the correct loader and original acquisition ID
-                                    channel_img = loader.get_image(original_acq_id, channel)
-                                    # Crop channel image
-                                    cropped_channel = channel_img[y_start:y_end, x_start:x_end]
-                                    # Apply mask
-                                    cropped_channel *= cropped_mask
-                                    
-                                    # Create image widget with acquisition and cell info
-                                    acq_label = self._get_acquisition_label(acq_id)
-                                    # Include channel/acquisition info in title; do not pass unsupported kwargs
-                                    img_widget = self._create_image_widget(cropped_channel, f"{acq_label} - {channel} - Cell {cell_id}", is_rgb=False)
-                                    grid_layout.addWidget(img_widget, i // 4, i % 4)
-                                    
-                                    self.cell_images.append({
-                                        'cell_id': cell_id,
-                                        'acquisition_id': acq_id,
-                                        'image': cropped_channel
-                                    })
+                                    # Fallback: use first match
+                                    unique_acq_id = matching_keys[0]
+                                    print(f"[ClusterExplorer]   Multiple matches found, using first: '{unique_acq_id}'")
+                            else:
+                                # Fallback: use first match
+                                unique_acq_id = matching_keys[0]
+                                print(f"[ClusterExplorer]   Multiple matches found, using first: '{unique_acq_id}'")
+                    else:
+                        print(f"[ClusterExplorer]   WARNING: acq_id {acq_id} not in segmentation_masks and no matching unique ID found")
+                        print(f"[ClusterExplorer]   Available acq_ids in masks: {list(parent_window.segmentation_masks.keys())[:10]}")
+                        cells_skipped_no_mask += 1
+                        continue
+                
+                # Get mask and image using the unique acquisition ID
+                if unique_acq_id not in parent_window.segmentation_masks:
+                    print(f"[ClusterExplorer]   WARNING: unique_acq_id {unique_acq_id} not in segmentation_masks")
+                    cells_skipped_no_mask += 1
+                    continue
+                
+                print(f"[ClusterExplorer]   Found mask for unique_acq_id: {unique_acq_id}")
+                mask = parent_window.segmentation_masks[unique_acq_id]
+                print(f"[ClusterExplorer]   Mask shape: {mask.shape}, dtype: {mask.dtype}")
+                
+                # Create cell mask
+                cell_mask = (mask == cell_id).astype(np.uint8)
+                cell_mask_pixels = np.sum(cell_mask)
+                print(f"[ClusterExplorer]   Cell mask pixels: {cell_mask_pixels}")
+                
+                if not np.any(cell_mask):
+                    print(f"[ClusterExplorer]   WARNING: No pixels found for cell_id {cell_id} in mask")
+                    print(f"[ClusterExplorer]   Unique cell_ids in mask: {np.unique(mask)[:20]}... (showing first 20)")
+                    cells_skipped_no_cell_mask += 1
+                    continue
+                
+                # Cell mask found, proceed with image loading
+                print(f"[ClusterExplorer]   Cell mask found, proceeding to load image")
+                try:
+                    # Calculate cell center using regionprops
+                    props = regionprops(cell_mask)
+                    if not props:
+                        print(f"[ClusterExplorer]   WARNING: No regionprops found for cell_mask")
+                        continue
+                    
+                    center_y, center_x = props[0].centroid
+                    center_y, center_x = int(center_y), int(center_x)
+                    print(f"[ClusterExplorer]   Cell center: ({center_y}, {center_x})")
+                    
+                    # Define crop boundaries
+                    half_crop = crop_size // 2
+                    y_start = max(0, center_y - half_crop)
+                    y_end = min(mask.shape[0], center_y + half_crop)
+                    x_start = max(0, center_x - half_crop)
+                    x_end = min(mask.shape[1], center_x + half_crop)
+                    print(f"[ClusterExplorer]   Crop boundaries: y=[{y_start}:{y_end}], x=[{x_start}:{x_end}]")
+                    
+                    # Crop the cell mask
+                    cropped_mask = cell_mask[y_start:y_end, x_start:x_end]
+                    
+                    # Get the correct loader for this acquisition (use unique_acq_id)
+                    loader = parent_window._get_loader_for_acquisition(unique_acq_id)
+                    if loader is None:
+                        print(f"[ClusterExplorer]   WARNING: No loader found for acquisition {unique_acq_id}, skipping cell {cell_id}")
+                        cells_skipped_no_loader += 1
+                        continue
+                    
+                    print(f"[ClusterExplorer]   Loader found for unique_acq_id: {unique_acq_id}")
+                    
+                    # Get original acquisition ID (needed for multi-file support)
+                    original_acq_id = parent_window._get_original_acq_id(unique_acq_id)
+                    print(f"[ClusterExplorer]   Original acq_id: {original_acq_id}")
+                    
+                    if self.rgb_checkbox.isChecked():
+                        print(f"[ClusterExplorer]   Loading RGB image")
+                        # Load RGB composite using user-selected channels (use unique_acq_id)
+                        rgb_img = self._load_rgb_image(parent_window, unique_acq_id, loader, original_acq_id)
+                        if rgb_img is not None:
+                            print(f"[ClusterExplorer]   RGB image loaded, shape: {rgb_img.shape}")
+                            # Crop RGB image
+                            cropped_rgb = rgb_img[y_start:y_end, x_start:x_end]
+                            # Apply mask
+                            for c in range(3):
+                                cropped_rgb[:, :, c] *= cropped_mask
                             
-                        except Exception as e:
-                            print(f"Error loading image for cell {cell_id}: {e}")
+                            # Create image widget with source file and well name
+                            source_file = cell_data.get('source_file', 'Unknown')
+                            well_name = cell_data.get('well', cell_data.get('source_well', 'Unknown'))
+                            # Clean up source_file to just the filename without path
+                            if source_file and source_file != 'Unknown':
+                                source_file = os.path.basename(str(source_file))
+                            label = f"{source_file} - {well_name}" if well_name and well_name != 'Unknown' else source_file
+                            img_widget = self._create_image_widget(cropped_rgb, label, is_rgb=True)
+                            grid_layout.addWidget(img_widget, i // 4, i % 4)
+                            
+                            self.cell_images.append({
+                                'cell_id': cell_id,
+                                'acquisition_id': unique_acq_id,
+                                'image': cropped_rgb
+                            })
+                            cells_loaded += 1
+                            print(f"[ClusterExplorer]   Successfully loaded RGB image for cell {cell_id}")
+                        else:
+                            print(f"[ClusterExplorer]   WARNING: Failed to load RGB image")
+                    else:
+                        print(f"[ClusterExplorer]   Loading single channel image: {channel}")
+                        # Load single channel using the correct loader and original acquisition ID
+                        try:
+                            channel_img = loader.get_image(original_acq_id, channel)
+                            print(f"[ClusterExplorer]   Channel image loaded, shape: {channel_img.shape}")
+                            # Crop channel image
+                            cropped_channel = channel_img[y_start:y_end, x_start:x_end]
+                            # Apply mask
+                            cropped_channel *= cropped_mask
+                            
+                            # Create image widget with source file and well name
+                            source_file = cell_data.get('source_file', 'Unknown')
+                            well_name = cell_data.get('well', cell_data.get('source_well', 'Unknown'))
+                            # Clean up source_file to just the filename without path
+                            if source_file and source_file != 'Unknown':
+                                source_file = os.path.basename(str(source_file))
+                            label = f"{source_file} - {well_name}" if well_name and well_name != 'Unknown' else source_file
+                            img_widget = self._create_image_widget(cropped_channel, label, is_rgb=False)
+                            grid_layout.addWidget(img_widget, i // 4, i % 4)
+                            
+                            self.cell_images.append({
+                                'cell_id': cell_id,
+                                'acquisition_id': unique_acq_id,
+                                'image': cropped_channel
+                            })
+                            cells_loaded += 1
+                            print(f"[ClusterExplorer]   Successfully loaded channel image for cell {cell_id}")
+                        except Exception as img_error:
+                            print(f"[ClusterExplorer]   ERROR loading channel image: {img_error}")
+                            import traceback
+                            traceback.print_exc()
                             continue
+                
+                except Exception as e:
+                    print(f"[ClusterExplorer]   ERROR loading image for cell {cell_id}: {e}")
+                    import traceback
+                    traceback.print_exc()
+                    continue
+            
+            # Print summary statistics
+            print(f"[ClusterExplorer] ===== SUMMARY =====")
+            print(f"[ClusterExplorer] Cells processed: {cells_processed}")
+            print(f"[ClusterExplorer] Cells loaded successfully: {cells_loaded}")
+            print(f"[ClusterExplorer] Cells skipped - no index: {cells_skipped_no_index}")
+            print(f"[ClusterExplorer] Cells skipped - no mask: {cells_skipped_no_mask}")
+            print(f"[ClusterExplorer] Cells skipped - no cell mask: {cells_skipped_no_cell_mask}")
+            print(f"[ClusterExplorer] Cells skipped - no loader: {cells_skipped_no_loader}")
+            print(f"[ClusterExplorer] Total images loaded: {len(self.cell_images)}")
+            print(f"[ClusterExplorer] ===================")
             
             self.scroll_area.setWidget(grid_widget)
             self.status_label.setText(f"Loaded {len(self.cell_images)} cell images for Cluster {self.current_cluster['cluster_id']}")
             
         except Exception as e:
+            print(f"[ClusterExplorer] ===== FATAL ERROR =====")
+            print(f"[ClusterExplorer] Exception type: {type(e).__name__}")
+            print(f"[ClusterExplorer] Exception message: {str(e)}")
+            import traceback
+            traceback.print_exc()
+            print(f"[ClusterExplorer] =======================")
             QtWidgets.QMessageBox.critical(self, "Error", f"Error loading cell images: {str(e)}")
+    
+    def _normalize_channel_global(self, channel_img, channel_name, scale_factor=1.0):
+        """Normalize a channel image using global min/max values.
+        
+        If global min/max are available in cache, use those. Otherwise, fall back
+        to per-image normalization. Optionally apply a brightness scaling factor.
+        
+        Args:
+            channel_img: The channel image array
+            channel_name: Name of the channel
+            scale_factor: Brightness scaling factor (default 1.0 = no change)
+            
+        Returns:
+            Normalized image array (0-1 range, scaled by scale_factor and clipped)
+        """
+        if channel_name in self._global_channel_minmax_cache:
+            global_min, global_max = self._global_channel_minmax_cache[channel_name]
+            # Normalize using global min/max
+            if global_max > global_min:
+                normalized = (channel_img - global_min) / (global_max - global_min + 1e-8)
+                # Apply brightness scaling
+                normalized = normalized * scale_factor
+                # Clip to [0, 1] range in case some pixels exceed bounds
+                normalized = np.clip(normalized, 0, 1)
+                return normalized
+            else:
+                # Fallback if min == max
+                return np.zeros_like(channel_img)
+        else:
+            # Fallback to per-image normalization if cache not available
+            img_min = channel_img.min()
+            img_max = channel_img.max()
+            if img_max > img_min:
+                normalized = (channel_img - img_min) / (img_max - img_min + 1e-8)
+                # Apply brightness scaling
+                normalized = normalized * scale_factor
+                # Clip to [0, 1] range
+                normalized = np.clip(normalized, 0, 1)
+                return normalized
+            else:
+                return np.zeros_like(channel_img)
     
     def _load_rgb_image(self, parent_window, acq_id, loader=None, original_acq_id=None):
         """Load RGB composite image for an acquisition using user-selected channels."""
@@ -5165,10 +5980,11 @@ class ClusterExplorerDialog(QtWidgets.QDialog):
                     ch2 = loader.get_image(original_acq_id, g_channel)
                     ch3 = loader.get_image(original_acq_id, b_channel)
                     
-                    # Normalize each channel to 0-1 range
-                    ch1_norm = (ch1 - ch1.min()) / (ch1.max() - ch1.min() + 1e-8)
-                    ch2_norm = (ch2 - ch2.min()) / (ch2.max() - ch2.min() + 1e-8)
-                    ch3_norm = (ch3 - ch3.min()) / (ch3.max() - ch3.min() + 1e-8)
+                    # Normalize each channel to 0-1 range using GLOBAL min/max (not per-image)
+                    # Apply user-defined brightness scaling for each channel
+                    ch1_norm = self._normalize_channel_global(ch1, r_channel, self.rgb_r_scale)
+                    ch2_norm = self._normalize_channel_global(ch2, g_channel, self.rgb_g_scale)
+                    ch3_norm = self._normalize_channel_global(ch3, b_channel, self.rgb_b_scale)
                     
                     # Create RGB composite
                     rgb_img = np.stack([ch1_norm, ch2_norm, ch3_norm], axis=-1)
@@ -5202,10 +6018,11 @@ class ClusterExplorerDialog(QtWidgets.QDialog):
                     ch2 = parent_window.loader.get_image(acq_id, rgb_channels[1])
                     ch3 = parent_window.loader.get_image(acq_id, rgb_channels[2])
                     
-                    # Normalize each channel to 0-1 range
-                    ch1_norm = (ch1 - ch1.min()) / (ch1.max() - ch1.min() + 1e-8)
-                    ch2_norm = (ch2 - ch2.min()) / (ch2.max() - ch2.min() + 1e-8)
-                    ch3_norm = (ch3 - ch3.min()) / (ch3.max() - ch3.min() + 1e-8)
+                    # Normalize each channel to 0-1 range using GLOBAL min/max (not per-image)
+                    # Apply user-defined brightness scaling for each channel
+                    ch1_norm = self._normalize_channel_global(ch1, rgb_channels[0], self.rgb_r_scale)
+                    ch2_norm = self._normalize_channel_global(ch2, rgb_channels[1], self.rgb_g_scale)
+                    ch3_norm = self._normalize_channel_global(ch3, rgb_channels[2], self.rgb_b_scale)
                     
                     # Create RGB composite
                     rgb_img = np.stack([ch1_norm, ch2_norm, ch3_norm], axis=-1)
@@ -5215,6 +6032,285 @@ class ClusterExplorerDialog(QtWidgets.QDialog):
             print(f"Error loading RGB image: {e}")
         
         return None
+    
+    def _export_to_hdf5(self):
+        """Export cell images, features, channels, and masks to HDF5 file."""
+        if not self.current_cluster:
+            QtWidgets.QMessageBox.warning(self, "No Cluster", "Please select a cluster first.")
+            return
+        
+        # Get crop size from user
+        crop_size, ok = QtWidgets.QInputDialog.getInt(
+            self,
+            "Crop Size",
+            "Enter crop size (square, in pixels):",
+            value=30,
+            min=10,
+            max=200,
+            step=5
+        )
+        
+        if not ok:
+            return
+        
+        # Get output file path
+        default = f"cluster_{self.current_cluster['cluster_id']}_export.h5"
+        file_path, _ = QtWidgets.QFileDialog.getSaveFileName(
+            self,
+            "Export to HDF5",
+            default,
+            "HDF5 Files (*.h5 *.hdf5)"
+        )
+        
+        if not file_path:
+            return
+        
+        try:
+            import h5py
+        except ImportError:
+            QtWidgets.QMessageBox.critical(
+                self,
+                "Missing Dependency",
+                "h5py is required for HDF5 export. Please install it: pip install h5py"
+            )
+            return
+        
+        # Show progress
+        progress_dlg = QtWidgets.QProgressDialog("Exporting to HDF5...", "Cancel", 0, 100, self)
+        progress_dlg.setWindowModality(QtCore.Qt.WindowModal)
+        progress_dlg.setValue(0)
+        QtWidgets.QApplication.processEvents()
+        
+        try:
+            parent_window = self.parent()
+            if parent_window is None:
+                QtWidgets.QMessageBox.warning(self, "Error", "Cannot access parent window.")
+                return
+            
+            if not hasattr(parent_window, 'segmentation_masks'):
+                QtWidgets.QMessageBox.warning(self, "No Masks", "Segmentation masks are required for export.")
+                return
+            
+            # Get all cells from current cluster
+            cluster_cells = self.current_cluster['cells']
+            total_cells = len(cluster_cells)
+            
+            if total_cells == 0:
+                QtWidgets.QMessageBox.warning(self, "No Cells", "No cells in selected cluster.")
+                return
+            
+            # Get all available channels from feature dataframe
+            intensity_suffixes = ['_mean', '_std', '_p10', '_p90', '_integrated', '_frac_pos', '_median', '_mad']
+            channels = set()
+            for col in self.feature_dataframe.columns:
+                for suffix in intensity_suffixes:
+                    if col.endswith(suffix):
+                        channel = col[:-len(suffix)]
+                        channels.add(channel)
+                        break
+            
+            channels = sorted(list(channels))
+            
+            if not channels:
+                QtWidgets.QMessageBox.warning(self, "No Channels", "No channels found in feature dataframe.")
+                return
+            
+            # Group cells by acquisition
+            cells_by_acq = {}
+            for cell_idx in cluster_cells:
+                if cell_idx not in self.feature_dataframe.index:
+                    continue
+                
+                cell_data = self.feature_dataframe.loc[cell_idx]
+                acq_id = cell_data['acquisition_id']
+                
+                # Convert old acquisition ID to new unique format
+                unique_acq_id = acq_id
+                if acq_id not in parent_window.segmentation_masks:
+                    matching_keys = [key for key in parent_window.segmentation_masks.keys() 
+                                   if key.startswith(acq_id + "__file_")]
+                    if matching_keys:
+                        if len(matching_keys) == 1:
+                            unique_acq_id = matching_keys[0]
+                        else:
+                            source_file = cell_data.get('source_file', None)
+                            if source_file:
+                                for key in matching_keys:
+                                    if hasattr(parent_window, 'acq_to_file') and key in parent_window.acq_to_file:
+                                        file_path_check = parent_window.acq_to_file[key]
+                                        if source_file in file_path_check or file_path_check.endswith(source_file):
+                                            unique_acq_id = key
+                                            break
+                                else:
+                                    unique_acq_id = matching_keys[0]
+                            else:
+                                unique_acq_id = matching_keys[0]
+                    else:
+                        continue
+                
+                if unique_acq_id not in parent_window.segmentation_masks:
+                    continue
+                
+                if unique_acq_id not in cells_by_acq:
+                    cells_by_acq[unique_acq_id] = []
+                cells_by_acq[unique_acq_id].append(cell_idx)
+            
+            if not cells_by_acq:
+                QtWidgets.QMessageBox.warning(self, "No Valid Cells", "No valid cells could be found for export.")
+                return
+            
+            # Prepare data for multiprocessing
+            # We need to pass serializable data to workers
+            acq_tasks = []
+            for unique_acq_id, cell_indices in cells_by_acq.items():
+                # Get loader info
+                loader = parent_window._get_loader_for_acquisition(unique_acq_id)
+                if loader is None:
+                    continue
+                
+                original_acq_id = parent_window._get_original_acq_id(unique_acq_id)
+                mask = parent_window.segmentation_masks[unique_acq_id]
+                
+                # Get file path for loader
+                file_path_for_loader = None
+                if hasattr(parent_window, 'acq_to_file') and unique_acq_id in parent_window.acq_to_file:
+                    file_path_for_loader = parent_window.acq_to_file[unique_acq_id]
+                
+                # Get loader type - check if it's MCD or OME-TIFF
+                loader_type = 'mcd'
+                if hasattr(parent_window, 'mcd_loaders') and file_path_for_loader and file_path_for_loader in parent_window.mcd_loaders:
+                    loader_type = 'mcd'
+                elif file_path_for_loader and os.path.isdir(file_path_for_loader):
+                    loader_type = 'ometiff'
+                elif hasattr(parent_window, 'loader') and parent_window.loader is not None:
+                    # Single file case - try to determine from file extension
+                    if file_path_for_loader and file_path_for_loader.endswith(('.mcd', '.mcdx')):
+                        loader_type = 'mcd'
+                    else:
+                        loader_type = 'ometiff'
+                
+                # Prepare cell data for this acquisition
+                cell_data_list = []
+                for cell_idx in cell_indices:
+                    cell_data = self.feature_dataframe.loc[cell_idx].to_dict()
+                    cell_data['_cell_idx'] = cell_idx
+                    cell_data_list.append(cell_data)
+                
+                acq_tasks.append((
+                    unique_acq_id,
+                    original_acq_id,
+                    file_path_for_loader,
+                    loader_type,
+                    cell_data_list,
+                    channels,
+                    crop_size,
+                    mask
+                ))
+            
+            # Determine number of workers (max_cores - 2)
+            max_workers = max(1, mp.cpu_count() - 2)
+            total_acqs = len(acq_tasks)
+            
+            progress_dlg.setMaximum(total_acqs)
+            progress_dlg.setLabelText(f"Processing {total_acqs} acquisitions with {max_workers} workers...")
+            QtWidgets.QApplication.processEvents()
+            
+            # Process acquisitions in parallel
+            images_list = []
+            masks_list = []
+            features_list = []
+            valid_cell_indices = []
+            
+            with mp.Pool(processes=max_workers) as pool:
+                futures = []
+                for task in acq_tasks:
+                    future = pool.apply_async(_process_acquisition_export, task)
+                    futures.append(future)
+                
+                # Collect results as they complete
+                completed = 0
+                for future in futures:
+                    if progress_dlg.wasCanceled():
+                        pool.terminate()
+                        pool.join()
+                        return
+                    
+                    try:
+                        result = future.get(timeout=600)  # 10 minute timeout per acquisition
+                        if result:
+                            acq_images, acq_masks, acq_features, acq_indices = result
+                            images_list.extend(acq_images)
+                            masks_list.extend(acq_masks)
+                            features_list.extend(acq_features)
+                            valid_cell_indices.extend(acq_indices)
+                    except Exception as e:
+                        print(f"[ClusterExplorer] Error processing acquisition: {e}")
+                        import traceback
+                        traceback.print_exc()
+                        continue
+                    
+                    completed += 1
+                    progress_dlg.setValue(completed)
+                    progress_dlg.setLabelText(f"Processed {completed}/{total_acqs} acquisitions ({len(images_list)} cells)...")
+                    QtWidgets.QApplication.processEvents()
+            
+            if not images_list:
+                QtWidgets.QMessageBox.warning(self, "No Valid Cells", "No valid cells could be processed for export.")
+                return
+            
+            progress_dlg.setLabelText("Saving to HDF5 file...")
+            QtWidgets.QApplication.processEvents()
+            
+            # Convert to numpy arrays
+            images_array = np.array(images_list)  # Shape: (N, H, W, C)
+            masks_array = np.array(masks_list)    # Shape: (N, H, W)
+            
+            # Create features dataframe for valid cells
+            features_df = pd.DataFrame(features_list)
+            features_df.index = valid_cell_indices
+            
+            # Save to HDF5
+            with h5py.File(file_path, 'w') as f:
+                # Save images
+                f.create_dataset('images', data=images_array, compression='gzip', compression_opts=4)
+                
+                # Save masks
+                f.create_dataset('masks', data=masks_array, compression='gzip', compression_opts=4)
+                
+                # Save channels as list (convert to numpy array of strings)
+                channels_array = np.array([ch.encode('utf-8') for ch in channels], dtype='S')
+                f.create_dataset('channels', data=channels_array)
+                
+                # Save features as structured array
+                # Convert dataframe to numpy structured array
+                features_rec = features_df.to_records(index=False)
+                f.create_dataset('features', data=features_rec, compression='gzip', compression_opts=4)
+                
+                # Store column names as attribute
+                f['features'].attrs['columns'] = [col.encode('utf-8') for col in features_df.columns]
+                f['features'].attrs['index'] = [str(idx).encode('utf-8') for idx in features_df.index]
+            
+            progress_dlg.setValue(total_acqs)
+            
+            QtWidgets.QMessageBox.information(
+                self,
+                "Export Complete",
+                f"Successfully exported {len(images_list)} cells to:\n{file_path}\n\n"
+                f"Shape: {images_array.shape}\n"
+                f"Channels: {len(channels)}\n"
+                f"Crop size: {crop_size}x{crop_size}"
+            )
+            
+        except Exception as e:
+            QtWidgets.QMessageBox.critical(
+                self,
+                "Export Error",
+                f"Error exporting to HDF5: {str(e)}"
+            )
+            import traceback
+            traceback.print_exc()
+        finally:
+            progress_dlg.close()
     
     def _get_acquisition_label(self, acq_id):
         """Get a user-friendly label for an acquisition ID."""
@@ -5256,6 +6352,114 @@ class ClusterExplorerDialog(QtWidgets.QDialog):
         
         layout.addWidget(canvas)
         return widget
+
+
+def _process_acquisition_export(unique_acq_id, original_acq_id, file_path, loader_type, cell_data_list, channels, crop_size, mask):
+    """Worker function to process all cells for one acquisition.
+    
+    This function runs in a separate process and processes all cells for a single acquisition.
+    Returns: (images_list, masks_list, features_list, cell_indices_list)
+    """
+    try:
+        # Import here to avoid issues with multiprocessing
+        from openimc.data.mcd_loader import MCDLoader
+        from openimc.data.ometiff_loader import OMETIFFLoader
+        from skimage.measure import regionprops
+        
+        # Create loader
+        if loader_type == 'mcd' and file_path and os.path.isfile(file_path):
+            loader = MCDLoader()
+            loader.open(file_path)
+        elif file_path and os.path.isdir(file_path):
+            # OME-TIFF directory
+            loader = OMETIFFLoader(channel_format='CHW')
+            loader.open(file_path)
+        else:
+            # For single file or if we can't determine, we'll need to handle differently
+            # This is a fallback - in practice, we should have file_path
+            return None
+        
+        images_list = []
+        masks_list = []
+        features_list = []
+        cell_indices_list = []
+        
+        # Process all cells for this acquisition
+        for cell_data_dict in cell_data_list:
+            cell_idx = cell_data_dict.pop('_cell_idx')
+            cell_id = int(cell_data_dict['cell_id'])
+            
+            # Get cell mask
+            cell_mask = (mask == cell_id).astype(np.uint8)
+            
+            if not np.any(cell_mask):
+                continue
+            
+            # Get cell center
+            props = regionprops(cell_mask)
+            if not props:
+                continue
+            
+            center_y, center_x = props[0].centroid
+            center_y, center_x = int(center_y), int(center_x)
+            
+            # Define crop boundaries
+            half_crop = crop_size // 2
+            y_start = max(0, center_y - half_crop)
+            y_end = min(mask.shape[0], center_y + half_crop)
+            x_start = max(0, center_x - half_crop)
+            x_end = min(mask.shape[1], center_x + half_crop)
+            
+            # Load all channels for this cell
+            try:
+                available_channels = loader.get_channels(original_acq_id)
+                cell_image_channels = []
+                
+                for channel in channels:
+                    if channel not in available_channels:
+                        # Fill with zeros if channel not available
+                        cell_image_channels.append(np.zeros((y_end - y_start, x_end - x_start), dtype=np.float32))
+                    else:
+                        try:
+                            channel_img = loader.get_image(original_acq_id, channel)
+                            cropped_channel = channel_img[y_start:y_end, x_start:x_end]
+                            cell_image_channels.append(cropped_channel.astype(np.float32))
+                        except Exception:
+                            # Fill with zeros if loading fails
+                            cell_image_channels.append(np.zeros((y_end - y_start, x_end - x_start), dtype=np.float32))
+                
+                # Stack channels: shape will be (H, W, C)
+                cell_image = np.stack(cell_image_channels, axis=-1)
+                
+                # Crop mask to same size and convert to binary (0-1)
+                cropped_mask = cell_mask[y_start:y_end, x_start:x_end].astype(np.float32)
+                # Ensure binary (0 or 1)
+                cropped_mask = (cropped_mask > 0).astype(np.float32)
+                
+                # Ensure same size (pad if necessary)
+                if cell_image.shape[:2] != (crop_size, crop_size):
+                    # Pad to crop_size
+                    pad_y = crop_size - cell_image.shape[0]
+                    pad_x = crop_size - cell_image.shape[1]
+                    cell_image = np.pad(cell_image, ((0, pad_y), (0, pad_x), (0, 0)), mode='constant', constant_values=0)
+                    cropped_mask = np.pad(cropped_mask, ((0, pad_y), (0, pad_x)), mode='constant', constant_values=0)
+                
+                images_list.append(cell_image)
+                masks_list.append(cropped_mask)
+                features_list.append(cell_data_dict)
+                cell_indices_list.append(cell_idx)
+                
+            except Exception as e:
+                print(f"[ClusterExplorer] Error processing cell {cell_id} in acquisition {unique_acq_id}: {e}")
+                continue
+        
+        return (images_list, masks_list, features_list, cell_indices_list)
+        
+    except Exception as e:
+        print(f"[ClusterExplorer] Error processing acquisition {unique_acq_id}: {e}")
+        import traceback
+        traceback.print_exc()
+        return None
 
 
 class GatingRulesDialog(QtWidgets.QDialog):
@@ -5315,7 +6519,7 @@ class GatingRulesDialog(QtWidgets.QDialog):
         edit_btn.clicked.connect(self._on_edit)
         del_btn.clicked.connect(self._on_delete)
         def do_load():
-            from PyQt5 import QtWidgets as _QtW
+            from PyQt5 import QtWidgets, QtCore as _QtW
             import json
             path, _ = _QtW.QFileDialog.getOpenFileName(self, "Load Gating Rules", "", "JSON Files (*.json)")
             if not path:
@@ -5331,7 +6535,7 @@ class GatingRulesDialog(QtWidgets.QDialog):
             except Exception as e:
                 _QtW.QMessageBox.critical(self, "Load Error", f"Error loading gating rules: {str(e)}")
         def do_save():
-            from PyQt5 import QtWidgets as _QtW
+            from PyQt5 import QtWidgets, QtCore as _QtW
             import json
             path, _ = _QtW.QFileDialog.getSaveFileName(self, "Save Gating Rules", "gating_rules.json", "JSON Files (*.json)")
             if not path:
@@ -5532,8 +6736,31 @@ class PhenotypeSuggestionDialog(QtWidgets.QDialog):
         form.addRow("Cohort/tissue context:", self.context_edit)
 
         self.model_combo = QtWidgets.QComboBox()
-        self.model_combo.addItems(["gpt-5", "gpt-5-mini", "gpt-5-nano", "gpt-4.1"])
+        self.model_combo.addItems(["gpt-5", "gpt-5-mini", "gpt-5-nano", "gpt-4.1", "gpt-5.1"])
+        self.model_combo.setCurrentText("gpt-5.1")  # Set gpt-5.1 as default
         form.addRow("Model:", self.model_combo)
+
+        # Reasoning level dropdown (only visible for gpt-5.1)
+        self.reasoning_combo = QtWidgets.QComboBox()
+        self.reasoning_combo.addItems(["none", "low", "medium", "high"])
+        self.reasoning_combo.setCurrentText("none")  # Set none as default
+        # Create a container widget that includes both label and combo for proper hiding
+        # This ensures both the label and dropdown are hidden/shown together
+        self._reasoning_container = QtWidgets.QWidget()
+        reasoning_container_layout = QtWidgets.QHBoxLayout(self._reasoning_container)
+        reasoning_container_layout.setContentsMargins(0, 0, 0, 0)
+        reasoning_label = QtWidgets.QLabel("Reasoning level:")
+        reasoning_container_layout.addWidget(reasoning_label)
+        reasoning_container_layout.addWidget(self.reasoning_combo)
+        reasoning_container_layout.addStretch()
+        # Add as a row with empty label since we include the label in the container
+        form.addRow("", self._reasoning_container)
+        self._reasoning_container.hide()  # Hidden by default
+
+        # System prompt selection (fine vs broad cell types)
+        self.system_prompt_combo = QtWidgets.QComboBox()
+        self.system_prompt_combo.addItems(["Fine cell types (detailed)", "Broad cell types (Myeloid, Tumor, Stroma, etc.)"])
+        form.addRow("System prompt:", self.system_prompt_combo)
 
         # Feature mode selection for markers used in LLM prompt
         self.feature_mode_combo = QtWidgets.QComboBox()
@@ -5577,6 +6804,16 @@ class PhenotypeSuggestionDialog(QtWidgets.QDialog):
         # Default to Both
         self.feature_mode_combo.setCurrentText("Both")
         _update_feature_mode()
+
+        # Update reasoning level visibility when model changes
+        def _update_reasoning_visibility():
+            model = self.model_combo.currentText()
+            if model == "gpt-5.1":
+                self._reasoning_container.show()
+            else:
+                self._reasoning_container.hide()
+        self.model_combo.currentTextChanged.connect(lambda _t: _update_reasoning_visibility())
+        _update_reasoning_visibility()  # Set initial state
 
         layout.addLayout(form)
 
@@ -5999,10 +7236,16 @@ class PhenotypeSuggestionDialog(QtWidgets.QDialog):
             btn_group = QtWidgets.QButtonGroup(group_box)
             btn_group.setExclusive(True)
 
-            # Create a radio per guess and show rationale
+            # Create a radio per guess and show rationale with confidence
             for idx, g in enumerate(guesses):
                 name = str(g.get('name', '')).strip() or 'Unknown'
-                rb = QtWidgets.QRadioButton(f"{name}")
+                confidence = g.get('confidence')
+                if confidence is not None:
+                    confidence_str = f"{confidence:.1f}%" if isinstance(confidence, (int, float)) else str(confidence)
+                    display_name = f"{name} ({confidence_str})"
+                else:
+                    display_name = name
+                rb = QtWidgets.QRadioButton(display_name)
                 btn_group.addButton(rb, idx)
                 if idx == 0:
                     rb.setChecked(True)
@@ -6024,19 +7267,45 @@ class PhenotypeSuggestionDialog(QtWidgets.QDialog):
         self.choices_layout.addStretch(1)
 
     def _build_prompt_payload(self, cid, stat_obj, K: int, context_str: str):
-        system_prompt = (
-            "You are assisting with IMC cell type suggestions. Use only the provided marker statistics. "
-            "Prefer canonical immune/epithelial/stromal names and give exactly 3 plausible phenotypes per cluster. "
-            "Consider the range of values across and within clusters for each marker to help determine if the marker is truly unique to the cluster. "
-            "Consider if the z-score and mean value is true expression of the marker or if it is due to noise. "
-            "Try to give varied phenotypes, rather than the same phenotype with different names. "
-            "Focus on different marker combinations to avoid giving the same phenotype with different names. "
-            "If uncertain, return \"Unknown\". Output valid JSON exactly matching the given schema. Do not invent markers. "
-            "Return valid JSON only and no prose/explanations."
-        )
+        # Select system prompt based on user choice
+        prompt_type = self.system_prompt_combo.currentText()
+        if "Broad" in prompt_type:
+            # Broad cell types system prompt
+            system_prompt = (
+                "You are assisting with IMC cell type suggestions. Use only the provided marker statistics. "
+                "Classify cells into broad categories: Myeloid (macrophages, monocytes, dendritic cells, neutrophils, etc.), "
+                "Tumor (cancer cells), Stroma (fibroblasts, endothelial cells, etc.), Lymphoid (T cells, B cells, NK cells, etc.), "
+                "or other broad categories as appropriate. Give exactly 3 plausible phenotypes per cluster. "
+                "When you have high confidence (typically when confidence is above 50%), you may specify more specific cell types within the broad categories. "
+                "For example, within Lymphoid you can specify 'T cells', 'B cells', or 'NK cells' if the marker profile strongly supports it. "
+                "Within Myeloid, you can specify 'Macrophages', 'Dendritic cells', 'Neutrophils', etc. if confident. "
+                "For lower confidence predictions, use the broad category names (e.g., 'Lymphoid', 'Myeloid', 'Stroma', 'Tumor'). "
+                "Rank the 3 phenotypes from most likely to least likely, and provide a confidence percentage for each phenotype. "
+                "The three confidence percentages must sum to exactly 100%. "
+                "Consider the range of values across and within clusters for each marker to help determine if the marker is truly unique to the cluster. "
+                "Consider if the z-score and mean value is true expression of the marker or if it is due to noise. "
+                "Try to give varied phenotypes, rather than the same phenotype with different names. "
+                "Focus on different marker combinations to avoid giving the same phenotype with different names. "
+                "If uncertain, return \"Unknown\". Output valid JSON exactly matching the given schema. Do not invent markers. "
+                "Return valid JSON only and no prose/explanations."
+            )
+        else:
+            # Fine cell types system prompt (default)
+            system_prompt = (
+                "You are assisting with IMC cell type suggestions. Use only the provided marker statistics. "
+                "Prefer canonical immune/epithelial/stromal names and give exactly 3 plausible phenotypes per cluster. "
+                "Rank the 3 phenotypes from most likely to least likely, and provide a confidence percentage for each phenotype. "
+                "The three confidence percentages must sum to exactly 100%. "
+                "Consider the range of values across and within clusters for each marker to help determine if the marker is truly unique to the cluster. "
+                "Consider if the z-score and mean value is true expression of the marker or if it is due to noise. "
+                "Try to give varied phenotypes, rather than the same phenotype with different names. "
+                "Focus on different marker combinations to avoid giving the same phenotype with different names. "
+                "If uncertain, return \"Unknown\". Output valid JSON exactly matching the given schema. Do not invent markers. "
+                "Return valid JSON only and no prose/explanations."
+            )
         schema = {
             "cluster_id": str(cid),
-            "phenotype_guesses": [ { "name": "", "rationale": "" } ],
+            "phenotype_guesses": [ { "name": "", "rationale": "", "confidence": 0 } ],
             "key_markers_positive": [],
             "key_markers_negative": [],
             "notes": ""
@@ -6063,7 +7332,7 @@ class PhenotypeSuggestionDialog(QtWidgets.QDialog):
             {
                 "role": "system",
                 "content": [
-                    {"type": "input_text", "text": system_prompt + " Schema: {\\n  \\\"cluster_id\\\": \\\"string\\\",\\n  \\\"phenotype_guesses\\\": [\\n    { \\\"name\\\": \\\"string\\\", \\\"rationale\\\": \\\"string\\\" }\\n  ],\\n  \\\"key_markers_positive\\\": [\\\"string\\\"],\\n  \\\"key_markers_negative\\\": [\\\"string\\\"],\\n  \\\"notes\\\": \\\"string\\\"\\n}"}
+                    {"type": "input_text", "text": system_prompt + " Schema: {\\n  \\\"cluster_id\\\": \\\"string\\\",\\n  \\\"phenotype_guesses\\\": [\\n    { \\\"name\\\": \\\"string\\\", \\\"rationale\\\": \\\"string\\\", \\\"confidence\\\": number }\\n  ],\\n  \\\"key_markers_positive\\\": [\\\"string\\\"],\\n  \\\"key_markers_negative\\\": [\\\"string\\\"],\\n  \\\"notes\\\": \\\"string\\\"\\n}"}
                 ]
             },
             {
@@ -6097,12 +7366,18 @@ class PhenotypeSuggestionDialog(QtWidgets.QDialog):
             pass
         # Responses API call
         try:
-            resp = client.responses.create(
-                model=data.get('model', 'gpt-5'),
-                max_output_tokens=data.get('max_tokens', 2000),
-                input=input_payload,
-                reasoning={'effort': 'low'}
-            )
+            model_name = data.get('model', 'gpt-5')
+            create_kwargs = {
+                'model': model_name,
+                'max_output_tokens': data.get('max_tokens', 2000),
+                'input': input_payload
+            }
+            # Only add reasoning parameter for gpt-5.1
+            if model_name == 'gpt-5.1':
+                reasoning_level = self.reasoning_combo.currentText()
+                if reasoning_level != 'none':
+                    create_kwargs['reasoning'] = {'effort': reasoning_level}
+            resp = client.responses.create(**create_kwargs)
         except Exception as e:
             error_msg = str(e)
             
@@ -6145,6 +7420,28 @@ class PhenotypeSuggestionDialog(QtWidgets.QDialog):
                 obj['cluster_id'] = str(cid)
             if not isinstance(obj.get('phenotype_guesses', []), list):
                 obj['phenotype_guesses'] = []
+            # Ensure confidence values are present and validate they sum to 100%
+            guesses = obj.get('phenotype_guesses', [])
+            if guesses:
+                confidences = []
+                for g in guesses:
+                    if 'confidence' not in g:
+                        g['confidence'] = None
+                    else:
+                        conf = g.get('confidence')
+                        if conf is not None:
+                            try:
+                                confidences.append(float(conf))
+                            except (ValueError, TypeError):
+                                confidences.append(None)
+                # If all confidences are provided, normalize to sum to 100
+                if confidences and all(c is not None for c in confidences):
+                    total = sum(confidences)
+                    if total > 0 and abs(total - 100.0) > 0.1:  # Allow small floating point differences
+                        # Normalize to sum to 100
+                        for i, g in enumerate(guesses):
+                            if i < len(confidences) and confidences[i] is not None:
+                                g['confidence'] = round((confidences[i] / total) * 100.0, 1)
             if not isinstance(obj.get('key_markers_positive', []), list):
                 obj['key_markers_positive'] = []
             if not isinstance(obj.get('key_markers_negative', []), list):

@@ -2376,7 +2376,7 @@ Examples:
     batch_parser.add_argument('--sigma', type=float, default=0.1, help='Width of soft kmeans clusters for Harmony (default: 0.1)')
     batch_parser.add_argument('--theta', type=float, default=2.0, help='Diversity clustering penalty parameter for Harmony (default: 2.0)')
     batch_parser.add_argument('--lambda-reg', type=float, default=1.0, help='Regularization parameter for Harmony (default: 1.0)')
-    batch_parser.add_argument('--max-iter', type=int, default=10, help='Maximum iterations for Harmony (default: 10)')
+    batch_parser.add_argument('--max-iter', type=int, default=20, help='Maximum iterations for Harmony (default: 20)')
     batch_parser.add_argument('--pca-variance', type=float, default=0.9, help='Proportion of variance to retain in PCA for Harmony (default: 0.9)')
     batch_parser.add_argument('--workers', type=int, default=None, help=f'Number of parallel workers (default: {get_default_workers()})')
     batch_parser.set_defaults(func=batch_correction_command)

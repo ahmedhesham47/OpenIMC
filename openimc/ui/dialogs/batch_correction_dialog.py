@@ -812,7 +812,7 @@ class BatchCorrectionDialog(QtWidgets.QDialog):
                 sigma=0.1,  # Default, could add UI control later
                 theta=2.0,  # Default, could add UI control later
                 lambda_reg=1.0,  # Default, could add UI control later
-                max_iter=10,  # Default, could add UI control later
+                max_iter=20,  # Default, could add UI control later
                 pca_variance=pca_variance
             )
             

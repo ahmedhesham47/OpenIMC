@@ -1574,7 +1574,7 @@ def batch_correction(
     sigma: float = 0.1,
     theta: float = 2.0,
     lambda_reg: float = 1.0,
-    max_iter: int = 10,
+    max_iter: int = 20,
     pca_variance: float = 0.9
 ) -> pd.DataFrame:
     """Apply batch correction to feature data.
@@ -1593,7 +1593,7 @@ def batch_correction(
         sigma: Width of soft kmeans clusters for Harmony (default: 0.1)
         theta: Diversity clustering penalty parameter for Harmony (default: 2.0)
         lambda_reg: Regularization parameter for Harmony (default: 1.0)
-        max_iter: Maximum number of iterations for Harmony (default: 10)
+        max_iter: Maximum number of iterations for Harmony (default: 20)
         pca_variance: Proportion of variance to retain in PCA for Harmony (default: 0.9)
     
     Returns:

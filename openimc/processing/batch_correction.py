@@ -292,7 +292,7 @@ def apply_harmony_correction(
     sigma: float = 0.1,
     theta: float = 2.0,
     lambda_reg: float = 1.0,
-    max_iter: int = 10,
+    max_iter: int = 20,
     pca_variance: float = 0.9
 ) -> pd.DataFrame:
     """
@@ -318,7 +318,7 @@ def apply_harmony_correction(
     lambda_reg : float
         Regularization parameter (default: 1.0)
     max_iter : int
-        Maximum number of iterations (default: 10)
+        Maximum number of iterations (default: 20)
     pca_variance : float
         Proportion of variance to retain in PCA (default: 0.9, i.e., 90%)
     

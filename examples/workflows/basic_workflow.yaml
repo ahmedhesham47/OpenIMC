@@ -129,7 +129,7 @@ batch_correction:
   sigma: 0.1
   theta: 2.0
   lambda_reg: 1.0
-  max_iter: 10
+  max_iter: 20
   pca_variance: 0.9               # Proportion of variance to retain in PCA
   
   # ComBat parameters
