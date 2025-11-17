@@ -30,3 +30,6 @@ htmlcov/
 openimc.egg-info/
 
 .pytest_cache/
+
+openimc-egg.info/
+htmlcov/
