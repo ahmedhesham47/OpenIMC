@@ -49,8 +49,63 @@ def run_gui():
         pass
 
     from PyQt5 import QtWidgets, QtGui
+    from PyQt5.QtCore import Qt
 
     app = QtWidgets.QApplication(sys.argv)
+    
+    # Set application name and display name for system dock/taskbar
+    app.setApplicationName("OpenIMC")
+    app.setApplicationDisplayName("OpenIMC")
+    
+    # Load and set application icon
+    icon = None
+    icon_path = None
+    try:
+        # Try multiple methods to find the icon file
+        # Method 1: Relative to __main__.py (works in development)
+        icon_path = os.path.join(os.path.dirname(__file__), 'ui', 'resources', 'OpenIMC_Icon.png')
+        if not os.path.exists(icon_path):
+            # Method 2: Try using importlib.resources (works when installed)
+            try:
+                import importlib.resources
+                with importlib.resources.path('openimc.ui.resources', 'OpenIMC_Icon.png') as p:
+                    icon_path = str(p)
+            except (ImportError, ModuleNotFoundError, FileNotFoundError):
+                # Method 3: Try relative to openimc package
+                import openimc
+                icon_path = os.path.join(os.path.dirname(openimc.__file__), 'ui', 'resources', 'OpenIMC_Icon.png')
+        
+        # Convert to absolute path for better compatibility
+        icon_path = os.path.abspath(icon_path)
+        
+        if os.path.exists(icon_path):
+            # Create icon with explicit sizes for better Linux compatibility
+            icon = QtGui.QIcon()
+            pixmap = QtGui.QPixmap(icon_path)
+            if not pixmap.isNull():
+                # Add multiple sizes to the icon (Linux window managers often need this)
+                icon.addPixmap(pixmap, QtGui.QIcon.Normal, QtGui.QIcon.Off)
+                # Also add scaled versions for different contexts
+                for size in [16, 32, 48, 64, 128, 256]:
+                    scaled = pixmap.scaled(size, size, Qt.KeepAspectRatio, Qt.SmoothTransformation)
+                    icon.addPixmap(scaled, QtGui.QIcon.Normal, QtGui.QIcon.Off)
+                
+                if not icon.isNull():
+                    app.setWindowIcon(icon)
+                    # On Linux, also set the WM_CLASS hint for better dock integration
+                    if platform.system() == 'Linux':
+                        app.setDesktopFileName('openimc')
+    except Exception as e:
+        # If icon loading fails, continue without it
+        # Enable debugging by setting environment variable: export OPENIMC_DEBUG_ICON=1
+        if os.environ.get('OPENIMC_DEBUG_ICON'):
+            print(f"Warning: Could not load application icon: {e}")
+            print(f"  Attempted path: {icon_path}")
+            if icon_path and os.path.exists(icon_path):
+                print(f"  File exists: {icon_path}")
+            else:
+                print(f"  File does not exist: {icon_path}")
+        pass
 
     # Load font size preference or use default
     from openimc.ui.dialogs.display_settings_dialog import (
@@ -75,6 +130,13 @@ def run_gui():
     from openimc.ui.main_window import MainWindow  # type: ignore
 
     win = MainWindow()
+    # Ensure the main window also has the icon set BEFORE showing
+    # This is critical - the icon must be set before show() on some Linux window managers
+    if icon is not None:
+        win.setWindowIcon(icon)
+    elif not app.windowIcon().isNull():
+        win.setWindowIcon(app.windowIcon())
+    
     win.show()
 
     sys.exit(app.exec_())

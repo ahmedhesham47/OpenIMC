@@ -8,7 +8,7 @@ OpenIMC is a comprehensive, open-source PyQt5-based platform for analyzing Imagi
 
 For complete documentation, installation instructions, and usage guides, please visit:
 
-**https://dean-tessone.github.io/OpenIMC/index.html**
+**https://dean-tessone.github.io/OpenIMC/overview.html**
 
 ## Quick Start
 

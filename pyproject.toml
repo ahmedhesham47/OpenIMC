@@ -73,6 +73,9 @@ openimc = "openimc.__main__:cli"
 include = ["openimc*"]
 exclude = ["tests*", "docs*", "examples*", "scripts*", "third_party*", "logs*"]
 
+[tool.setuptools.package-data]
+openimc = ["ui/resources/*.png"]
+
 # Pytest configuration
 [tool.pytest.ini_options]
 testpaths = ["tests"]
