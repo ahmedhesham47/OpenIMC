@@ -26,11 +26,20 @@ the GUI and CLI interfaces, ensuring exact parity between them.
 
 import json
 import os
+import sys
+import gc
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, Dict, List, Optional, Tuple, Union
 
 if TYPE_CHECKING:
     import anndata as ad
+
+# Try to import psutil for better memory tracking
+try:
+    import psutil
+    _HAVE_PSUTIL = True
+except ImportError:
+    _HAVE_PSUTIL = False
 
 import numpy as np
 import pandas as pd
@@ -137,7 +146,7 @@ def preprocess(
     output_dir: Union[str, Path],
     denoise_settings: Optional[Dict] = None,
     normalization_method: str = "None",
-    arcsinh_cofactor: float = 10.0,
+    arcsinh_cofactor: float = 1.0,
     percentile_params: Tuple[float, float] = (1.0, 99.0),
     viewer_denoise_func: Optional[callable] = None
 ) -> Path:
@@ -162,9 +171,12 @@ def preprocess(
     output_dir = Path(output_dir)
     output_dir.mkdir(parents=True, exist_ok=True)
     
+    # Extract original acquisition ID for loader calls (handles multi-file unique IDs)
+    original_acq_id = _extract_original_acq_id(acquisition.id)
+    
     # Get all channels
-    channels = loader.get_channels(acquisition.id)
-    img_stack = loader.get_all_channels(acquisition.id)
+    channels = loader.get_channels(original_acq_id)
+    img_stack = loader.get_all_channels(original_acq_id)
     
     # Process each channel
     processed_channels = []
@@ -240,7 +252,7 @@ def _preprocess_channels_for_segmentation(
     cyto_channels: List[str],
     denoise_settings: Optional[Dict] = None,
     normalization_method: str = "None",
-    arcsinh_cofactor: float = 10.0,
+    arcsinh_cofactor: float = 1.0,
     percentile_params: Tuple[float, float] = (1.0, 99.0),
     nuclear_combo_method: str = "mean",
     cyto_combo_method: str = "mean",
@@ -266,10 +278,17 @@ def _preprocess_channels_for_segmentation(
     Returns:
         Tuple of (nuclear_img, cyto_img) where cyto_img can be None
     """
+    # Extract original acquisition ID for loader calls (handles multi-file unique IDs)
+    original_acq_id = _extract_original_acq_id(acquisition.id)
+    
+    _log_memory_debug(f"Starting preprocessing for {acquisition.id} (original: {original_acq_id})")
+    
     # Load and preprocess nuclear channels
     nuclear_imgs = []
     for channel in nuclear_channels:
-        img = loader.get_image(acquisition.id, channel)
+        _log_memory_debug(f"Loading nuclear channel {channel} for {acquisition.id}")
+        img = loader.get_image(original_acq_id, channel)
+        _log_memory_debug(f"Loaded nuclear channel {channel}", img, f"nuclear_{channel}")
         # Apply denoising if custom settings provided
         if denoise_settings and channel in denoise_settings:
             img = _apply_denoise_to_channel(img, channel, denoise_settings[channel])
@@ -286,15 +305,24 @@ def _preprocess_channels_for_segmentation(
         nuclear_imgs.append(img)
     
     # Combine nuclear channels
+    _log_memory_debug(f"Combining {len(nuclear_imgs)} nuclear channels for {acquisition.id}")
     nuclear_img = combine_channels(nuclear_imgs, nuclear_combo_method, nuclear_weights)
     nuclear_img = _ensure_0_1_range(nuclear_img)
+    _log_memory_debug(f"Combined nuclear image created", nuclear_img, "nuclear_img")
+    # Release intermediate images immediately to free memory
+    _log_memory_debug(f"Deleting {len(nuclear_imgs)} nuclear channel images")
+    del nuclear_imgs
+    gc.collect()
+    _log_memory_debug(f"After deleting nuclear_imgs")
     
     # Load and preprocess cytoplasm channels
     cyto_img = None
     if cyto_channels:
         cyto_imgs = []
         for channel in cyto_channels:
-            img = loader.get_image(acquisition.id, channel)
+            _log_memory_debug(f"Loading cyto channel {channel} for {acquisition.id}")
+            img = loader.get_image(original_acq_id, channel)
+            _log_memory_debug(f"Loaded cyto channel {channel}", img, f"cyto_{channel}")
             # Apply denoising if custom settings provided
             if denoise_settings and channel in denoise_settings:
                 img = _apply_denoise_to_channel(img, channel, denoise_settings[channel])
@@ -311,10 +339,61 @@ def _preprocess_channels_for_segmentation(
             cyto_imgs.append(img)
         
         # Combine cytoplasm channels
+        _log_memory_debug(f"Combining {len(cyto_imgs)} cyto channels for {acquisition.id}")
         cyto_img = combine_channels(cyto_imgs, cyto_combo_method, cyto_weights)
         cyto_img = _ensure_0_1_range(cyto_img)
+        _log_memory_debug(f"Combined cyto image created", cyto_img, "cyto_img")
+        # Release intermediate images immediately to free memory
+        _log_memory_debug(f"Deleting {len(cyto_imgs)} cyto channel images")
+        del cyto_imgs
+        gc.collect()
+        _log_memory_debug(f"After deleting cyto_imgs")
     
+    _log_memory_debug(f"Preprocessing complete for {acquisition.id}", nuclear_img, "final_nuclear_img")
+    if cyto_img is not None:
+        _log_memory_debug(f"Preprocessing complete for {acquisition.id}", cyto_img, "final_cyto_img")
     return nuclear_img, cyto_img
+
+
+def _get_memory_usage_mb():
+    """Get current memory usage in MB."""
+    if _HAVE_PSUTIL:
+        process = psutil.Process(os.getpid())
+        return process.memory_info().rss / 1024 / 1024
+    else:
+        # Fallback: approximate using sys.getsizeof
+        return sys.getsizeof(gc.get_objects()) / 1024 / 1024
+
+
+def _log_memory_debug(message, obj=None, obj_name=None):
+    """Log memory usage with optional object info."""
+    mem_mb = _get_memory_usage_mb()
+    if obj is not None and obj_name:
+        if isinstance(obj, np.ndarray):
+            obj_size_mb = obj.nbytes / 1024 / 1024
+            print(f"[MEM_DEBUG] {message} | Memory: {mem_mb:.1f} MB | {obj_name}: {obj.shape} {obj.dtype} ({obj_size_mb:.2f} MB)")
+        else:
+            print(f"[MEM_DEBUG] {message} | Memory: {mem_mb:.1f} MB | {obj_name}: {type(obj).__name__}")
+    else:
+        print(f"[MEM_DEBUG] {message} | Memory: {mem_mb:.1f} MB")
+
+
+def _extract_original_acq_id(acq_id: str) -> str:
+    """Extract original acquisition ID from unique ID format.
+    
+    For multi-file support, acquisition IDs may be in format:
+    'slide_0_acq_0__file_e149256f' -> 'slide_0_acq_0'
+    
+    Args:
+        acq_id: Acquisition ID (may be unique or original)
+    
+    Returns:
+        Original acquisition ID
+    """
+    if '__file_' in acq_id:
+        # Extract original ID by removing __file_* suffix
+        return acq_id.split('__file_')[0]
+    return acq_id
 
 
 def segment(
@@ -326,7 +405,7 @@ def segment(
     output_dir: Optional[Union[str, Path]] = None,
     denoise_settings: Optional[Dict] = None,
     normalization_method: str = "None",
-    arcsinh_cofactor: float = 10.0,
+    arcsinh_cofactor: float = 1.0,
     percentile_params: Tuple[float, float] = (1.0, 99.0),
     nuclear_combo_method: str = "mean",
     cyto_combo_method: str = "mean",
@@ -392,8 +471,11 @@ def segment(
     if cyto_channels is None:
         cyto_channels = []
     
+    # Extract original acquisition ID for loader calls (handles multi-file unique IDs)
+    original_acq_id = _extract_original_acq_id(acquisition.id)
+    
     # Validate channels
-    channels = loader.get_channels(acquisition.id)
+    channels = loader.get_channels(original_acq_id)
     missing_nuclear = [ch for ch in nuclear_channels if ch not in channels]
     missing_cyto = [ch for ch in cyto_channels if ch not in channels]
     if missing_nuclear:
@@ -405,12 +487,11 @@ def segment(
     
     # Run segmentation based on method
     if method == 'cellsam':
-        # Try to import CellSAM
-        # Catch both ImportError and OSError (Windows DLL loading errors)
+        # Use our custom CellSAM implementation with proper model caching
         try:
-            from cellSAM import get_model, cellsam_pipeline
-        except (ImportError, OSError):
-            raise ImportError("CellSAM not installed or failed to load. Install with: pip install git+https://github.com/vanvalenlab/cellSAM.git")
+            from openimc.processing.custom_cellsam import cellsam_pipeline_custom
+        except (ImportError, OSError) as e:
+            raise ImportError(f"CellSAM not installed or failed to load: {e}. Install with: pip install git+https://github.com/vanvalenlab/cellSAM.git")
         
         # Set API key from argument or environment variable
         api_key = deepcell_api_key or os.environ.get("DEEPCELL_ACCESS_TOKEN", "")
@@ -418,13 +499,10 @@ def segment(
             raise ValueError("DeepCell API key is required for CellSAM. Set deepcell_api_key or DEEPCELL_ACCESS_TOKEN environment variable.")
         os.environ["DEEPCELL_ACCESS_TOKEN"] = api_key
         
-        # Initialize CellSAM model and download weights
-        try:
-            get_model()  # This downloads weights if not already present
-        except Exception as e:
-            raise RuntimeError(f"Failed to initialize CellSAM model: {e}. Please check your API key and internet connection.")
+        _log_memory_debug(f"Using custom CellSAM implementation for {acquisition.id}")
         
         # Preprocess channels
+        _log_memory_debug(f"Starting CellSAM segmentation for {acquisition.id}")
         nuclear_img, cyto_img = _preprocess_channels_for_segmentation(
             loader, acquisition, nuclear_channels, cyto_channels,
             denoise_settings, normalization_method, arcsinh_cofactor,
@@ -433,29 +511,50 @@ def segment(
         )
         
         # Prepare input for CellSAM (supports nuclear-only, cyto-only, or combined)
+        _log_memory_debug(f"Preparing CellSAM input for {acquisition.id}")
         if nuclear_channels and cyto_channels:
             # Combined mode: H x W x 3 array
             h, w = nuclear_img.shape
             cellsam_input = np.zeros((h, w, 3), dtype=np.float32)
             cellsam_input[:, :, 1] = nuclear_img  # Channel 1 is nuclear
             cellsam_input[:, :, 2] = cyto_img if cyto_img is not None else nuclear_img  # Channel 2 is cyto
+            _log_memory_debug(f"Created combined CellSAM input", cellsam_input, "cellsam_input")
         elif nuclear_channels:
             # Nuclear only mode: H x W array
             cellsam_input = nuclear_img
+            _log_memory_debug(f"Using nuclear-only CellSAM input", cellsam_input, "cellsam_input")
         elif cyto_channels:
             # Cyto only mode: H x W array
             cellsam_input = cyto_img if cyto_img is not None else nuclear_img
+            _log_memory_debug(f"Using cyto-only CellSAM input", cellsam_input, "cellsam_input")
         else:
             raise ValueError("At least one channel (nuclear or cyto) must be selected for CellSAM")
         
-        # Run CellSAM pipeline
-        mask = cellsam_pipeline(
+        # Run CellSAM pipeline using our custom implementation
+        _log_memory_debug(f"Running CellSAM pipeline for {acquisition.id}")
+        _log_memory_debug(f"Before cellsam_pipeline_custom call for {acquisition.id}")
+        mask = cellsam_pipeline_custom(
             cellsam_input,
             bbox_threshold=bbox_threshold,
             use_wsi=use_wsi,
             low_contrast_enhancement=low_contrast_enhancement,
             gauge_cell_size=gauge_cell_size
         )
+        _log_memory_debug(f"After cellsam_pipeline_custom call for {acquisition.id}")
+        _log_memory_debug(f"CellSAM pipeline complete, mask created", mask, "mask")
+        
+        # Immediately release input images to free memory
+        _log_memory_debug(f"Deleting CellSAM input images for {acquisition.id}")
+        del cellsam_input
+        _log_memory_debug(f"Deleted cellsam_input")
+        del nuclear_img
+        _log_memory_debug(f"Deleted nuclear_img")
+        if cyto_img is not None:
+            del cyto_img
+            _log_memory_debug(f"Deleted cyto_img")
+        gc.collect()
+        _log_memory_debug(f"After GC, mask still exists", mask, "mask_after_cleanup")
+        
         # Use mask directly without modifications
         if isinstance(mask, np.ndarray):
             mask = mask.copy()
@@ -509,8 +608,9 @@ def segment(
     
     elif method == 'watershed':
         # Get image stack and channels for watershed
-        channels = loader.get_channels(acquisition.id)
-        img_stack = loader.get_all_channels(acquisition.id)
+        # Use original_acq_id extracted above
+        channels = loader.get_channels(original_acq_id)
+        img_stack = loader.get_all_channels(original_acq_id)
         
         # Run watershed segmentation
         mask = watershed_segmentation(
@@ -533,15 +633,12 @@ def segment(
         
         # Use well name if available, otherwise use acquisition name
         if acquisition.well:
-            output_filename = f"{acquisition.well}_segmentation.tif"
+            output_filename = f"{acquisition.well}_segmentation_masks.tif"
         else:
-            output_filename = f"{acquisition.name}_segmentation.tif"
+            output_filename = f"{acquisition.name}_segmentation_masks.tif"
         output_path = output_dir / output_filename
         
-        tifffile.imwrite(str(output_path), mask.astype(np.uint32), compression='lzw')
-        
-        # Also save as numpy array for easier loading
-        np.save(str(output_path).replace('.tif', '.npy'), mask)
+        tifffile.imwrite(str(output_path), mask.astype(np.uint16), compression='lzw')
     
     return mask
 
@@ -661,7 +758,7 @@ def extract_features(
     intensity: bool = True,
     denoise_settings: Optional[Dict] = None,
     arcsinh: bool = False,
-    arcsinh_cofactor: float = 10.0,
+    arcsinh_cofactor: float = 1.0,
     spillover_config: Optional[Dict] = None,
     excluded_channels: Optional[set] = None,
     selected_features: Optional[Dict[str, bool]] = None
@@ -701,9 +798,12 @@ def extract_features(
         if acq.id not in masks_dict:
             continue
         
+        # Extract original acquisition ID for loader calls (handles multi-file unique IDs)
+        original_acq_id = _extract_original_acq_id(acq.id)
+        
         mask = masks_dict[acq.id]
-        channels = loader.get_channels(acq.id)
-        img_stack = loader.get_all_channels(acq.id)
+        channels = loader.get_channels(original_acq_id)
+        img_stack = loader.get_all_channels(original_acq_id)
         
         # Prepare acquisition info
         acq_info = {
@@ -1680,8 +1780,11 @@ def pixel_correlation(
     from scipy.stats import spearmanr
     from statsmodels.stats.multitest import multipletests
     
+    # Extract original acquisition ID for loader calls (handles multi-file unique IDs)
+    original_acq_id = _extract_original_acq_id(acquisition.id)
+    
     # Load image stack for all channels
-    img_stack = loader.get_all_channels(acquisition.id)
+    img_stack = loader.get_all_channels(original_acq_id)
     
     # Determine shape - loaders return HWC format (H, W, C)
     if img_stack.ndim == 3:
@@ -1797,6 +1900,9 @@ def qc_analysis(
     Returns:
         DataFrame with QC metrics per channel
     """
+    # Extract original acquisition ID for loader calls (handles multi-file unique IDs)
+    original_acq_id = _extract_original_acq_id(acquisition.id)
+    
     # Optional scikit-image for Otsu thresholding
     try:
         from skimage.filters import threshold_otsu
@@ -1824,7 +1930,7 @@ def qc_analysis(
     for channel in channels:
         try:
             # Load image
-            img = loader.get_image(acquisition.id, channel)
+            img = loader.get_image(original_acq_id, channel)
             if img is None:
                 continue
             
@@ -2636,7 +2742,8 @@ def build_spatial_graph_anndata(
 def spatial_neighborhood_enrichment(
     anndata_dict: Dict[str, 'ad.AnnData'],
     cluster_key: str = "cluster",
-    aggregation: str = "mean"
+    aggregation: str = "mean",
+    significance_threshold: float = 2.0
 ) -> Dict[str, Any]:
     """Compute neighborhood enrichment using squidpy.
     
@@ -2646,12 +2753,14 @@ def spatial_neighborhood_enrichment(
         anndata_dict: Dictionary mapping ROI ID to AnnData object with spatial graph
         cluster_key: Column name containing cluster labels (default: "cluster")
         aggregation: Aggregation method for multiple ROIs ("mean" or "sum", default: "mean")
+        significance_threshold: Z-score threshold for significant interactions (default: 2.0)
     
     Returns:
         Dictionary with:
             - 'results': Dict mapping ROI ID to enrichment results
             - 'aggregated': Aggregated enrichment matrix (if multiple ROIs)
             - 'cluster_categories': List of cluster categories
+            - 'significant_counts': Matrix counting ROIs with significant interactions per cluster pair
     """
     try:
         import squidpy as sq
@@ -2664,39 +2773,116 @@ def spatial_neighborhood_enrichment(
     roi_cluster_map = {}
     
     for roi_id, adata in anndata_dict.items():
+        print(f"[DEBUG] Processing ROI: {roi_id}")
         if 'spatial_connectivities' not in adata.obsp:
+            print(f"[DEBUG]   Skipping {roi_id}: no spatial_connectivities")
             continue
         
         if cluster_key not in adata.obs.columns:
+            print(f"[DEBUG]   Skipping {roi_id}: cluster_key '{cluster_key}' not in obs")
             continue
         
         # Ensure categorical
         if not hasattr(adata.obs[cluster_key], 'cat'):
             adata.obs[cluster_key] = adata.obs[cluster_key].astype('category')
         
+        print(f"[DEBUG]   Running nhood_enrichment for {roi_id}...")
+        print(f"[DEBUG]   adata.obsp keys before: {list(adata.obsp.keys())}")
+        print(f"[DEBUG]   Number of cells: {adata.n_obs}")
+        
+        # Check graph connectivity
+        if 'spatial_connectivities' in adata.obsp:
+            conn = adata.obsp['spatial_connectivities']
+            n_edges = conn.nnz // 2  # Divide by 2 because it's symmetric
+            print(f"[DEBUG]   Graph has {n_edges} edges (connections)")
+            # Check if graph is connected
+            from scipy.sparse.csgraph import connected_components
+            n_components, labels = connected_components(conn, directed=False, return_labels=True)
+            print(f"[DEBUG]   Graph has {n_components} connected component(s)")
+            if n_components > 1:
+                print(f"[DEBUG]   WARNING: Graph is not fully connected! This may cause issues.")
+        
+        # Check clusters
+        if hasattr(adata.obs[cluster_key], 'cat'):
+            categories = list(adata.obs[cluster_key].cat.categories)
+            unique_vals = sorted(adata.obs[cluster_key].unique())
+        else:
+            categories = sorted(adata.obs[cluster_key].unique())
+            unique_vals = categories
+        
+        print(f"[DEBUG]   Cluster key '{cluster_key}' categories: {categories}")
+        print(f"[DEBUG]   Number of unique clusters: {len(unique_vals)}")
+        if len(unique_vals) < 2:
+            print(f"[DEBUG]   WARNING: Only {len(unique_vals)} cluster(s) found. Need at least 2 for enrichment analysis!")
+            print(f"[DEBUG]   Skipping {roi_id} due to insufficient clusters")
+            continue
+        
         # Run neighborhood enrichment
         sq.gr.nhood_enrichment(adata, cluster_key=cluster_key)
+        print(f"[DEBUG]   nhood_enrichment completed for {roi_id}")
         
-        # Extract matrix
-        enrichment_data = adata.uns.get('nhood_enrichment', {})
+        # Check ALL keys in uns to see what squidpy stored
+        print(f"[DEBUG]   adata.uns keys after nhood_enrichment: {list(adata.uns.keys())}")
+        for key in adata.uns.keys():
+            if 'nhood' in key.lower() or 'enrich' in key.lower():
+                print(f"[DEBUG]   Found relevant key: '{key}'")
+                val = adata.uns[key]
+                print(f"[DEBUG]     Type: {type(val)}")
+                if isinstance(val, dict):
+                    print(f"[DEBUG]     Dict keys: {list(val.keys())}")
+                    for k, v in val.items():
+                        print(f"[DEBUG]       '{k}': type={type(v)}, shape={getattr(v, 'shape', 'N/A')}")
+        
+        # Extract matrix - try multiple possible keys
+        enrichment_data = None
+        possible_keys = ['nhood_enrichment', f'{cluster_key}_nhood_enrichment', 'nhood_enrichment_zscore']
+        for key in possible_keys:
+            if key in adata.uns:
+                enrichment_data = adata.uns[key]
+                print(f"[DEBUG]   Found enrichment data at key: '{key}'")
+                break
+        
+        if enrichment_data is None:
+            # Try to find any key containing 'nhood' or 'enrich'
+            for key in adata.uns.keys():
+                if 'nhood' in key.lower() or 'enrich' in key.lower():
+                    enrichment_data = adata.uns[key]
+                    print(f"[DEBUG]   Found enrichment data at key: '{key}' (searched)")
+                    break
+        
+        if enrichment_data is None:
+            enrichment_data = {}
+            print(f"[DEBUG]   No enrichment data found in uns, using empty dict")
+        
+        print(f"[DEBUG]   enrichment_data type: {type(enrichment_data)}")
+        if isinstance(enrichment_data, dict):
+            print(f"[DEBUG]   enrichment_data keys: {list(enrichment_data.keys())}")
         matrix = None
         
         if isinstance(enrichment_data, dict):
             if 'zscore' in enrichment_data:
                 matrix = enrichment_data['zscore']
+                print(f"[DEBUG]   Found zscore matrix, shape: {matrix.shape if hasattr(matrix, 'shape') else 'N/A'}")
             elif 'count' in enrichment_data:
                 matrix = enrichment_data['count']
+                print(f"[DEBUG]   Found count matrix, shape: {matrix.shape if hasattr(matrix, 'shape') else 'N/A'}")
             elif 'stat' in enrichment_data:
                 matrix = enrichment_data['stat']
+                print(f"[DEBUG]   Found stat matrix, shape: {matrix.shape if hasattr(matrix, 'shape') else 'N/A'}")
             else:
-                for value in enrichment_data.values():
+                print(f"[DEBUG]   Searching for matrix-like value in dict...")
+                for key, value in enrichment_data.items():
+                    print(f"[DEBUG]     Key '{key}': type={type(value)}, ndim={getattr(value, 'ndim', 'N/A')}")
                     if isinstance(value, np.ndarray) and value.ndim == 2:
                         matrix = value
+                        print(f"[DEBUG]   Found matrix at key '{key}', shape: {matrix.shape}")
                         break
         elif isinstance(enrichment_data, np.ndarray):
             matrix = enrichment_data
+            print(f"[DEBUG]   enrichment_data is numpy array, shape: {matrix.shape}")
         
         if matrix is not None and isinstance(matrix, np.ndarray) and matrix.ndim == 2:
+            print(f"[DEBUG]   Successfully extracted matrix for {roi_id}, shape: {matrix.shape}")
             results[roi_id] = adata
             enrichment_matrices.append((roi_id, matrix))
             
@@ -2706,9 +2892,16 @@ def spatial_neighborhood_enrichment(
             else:
                 clusters = sorted(adata.obs[cluster_key].unique())
             roi_cluster_map[roi_id] = clusters
+            print(f"[DEBUG]   Added {roi_id} with {len(clusters)} clusters")
+        else:
+            print(f"[DEBUG]   Failed to extract valid matrix for {roi_id}")
+            print(f"[DEBUG]     matrix is None: {matrix is None}")
+            if matrix is not None:
+                print(f"[DEBUG]     matrix type: {type(matrix)}, ndim: {getattr(matrix, 'ndim', 'N/A')}")
     
     # Aggregate if multiple ROIs
     aggregated_matrix = None
+    significant_counts_matrix = None
     all_clusters_union = []
     
     if len(enrichment_matrices) > 1:
@@ -2719,6 +2912,7 @@ def spatial_neighborhood_enrichment(
         if all_clusters_union:
             # Align all matrices to the union of clusters
             aligned_matrices = []
+            significant_matrices = []  # Track significant interactions per ROI
             n_clusters = len(all_clusters_union)
             
             for roi_id, matrix in enrichment_matrices:
@@ -2727,6 +2921,7 @@ def spatial_neighborhood_enrichment(
                 if roi_clusters is not None:
                     # Create aligned matrix
                     aligned_matrix = np.full((n_clusters, n_clusters), np.nan)
+                    significant_matrix = np.zeros((n_clusters, n_clusters), dtype=bool)
                     
                     # Map old indices to new indices
                     cluster_to_new_idx = {clust: idx for idx, clust in enumerate(all_clusters_union)}
@@ -2739,27 +2934,49 @@ def spatial_neighborhood_enrichment(
                                 if old_clust_j in cluster_to_new_idx:
                                     new_j = cluster_to_new_idx[old_clust_j]
                                     aligned_matrix[new_i, new_j] = matrix[i, j]
+                                    # Mark as significant if |z-score| > threshold
+                                    if not np.isnan(matrix[i, j]) and abs(matrix[i, j]) > significance_threshold:
+                                        significant_matrix[new_i, new_j] = True
                     
                     aligned_matrices.append(aligned_matrix)
+                    significant_matrices.append(significant_matrix)
                 else:
                     aligned_matrices.append(matrix)
+                    # Create significant matrix for this ROI
+                    significant_matrix = np.abs(matrix) > significance_threshold
+                    significant_matrices.append(significant_matrix)
             
-            # Aggregate
+            # Aggregate z-scores
             stacked = np.stack(aligned_matrices, axis=0)
             if aggregation == 'mean':
                 aggregated_matrix = np.nanmean(stacked, axis=0)
             else:  # sum
                 aggregated_matrix = np.nansum(stacked, axis=0)
+            
+            # Count significant interactions across ROIs
+            significant_stacked = np.stack(significant_matrices, axis=0)
+            significant_counts_matrix = np.sum(significant_stacked, axis=0).astype(int)
         else:
             aggregated_matrix = enrichment_matrices[0][1] if enrichment_matrices else None
+            if aggregated_matrix is not None:
+                significant_counts_matrix = (np.abs(aggregated_matrix) > significance_threshold).astype(int)
     elif len(enrichment_matrices) == 1:
         aggregated_matrix = enrichment_matrices[0][1]
         all_clusters_union = roi_cluster_map.get(enrichment_matrices[0][0], [])
+        if aggregated_matrix is not None:
+            significant_counts_matrix = (np.abs(aggregated_matrix) > significance_threshold).astype(int)
+    
+    print(f"[DEBUG] spatial_neighborhood_enrichment: Returning results")
+    print(f"[DEBUG]   - results: {len(results)} ROIs")
+    print(f"[DEBUG]   - aggregated: {aggregated_matrix.shape if aggregated_matrix is not None else None}")
+    print(f"[DEBUG]   - cluster_categories: {len(all_clusters_union)} clusters")
+    print(f"[DEBUG]   - significant_counts: {significant_counts_matrix.shape if significant_counts_matrix is not None else None}")
     
     return {
         'results': results,
         'aggregated': aggregated_matrix,
-        'cluster_categories': all_clusters_union
+        'cluster_categories': all_clusters_union,
+        'significant_counts': significant_counts_matrix
     }
 
 

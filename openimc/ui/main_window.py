@@ -17,8 +17,28 @@
 # You should have received a copy of the GNU General Public License
 # along with this program.  If not, see <https://www.gnu.org/licenses/>.
 
-from typing import Dict, List, Optional, Tuple, Union
+# CRITICAL: Configure dask BEFORE any imports that might trigger dask.dataframe
+# This must be done at the very top, before any other imports
 import os
+import sys
+# Use direct assignment (not setdefault) to ensure it's set
+os.environ['DASK_DATAFRAME__QUERY_PLANNING'] = 'False'
+
+# Also configure dask directly if available (must be before any dask.dataframe import)
+# Check if dask.dataframe was already imported
+dask_dataframe_imported = 'dask.dataframe' in sys.modules
+if dask_dataframe_imported:
+    print("[DEBUG] main_window.py: WARNING - dask.dataframe already imported before configuration!")
+try:
+    import dask
+    # Configure before dask.dataframe can be imported
+    dask.config.set({'dataframe.query-planning': False})
+    print("[DEBUG] main_window.py: Configured dask: dataframe.query-planning = False")
+except (ImportError, AttributeError) as e:
+    print(f"[DEBUG] main_window.py: Could not configure dask: {e}")
+    pass
+
+from typing import Dict, List, Optional, Tuple, Union
 import threading
 from concurrent.futures import ThreadPoolExecutor, Future
 
@@ -141,6 +161,10 @@ from openimc.ui.dialogs.deconvolution_dialog import DeconvolutionDialog
 from openimc.ui.dialogs.pixel_correlation_dialog import PixelCorrelationDialog
 from openimc.core import deconvolution
 from openimc.utils.logger import get_logger
+from openimc.ui.mask_manager import DynamicMaskManager
+from openimc.ui.dialogs.display_settings_dialog import (
+    get_masks_directory_preference, save_masks_directory_preference
+)
 
 
 
@@ -157,10 +181,12 @@ else:
     # Import models under the expected name when available
     from cellpose import models  # type: ignore
 
-# Optional CellSAM
+# Optional CellSAM - use our custom implementation
 _HAVE_CELLSAM = False
+cellsam_pipeline = None
 try:
-    from cellSAM import get_model, cellsam_pipeline  # type: ignore
+    from openimc.processing.custom_cellsam import cellsam_pipeline_custom
+    cellsam_pipeline = cellsam_pipeline_custom
     _HAVE_CELLSAM = True
 except (ImportError, OSError):
     _HAVE_CELLSAM = False
@@ -232,7 +258,7 @@ def _load_and_preprocess_acquisition_worker(task_data):
             elif norm_method == 'channelwise_minmax':
                 return channelwise_minmax_normalize(img)
             elif norm_method == 'arcsinh':
-                cofactor = config.get('arcsinh_cofactor', 10.0)
+                cofactor = config.get('arcsinh_cofactor', 1.0)
                 return arcsinh_normalize(img, cofactor)
             elif norm_method == 'percentile_clip':
                 p_low, p_high = config.get('percentile_params', (1.0, 99.0))
@@ -434,20 +460,90 @@ from openimc.processing.feature_worker import load_and_extract_features as _extr
 
 
 # --------------------------
+# Mask Manager Dict Wrapper
+# --------------------------
+class MaskManagerDict:
+    """Dict-like wrapper for DynamicMaskManager to maintain backward compatibility."""
+    
+    def __init__(self, mask_manager: DynamicMaskManager):
+        self.mask_manager = mask_manager
+        self._acq_info_cache = {}  # Cache acquisition info for mask loading
+    
+    def __getitem__(self, acq_id: str):
+        """Get mask for acquisition, loading from disk if needed."""
+        acq_info = self._acq_info_cache.get(acq_id)
+        mask = self.mask_manager.get_mask(acq_id, acq_info)
+        if mask is None:
+            raise KeyError(f"No mask found for acquisition {acq_id}")
+        return mask
+    
+    def __setitem__(self, acq_id: str, mask: np.ndarray):
+        """Set mask for acquisition."""
+        acq_info = self._acq_info_cache.get(acq_id)
+        self.mask_manager.set_mask(acq_id, mask, acq_info=acq_info)
+    
+    def __contains__(self, acq_id: str) -> bool:
+        """Check if mask exists for acquisition."""
+        return self.mask_manager.has_mask(acq_id)
+    
+    def __delitem__(self, acq_id: str):
+        """Remove mask from memory (does not delete disk files)."""
+        self.mask_manager.remove_mask(acq_id)
+    
+    def __len__(self) -> int:
+        """Return the number of masks available."""
+        return len(self.mask_manager.get_all_mask_ids())
+    
+    def keys(self):
+        """Get all acquisition IDs that have masks."""
+        return self.mask_manager.get_all_mask_ids()
+    
+    def items(self):
+        """Get all (acq_id, mask) pairs, loading masks as needed."""
+        for acq_id in self.keys():
+            acq_info = self._acq_info_cache.get(acq_id)
+            mask = self.mask_manager.get_mask(acq_id, acq_info)
+            if mask is not None:
+                yield (acq_id, mask)
+    
+    def values(self):
+        """Get all masks, loading as needed."""
+        for acq_id in self.keys():
+            acq_info = self._acq_info_cache.get(acq_id)
+            mask = self.mask_manager.get_mask(acq_id, acq_info)
+            if mask is not None:
+                yield mask
+    
+    def get(self, acq_id: str, default=None):
+        """Get mask with default value if not found."""
+        acq_info = self._acq_info_cache.get(acq_id)
+        mask = self.mask_manager.get_mask(acq_id, acq_info)
+        return mask if mask is not None else default
+    
+    def set_acq_info(self, acq_id: str, acq_info):
+        """Set acquisition info for better mask file resolution."""
+        self._acq_info_cache[acq_id] = acq_info
+
+
+# --------------------------
 # Main Window
 # --------------------------
 class MainWindow(QtWidgets.QMainWindow):
     def __init__(self):
-        super().__init__()
-        self.setWindowTitle("IMC File Viewer")
-        
-        # Set window size to full screen with minimum size constraint
-        screen = QtWidgets.QApplication.desktop().screenGeometry()
-        self.resize(screen.width(), screen.height())
-        
-        # Set minimum size for smaller screens
-        self.setMinimumSize(1000, 700)
-
+        try:
+            super().__init__()
+            self.setWindowTitle("OpenIMC")
+            
+            # Set window size to full screen with minimum size constraint
+            screen = QtWidgets.QApplication.desktop().screenGeometry()
+            self.resize(screen.width(), screen.height())
+            
+            # Set minimum size for smaller screens
+            self.setMinimumSize(1000, 700)
+        except Exception as e:
+            import traceback
+            traceback.print_exc()
+            raise
         # State
         self.loader: Optional[Union[MCDLoader, OMETIFFLoader]] = None
         self.current_path: Optional[str] = None
@@ -475,10 +571,14 @@ class MainWindow(QtWidgets.QMainWindow):
         self.saved_zoom_limits = None
         self.preserve_zoom = False  # Flag to indicate when to preserve zoom
         self.had_no_channels = False  # Flag to track when we had no channels selected
-        
 
         # Widgets
-        self.canvas = MplCanvas(width=6, height=6, dpi=100)
+        try:
+            self.canvas = MplCanvas(width=6, height=6, dpi=100)
+        except Exception as e:
+            import traceback
+            traceback.print_exc()
+            raise
         self.open_btn = QtWidgets.QPushButton("Open File/Folder")
         self.acq_combo = QtWidgets.QComboBox()
         self.channel_list = QtWidgets.QListWidget()
@@ -747,7 +847,7 @@ class MainWindow(QtWidgets.QMainWindow):
         self.cofactor_spinbox = QtWidgets.QDoubleSpinBox()
         self.cofactor_spinbox.setRange(0.1, 100.0)
         self.cofactor_spinbox.setDecimals(1)
-        self.cofactor_spinbox.setValue(10.0)
+        self.cofactor_spinbox.setValue(1.0)
         self.cofactor_spinbox.setSingleStep(0.5)
         arcsinh_layout.addWidget(self.cofactor_spinbox)
         arcsinh_layout.addStretch()
@@ -829,7 +929,15 @@ class MainWindow(QtWidgets.QMainWindow):
         self.channel_scaling_method: Dict[str, str] = {}  # {channel: "default"|"arcsinh"}
         
         # Segmentation state
-        self.segmentation_masks = {}  # {acq_id: mask_array}
+        # Use dynamic mask manager for large datasets
+        try:
+            saved_masks_dir = get_masks_directory_preference()
+            self.mask_manager = DynamicMaskManager(masks_directory=saved_masks_dir)
+        except Exception as e:
+            import traceback
+            traceback.print_exc()
+            raise
+        # Keep segmentation_masks as a property that uses mask_manager for backward compatibility
         self.segmentation_colors = {}  # {acq_id: colors_array}
         self.cluster_colors = {}  # {acq_id: {cluster_id: color_array}}
         self.cluster_color_map = {}  # {acq_id: {cluster_id: display_name}}
@@ -1005,33 +1113,38 @@ class MainWindow(QtWidgets.QMainWindow):
         QTimer.singleShot(0, self._update_sidebar_max_width)
 
         # Menu
-        file_menu = self.menuBar().addMenu("&File")
-        act_about = file_menu.addAction("About…")
-        act_about.triggered.connect(self._show_about_dialog)
-        act_display_settings = file_menu.addAction("Display Settings…")
-        act_display_settings.triggered.connect(self._show_display_settings)
-        file_menu.addSeparator()
-        act_open = file_menu.addAction("Open File/Folder…")
-        act_open.triggered.connect(self._open_dialog)
-        act_load_features = file_menu.addAction("Load Feature File…")
-        act_load_features.triggered.connect(self._load_feature_file)
-        file_menu.addSeparator()
-        
-        # Export submenu
-        export_submenu = file_menu.addMenu("Export")
-        act_export_tiff = export_submenu.addAction("Export to OME-TIFF…")
-        act_export_tiff.triggered.connect(self._export_ome_tiff)
-        
-        # Masks submenu
-        masks_submenu = file_menu.addMenu("Segmentation Masks")
-        act_load_masks = masks_submenu.addAction("Load Masks…")
-        act_load_masks.triggered.connect(self._load_segmentation_masks)
-        act_save_masks = masks_submenu.addAction("Save Masks…")
-        act_save_masks.triggered.connect(self._save_segmentation_masks)
-        
-        file_menu.addSeparator()
-        act_quit = file_menu.addAction("Quit")
-        act_quit.triggered.connect(self.close)
+        try:
+            file_menu = self.menuBar().addMenu("&File")
+            act_about = file_menu.addAction("About…")
+            act_about.triggered.connect(self._show_about_dialog)
+            act_display_settings = file_menu.addAction("Display Settings…")
+            act_display_settings.triggered.connect(self._show_display_settings)
+            file_menu.addSeparator()
+            act_open = file_menu.addAction("Open File/Folder…")
+            act_open.triggered.connect(self._open_dialog)
+            act_load_features = file_menu.addAction("Load Feature File…")
+            act_load_features.triggered.connect(self._load_feature_file)
+            file_menu.addSeparator()
+            
+            # Export submenu
+            export_submenu = file_menu.addMenu("Export")
+            act_export_tiff = export_submenu.addAction("Export to OME-TIFF…")
+            act_export_tiff.triggered.connect(self._export_ome_tiff)
+            
+            # Masks submenu
+            masks_submenu = file_menu.addMenu("Segmentation Masks")
+            act_load_masks = masks_submenu.addAction("Load Masks…")
+            act_load_masks.triggered.connect(self._load_segmentation_masks)
+            act_save_masks = masks_submenu.addAction("Save Masks…")
+            act_save_masks.triggered.connect(self._save_segmentation_masks)
+            
+            file_menu.addSeparator()
+            act_quit = file_menu.addAction("Quit")
+            act_quit.triggered.connect(self.close)
+        except Exception as e:
+            import traceback
+            traceback.print_exc()
+            raise
 
         # Analysis menu
         analysis_menu = self.menuBar().addMenu("&Analysis")
@@ -1057,23 +1170,35 @@ class MainWindow(QtWidgets.QMainWindow):
         act_deconvolution.triggered.connect(self._open_deconvolution_dialog)
 
         # Signals
-        self.open_btn.clicked.connect(self._open_dialog)
-        self.acq_combo.currentIndexChanged.connect(self._on_acq_changed)
-        self.deselect_all_btn.clicked.connect(self._deselect_all_channels)
-        self.channel_list.itemChanged.connect(self._on_channel_selection_changed)
-        self.channel_search.textChanged.connect(self._filter_channels)
+        try:
+            self.open_btn.clicked.connect(self._open_dialog)
+            self.acq_combo.currentIndexChanged.connect(self._on_acq_changed)
+            self.deselect_all_btn.clicked.connect(self._deselect_all_channels)
+            self.channel_list.itemChanged.connect(self._on_channel_selection_changed)
+            self.channel_search.textChanged.connect(self._filter_channels)
+        except Exception as e:
+            import traceback
+            traceback.print_exc()
+            raise
+        
         # Auto-refresh: no manual 'View selected' action
         try:
             self.view_btn.clicked.disconnect()
         except Exception:
             pass
-        self.reset_zoom_btn.clicked.connect(self._reset_zoom)
-        self.comparison_btn.clicked.connect(self._comparison)
-        self.segment_btn.clicked.connect(self._run_segmentation)
-        self.extract_features_btn.clicked.connect(self._extract_features)
-        self.batch_correction_btn.clicked.connect(self._open_batch_correction_dialog)
-        self.clustering_btn.clicked.connect(self._open_clustering_dialog)
-        self.spatial_btn.clicked.connect(self._open_spatial_dialog)
+        
+        try:
+            self.reset_zoom_btn.clicked.connect(self._reset_zoom)
+            self.comparison_btn.clicked.connect(self._comparison)
+            self.segment_btn.clicked.connect(self._run_segmentation)
+            self.extract_features_btn.clicked.connect(self._extract_features)
+            self.batch_correction_btn.clicked.connect(self._open_batch_correction_dialog)
+            self.clustering_btn.clicked.connect(self._open_clustering_dialog)
+            self.spatial_btn.clicked.connect(self._open_spatial_dialog)
+        except Exception as e:
+            import traceback
+            traceback.print_exc()
+            raise
 
         # Loader - will be initialized when data is loaded
         self.loader = None
@@ -1092,6 +1217,21 @@ class MainWindow(QtWidgets.QMainWindow):
             self._update_cluster_mode_availability()
         except Exception:
             pass
+    
+    @property
+    def segmentation_masks(self):
+        """
+        Property for backward compatibility with self.segmentation_masks.
+        Returns a dict-like object that uses the mask manager.
+        """
+        return MaskManagerDict(self.mask_manager)
+    
+    @segmentation_masks.setter
+    def segmentation_masks(self, value):
+        """Setter for backward compatibility - converts dict to mask manager entries."""
+        if isinstance(value, dict):
+            for acq_id, mask in value.items():
+                self.mask_manager.set_mask(acq_id, mask)
 
     # ---------- About dialog ----------
     def _show_about_dialog(self):
@@ -1224,9 +1364,9 @@ class MainWindow(QtWidgets.QMainWindow):
         # Update window title
         if len(paths) == 1:
             stem = os.path.splitext(os.path.basename(paths[0]))[0]
-            self.setWindowTitle(f"IMC File Viewer - {stem} (MCD)")
+            self.setWindowTitle(f"OpenIMC - {stem} (MCD)")
         else:
-            self.setWindowTitle(f"IMC File Viewer - {len(paths)} MCD files")
+            self.setWindowTitle(f"OpenIMC - {len(paths)} MCD files")
         
         # Clear canvas completely before loading new files to ensure proper redraw
         self.canvas.fig.clear()
@@ -1431,13 +1571,13 @@ class MainWindow(QtWidgets.QMainWindow):
         try:
             if is_file:
                 stem = os.path.splitext(os.path.basename(path))[0]
-                self.setWindowTitle(f"IMC File Viewer - {stem} ({loader_type})")
+                self.setWindowTitle(f"OpenIMC - {stem} ({loader_type})")
             else:
                 dirname = os.path.basename(path) or path
-                self.setWindowTitle(f"IMC File Viewer - {dirname} ({loader_type})")
+                self.setWindowTitle(f"OpenIMC - {dirname} ({loader_type})")
         except Exception:
             # Fallback to default title if something goes wrong
-            self.setWindowTitle(f"IMC File Viewer ({loader_type})")
+            self.setWindowTitle(f"OpenIMC ({loader_type})")
         
         # Clear canvas completely before loading new file to ensure proper redraw
         self.canvas.fig.clear()
@@ -2436,7 +2576,7 @@ class MainWindow(QtWidgets.QMainWindow):
             cofactor_spin = QtWidgets.QDoubleSpinBox()
             cofactor_spin.setRange(0.1, 100.0)
             cofactor_spin.setDecimals(1)
-            cofactor_spin.setValue(10.0)
+            cofactor_spin.setValue(1.0)
             cofactor_spin.setSingleStep(0.5)
             control_panel.addWidget(cofactor_label)
             control_panel.addWidget(cofactor_spin)
@@ -2869,7 +3009,7 @@ class MainWindow(QtWidgets.QMainWindow):
         if not is_rgb_color and current_selection in self.channel_normalization:
             norm_cfg = self.channel_normalization[current_selection]
             if norm_cfg.get("method") == "arcsinh":
-                cofactor = norm_cfg.get("cofactor", 10.0)
+                cofactor = norm_cfg.get("cofactor", 1.0)
                 self.cofactor_spinbox.setValue(float(cofactor))
 
     def _save_channel_scaling(self):
@@ -2995,9 +3135,28 @@ class MainWindow(QtWidgets.QMainWindow):
             loader = self._get_loader_for_acquisition(acq_id)
             if loader is None:
                 raise ValueError(f"No loader found for acquisition {acq_id}")
+            
+            # Validate loader state (for MCDLoader, check if mcd is not None)
+            if isinstance(loader, MCDLoader) and loader.mcd is None:
+                raise RuntimeError(f"Loader for acquisition {acq_id} is closed or invalid")
+            
             # Get original acquisition ID if this is a unique ID
             original_acq_id = self._get_original_acq_id(acq_id)
-            img = loader.get_image(original_acq_id, channel)
+            try:
+                img = loader.get_image(original_acq_id, channel)
+            except (OSError, RuntimeError) as e:
+                if isinstance(e, OSError) and e.errno == 9:
+                    # Bad file descriptor - clear cache and re-raise with better message
+                    with self._cache_lock:
+                        # Clear cache entries for this acquisition
+                        keys_to_remove = [k for k in self.image_cache.keys() if k[0] == acq_id]
+                        for k in keys_to_remove:
+                            self.image_cache.pop(k, None)
+                    raise RuntimeError(
+                        f"File descriptor error when loading {acq_id}, channel {channel}. "
+                        "The file may have been closed. Please reload the file."
+                    ) from e
+                raise
             with self._cache_lock:
                 self.image_cache[cache_key] = img
         
@@ -3010,7 +3169,7 @@ class MainWindow(QtWidgets.QMainWindow):
         # Apply per-channel normalization (if configured)
         norm_cfg = self.channel_normalization.get(channel)
         if norm_cfg and norm_cfg.get("method") == "arcsinh":
-            cofactor = float(norm_cfg.get("cofactor", 10.0))
+            cofactor = float(norm_cfg.get("cofactor", 1.0))
             img = arcsinh_normalize(img, cofactor=cofactor)
         
         return img
@@ -3025,9 +3184,28 @@ class MainWindow(QtWidgets.QMainWindow):
             loader = self._get_loader_for_acquisition(acq_id)
             if loader is None:
                 raise ValueError(f"No loader found for acquisition {acq_id}")
+            
+            # Validate loader state (for MCDLoader, check if mcd is not None)
+            if isinstance(loader, MCDLoader) and loader.mcd is None:
+                raise RuntimeError(f"Loader for acquisition {acq_id} is closed or invalid")
+            
             # Get original acquisition ID if this is a unique ID
             original_acq_id = self._get_original_acq_id(acq_id)
-            img = loader.get_image(original_acq_id, channel)
+            try:
+                img = loader.get_image(original_acq_id, channel)
+            except (OSError, RuntimeError) as e:
+                if isinstance(e, OSError) and e.errno == 9:
+                    # Bad file descriptor - clear cache and re-raise with better message
+                    with self._cache_lock:
+                        # Clear cache entries for this acquisition
+                        keys_to_remove = [k for k in self.image_cache.keys() if k[0] == acq_id]
+                        for k in keys_to_remove:
+                            self.image_cache.pop(k, None)
+                    raise RuntimeError(
+                        f"File descriptor error when loading {acq_id}, channel {channel}. "
+                        "The file may have been closed. Please reload the file."
+                    ) from e
+                raise
             with self._cache_lock:
                 self.image_cache[cache_key] = img
         
@@ -3081,7 +3259,7 @@ class MainWindow(QtWidgets.QMainWindow):
                 # Apply normalization if configured
                 norm_cfg = self.channel_normalization.get(ch)
                 if norm_cfg and norm_cfg.get("method") == "arcsinh":
-                    cofactor = float(norm_cfg.get("cofactor", 10.0))
+                    cofactor = float(norm_cfg.get("cofactor", 1.0))
                     img = arcsinh_normalize(img, cofactor=cofactor)
                 channel_images[ch] = img
             return channel_images
@@ -3128,7 +3306,7 @@ class MainWindow(QtWidgets.QMainWindow):
             # Apply normalization if configured
             norm_cfg = self.channel_normalization.get(ch)
             if norm_cfg and norm_cfg.get("method") == "arcsinh":
-                cofactor = float(norm_cfg.get("cofactor", 10.0))
+                cofactor = float(norm_cfg.get("cofactor", 1.0))
                 img = arcsinh_normalize(img, cofactor=cofactor)
             channel_images[ch] = img
         
@@ -3157,10 +3335,21 @@ class MainWindow(QtWidgets.QMainWindow):
 
         def _prefetch():
             try:
+                # Validate loader state before prefetching
+                if isinstance(loader, MCDLoader) and loader.mcd is None:
+                    return
+                
                 # Get original acquisition ID if this is a unique ID
                 original_acq_id = self._get_original_acq_id(acq_id)
                 # Load the full stack once, then split into channels for faster access
-                stack = loader.get_all_channels(original_acq_id)
+                try:
+                    stack = loader.get_all_channels(original_acq_id)
+                except (OSError, RuntimeError) as e:
+                    if isinstance(e, OSError) and e.errno == 9:
+                        # Bad file descriptor - loader is invalid, skip prefetch
+                        return
+                    raise
+                
                 # Store in cache
                 with self._cache_lock:
                     for i, ch in enumerate(channels):
@@ -3365,6 +3554,18 @@ class MainWindow(QtWidgets.QMainWindow):
     def _auto_load_image(self, selected_channels: List[str]):
         """Automatically load and display image for pre-selected channels."""
         try:
+            # Validate that we have a valid loader and acquisition
+            if not self.current_acq_id:
+                return
+            
+            loader = self._get_loader_for_acquisition(self.current_acq_id)
+            if loader is None:
+                return
+            
+            # Check if loader is valid (for MCDLoader, check if mcd is not None)
+            if isinstance(loader, MCDLoader) and loader.mcd is None:
+                return
+            
             grayscale = self.grayscale_chk.isChecked()
             grid_view = self.grid_view_chk.isChecked()
             
@@ -3415,7 +3616,17 @@ class MainWindow(QtWidgets.QMainWindow):
                 
                 # Add cluster legend if cluster overlay mode is active
                 self._add_cluster_legend()
+        except (OSError, RuntimeError) as e:
+            # Handle file descriptor errors and other runtime errors gracefully
+            if isinstance(e, OSError) and e.errno == 9:
+                # Bad file descriptor - loader is in invalid state
+                # Silently fail to avoid spamming console with errors
+                pass
+            else:
+                # Log other errors but don't disrupt the UI
+                print(f"Auto-load error: {e}")
         except Exception as e:
+            # Catch all other exceptions to prevent UI disruption
             print(f"Auto-load error: {e}")
 
     def _combine_channels_for_rgb(self, channel_names: List[str], first_img: np.ndarray, corrected_images: dict = None) -> np.ndarray:
@@ -4714,11 +4925,17 @@ class MainWindow(QtWidgets.QMainWindow):
                 
                 try:
                     if segment_all:
-                        # Run segmentation on all acquisitions
+                        # Check if dialog has a specific list of acquisitions to segment (from "Segment Missing Masks")
+                        acquisitions_to_segment = None
+                        if hasattr(dlg, '_acquisitions_to_segment'):
+                            acquisitions_to_segment = dlg._acquisitions_to_segment
+                        
+                        # Run segmentation on all acquisitions (or specific subset)
                         self._perform_segmentation_all_acquisitions(
                             model, diameter, flow_threshold, cellprob_threshold, 
                             show_overlay, save_masks, masks_directory, gpu_id, preprocessing_config,
-                            denoise_source, custom_denoise_settings, dlg
+                            denoise_source, custom_denoise_settings, dlg,
+                            acquisitions_to_segment=acquisitions_to_segment
                         )
                     else:
                         # Run segmentation on current acquisition only
@@ -4787,7 +5004,20 @@ class MainWindow(QtWidgets.QMainWindow):
                 # Get labels from results
                 if 'labels' in results:
                     labels = results['labels']
-                    self.segmentation_masks[self.current_acq_id] = labels
+                    if isinstance(labels, np.ndarray):
+                        labels = labels.copy()
+                    
+                    # Update acquisition info cache
+                    acq_info = self._get_acquisition_info(self.current_acq_id)
+                    if acq_info:
+                        self.segmentation_masks.set_acq_info(self.current_acq_id, acq_info)
+                    
+                    # Store mask using mask manager (always in memory)
+                    self.mask_manager.set_mask(
+                        self.current_acq_id, labels,
+                        save_to_disk=False,
+                        acq_info=acq_info
+                    )
                     
                     # Log segmentation operation
                     logger = get_logger()
@@ -4845,7 +5075,18 @@ class MainWindow(QtWidgets.QMainWindow):
                         prob_arrays = list(prob_maps.values())
                         prob_stack = np.stack(prob_arrays, axis=-1)
                         labels = np.argmax(prob_stack, axis=-1).astype(np.int32)
-                        self.segmentation_masks[self.current_acq_id] = labels
+                        
+                        # Update acquisition info cache
+                        acq_info = self._get_acquisition_info(self.current_acq_id)
+                        if acq_info:
+                            self.segmentation_masks.set_acq_info(self.current_acq_id, acq_info)
+                        
+                        # Store mask using mask manager (always in memory)
+                        self.mask_manager.set_mask(
+                            self.current_acq_id, labels,
+                            save_to_disk=False,
+                            acq_info=acq_info
+                        )
                         
                         # Show overlay
                         self._show_segmentation_overlay(labels)
@@ -5151,8 +5392,26 @@ class MainWindow(QtWidgets.QMainWindow):
             
             progress_dlg.update_progress(80, "Processing results", "Creating segmentation masks...")
             
-            # Store segmentation results
-            self.segmentation_masks[self.current_acq_id] = masks[0]  # First (and only) mask
+            # Store segmentation results using mask manager
+            mask = masks[0]  # First (and only) mask
+            if isinstance(mask, np.ndarray):
+                mask = mask.copy()
+            
+            # Update acquisition info cache
+            self.segmentation_masks.set_acq_info(self.current_acq_id, acq_info)
+            
+            # Store mask in memory (save to disk only if user explicitly requested)
+            if save_masks and masks_directory:
+                save_masks_directory_preference(masks_directory)
+                self.mask_manager.set_masks_directory(masks_directory)
+            
+            self.mask_manager.set_mask(
+                self.current_acq_id, mask,
+                save_to_disk=save_masks,
+                acq_info=acq_info,
+                masks_directory=masks_directory
+            )
+            
             # Clear colors for this acquisition so they get regenerated
             if self.current_acq_id in self.segmentation_colors:
                 del self.segmentation_colors[self.current_acq_id]
@@ -5205,14 +5464,25 @@ class MainWindow(QtWidgets.QMainWindow):
                                              flow_threshold: float = 0.4, cellprob_threshold: float = 0.0, 
                                              show_overlay: bool = True, save_masks: bool = False, 
                                              masks_directory: str = None, gpu_id = None, preprocessing_config = None,
-                                             denoise_source: str = "Use viewer settings", custom_denoise_settings: dict = None, dlg = None):
-        """Perform efficient batch segmentation on all acquisitions."""
+                                             denoise_source: str = "Use viewer settings", custom_denoise_settings: dict = None, dlg = None,
+                                             acquisitions_to_segment: List = None):
+        """Perform efficient batch segmentation on all acquisitions or a specific subset."""
         if not self.acquisitions:
             QtWidgets.QMessageBox.warning(self, "No acquisitions", "No acquisitions available for segmentation.")
             return
         
+        # Use specific acquisitions list if provided (from "Segment Missing Masks"), otherwise use all
+        if acquisitions_to_segment is not None:
+            acquisitions_to_process = acquisitions_to_segment
+        else:
+            acquisitions_to_process = self.acquisitions
+        
+        if not acquisitions_to_process:
+            QtWidgets.QMessageBox.warning(self, "No acquisitions", "No acquisitions to segment.")
+            return
+        
         # Create progress dialog for batch processing
-        total_acquisitions = len(self.acquisitions)
+        total_acquisitions = len(acquisitions_to_process)
         progress_dlg = ProgressDialog("Batch Cell Segmentation", self)
         progress_dlg.set_maximum(total_acquisitions)
         progress_dlg.show()
@@ -5221,7 +5491,8 @@ class MainWindow(QtWidgets.QMainWindow):
         if model == "Classical Watershed":
             self._perform_watershed_batch_segmentation(
                 preprocessing_config, denoise_source, custom_denoise_settings, 
-                save_masks, masks_directory, dlg, progress_dlg, total_acquisitions
+                save_masks, masks_directory, dlg, progress_dlg, total_acquisitions,
+                acquisitions_to_process=acquisitions_to_process
             )
             return
         
@@ -5229,7 +5500,8 @@ class MainWindow(QtWidgets.QMainWindow):
         if model == "DeepCell CellSAM":
             self._perform_cellsam_batch_segmentation(
                 preprocessing_config, denoise_source, custom_denoise_settings, 
-                save_masks, masks_directory, dlg, progress_dlg, total_acquisitions
+                save_masks, masks_directory, dlg, progress_dlg, total_acquisitions,
+                acquisitions_to_process=acquisitions_to_process
             )
             return
         
@@ -5270,7 +5542,7 @@ class MainWindow(QtWidgets.QMainWindow):
                     break
                 
                 batch_end = min(batch_start + batch_size, total_acquisitions)
-                batch_acquisitions = self.acquisitions[batch_start:batch_end]
+                batch_acquisitions = acquisitions_to_process[batch_start:batch_end]
                 
                 progress_dlg.update_progress(
                     successful_segmentations, 
@@ -5307,6 +5579,11 @@ class MainWindow(QtWidgets.QMainWindow):
                     acquisition_info_list = batch_data.get('acquisition_info_list', [])  # List of AcquisitionInfo objects
                     processed_acquisitions = set()
                     
+                    # Set up masks directory if saving to disk
+                    if save_masks and masks_directory:
+                        save_masks_directory_preference(masks_directory)
+                        self.mask_manager.set_masks_directory(masks_directory)
+                    
                     for i, mask in enumerate(masks):
                         if i < len(acquisition_mapping):
                             acq_idx = acquisition_mapping[i]  # Index in acquisition_info_list
@@ -5316,7 +5593,21 @@ class MainWindow(QtWidgets.QMainWindow):
                                 acq_info = acquisition_info_list[acq_idx]
                                 acq_id = acq_info.id
                                 
-                                self.segmentation_masks[acq_id] = mask
+                                # Store mask using mask manager
+                                if isinstance(mask, np.ndarray):
+                                    mask = mask.copy()
+                                
+                                # Update acquisition info cache
+                                self.segmentation_masks.set_acq_info(acq_id, acq_info)
+                                
+                                # Store mask in memory (save to disk only if user requested)
+                                self.mask_manager.set_mask(
+                                    acq_id, mask,
+                                    save_to_disk=save_masks,
+                                    acq_info=acq_info,
+                                    masks_directory=masks_directory
+                                )
+                                
                                 # Clear colors for this acquisition so they get regenerated
                                 if acq_id in self.segmentation_colors:
                                     del self.segmentation_colors[acq_id]
@@ -5327,9 +5618,8 @@ class MainWindow(QtWidgets.QMainWindow):
                                 successful_segmentations += 1
                                 processed_acquisitions.add(acq_idx)
                                 
-                                # Save masks if requested - use the AcquisitionInfo directly from the batch
-                                if save_masks:
-                                    self._save_segmentation_masks_for_acquisition_with_info(mask, acq_info, masks_directory)
+                                # mask_manager.set_mask already saves with _segmentation_masks.tif naming
+                                # No need for redundant save
                                 
                                 # Update progress after each acquisition
                                 progress_dlg.update_progress(
@@ -5338,8 +5628,13 @@ class MainWindow(QtWidgets.QMainWindow):
                                     f"Segmented {acq_info.name} ({successful_segmentations}/{total_acquisitions} completed)"
                                 )
                     
-                    # Clear batch data to free memory
-                    del batch_data
+                    # Explicitly release memory: delete images and other large arrays from batch_data
+                    # This is critical for large datasets to prevent memory buildup
+                    del batch_data['images']
+                    del masks, flows, styles, diams
+                    batch_data = None
+                    import gc
+                    gc.collect()  # Force garbage collection to free memory immediately
                     if _HAVE_TORCH and use_gpu:
                         torch.cuda.empty_cache()
                     
@@ -5385,8 +5680,11 @@ class MainWindow(QtWidgets.QMainWindow):
     
     def _perform_cellsam_batch_segmentation(self, preprocessing_config: dict, denoise_source: str, 
                                             custom_denoise_settings: dict, save_masks: bool, 
-                                            masks_directory: str, dlg, progress_dlg, total_acquisitions: int):
+                                            masks_directory: str, dlg, progress_dlg, total_acquisitions: int,
+                                            acquisitions_to_process: List = None):
         """Perform sequential batch segmentation for CellSAM (one acquisition at a time)."""
+        if acquisitions_to_process is None:
+            acquisitions_to_process = self.acquisitions
         if dlg is None:
             QtWidgets.QMessageBox.critical(
                 self, "Missing Dialog", 
@@ -5394,6 +5692,11 @@ class MainWindow(QtWidgets.QMainWindow):
             )
             progress_dlg.close()
             return
+        
+        # Set up masks directory if saving to disk
+        if save_masks and masks_directory:
+            save_masks_directory_preference(masks_directory)
+            self.mask_manager.set_masks_directory(masks_directory)
         
         try:
             # Initialize CellSAM model once
@@ -5413,16 +5716,14 @@ class MainWindow(QtWidgets.QMainWindow):
                 )
                 return
             
-            # Initialize CellSAM model and download weights
-            progress_dlg.update_progress(0, "Initializing CellSAM model", "Downloading model weights...")
-            try:
-                get_model()  # This downloads weights if not already present
-            except Exception as e:
+            # Model initialization is handled automatically by custom_cellsam
+            # The first call to cellsam_pipeline will create and cache the model
+            if not _HAVE_CELLSAM:
                 progress_dlg.close()
                 QtWidgets.QMessageBox.critical(
-                    self, "CellSAM Initialization Failed",
-                    f"Failed to initialize CellSAM model:\n{str(e)}\n\n"
-                    "Please check your API key and internet connection."
+                    self, "CellSAM Not Available",
+                    "CellSAM is not installed or failed to load.\n\n"
+                    "Please install with: pip install git+https://github.com/vanvalenlab/cellSAM.git"
                 )
                 return
             
@@ -5435,7 +5736,7 @@ class MainWindow(QtWidgets.QMainWindow):
             # Process each acquisition sequentially
             successful_segmentations = 0
             
-            for acq_idx, acq in enumerate(self.acquisitions):
+            for acq_idx, acq in enumerate(acquisitions_to_process):
                 if progress_dlg.is_cancelled():
                     break
                 
@@ -5449,15 +5750,35 @@ class MainWindow(QtWidgets.QMainWindow):
                 )
                 
                 try:
+                    # Get acquisition info
+                    acq_info = self._get_acquisition_info(acq_id)
+                    if acq_info is None:
+                        raise ValueError(f"Acquisition {acq_id} not found")
+                    
                     # Preprocess this acquisition
+                    from openimc.core import _log_memory_debug
+                    _log_memory_debug(f"[GUI] Starting preprocessing for {acq_name} ({acq_id})")
                     nuclear_img, cyto_img = self._preprocess_acquisition_for_cellsam(
                         acq_id, preprocessing_config, progress_dlg, denoise_source, custom_denoise_settings
                     )
+                    _log_memory_debug(f"[GUI] Preprocessing complete for {acq_name}", nuclear_img, "nuclear_img")
+                    if cyto_img is not None:
+                        _log_memory_debug(f"[GUI] Preprocessing complete for {acq_name}", cyto_img, "cyto_img")
+                    
+                    # Clear loader image cache immediately after preprocessing to free memory
+                    loader = self._get_loader_for_acquisition(acq_id)
+                    if loader is not None and hasattr(loader, '_image_cache'):
+                        cache_size_before = len(loader._image_cache)
+                        loader._image_cache.clear()
+                        _log_memory_debug(f"[GUI] Cleared loader image cache after preprocessing for {acq_name} | cleared {cache_size_before} cached images")
+                        import gc
+                        gc.collect()
                     
                     # Prepare CellSAM input
                     nuclear_channels_list = preprocessing_config.get('nuclear_channels', []) if preprocessing_config else []
                     cyto_channels_list = preprocessing_config.get('cyto_channels', []) if preprocessing_config else []
                     
+                    _log_memory_debug(f"[GUI] Preparing CellSAM input for {acq_name}")
                     if nuclear_channels_list and cyto_channels_list:
                         # Combined mode: H x W x 3 array
                         if nuclear_img is None:
@@ -5468,16 +5789,19 @@ class MainWindow(QtWidgets.QMainWindow):
                         cellsam_input = np.zeros((h, w, 3), dtype=np.float32)
                         cellsam_input[:, :, 1] = nuclear_img  # Channel 1 is nuclear
                         cellsam_input[:, :, 2] = cyto_img  # Channel 2 is cyto
+                        _log_memory_debug(f"[GUI] Created combined CellSAM input", cellsam_input, "cellsam_input")
                     elif nuclear_channels_list:
                         # Nuclear only mode: H x W array
                         if nuclear_img is None:
                             raise ValueError("Failed to load nuclear channels")
                         cellsam_input = nuclear_img
+                        _log_memory_debug(f"[GUI] Using nuclear-only CellSAM input", cellsam_input, "cellsam_input")
                     elif cyto_channels_list:
                         # Cyto only mode: H x W array
                         if cyto_img is None:
                             raise ValueError("Failed to load cytoplasm channels")
                         cellsam_input = cyto_img
+                        _log_memory_debug(f"[GUI] Using cyto-only CellSAM input", cellsam_input, "cellsam_input")
                     else:
                         raise ValueError("At least one channel (nuclear or cyto) must be selected for CellSAM")
                     
@@ -5488,6 +5812,8 @@ class MainWindow(QtWidgets.QMainWindow):
                         f"Running CellSAM... ({successful_segmentations}/{total_acquisitions} completed)"
                     )
                     
+                    _log_memory_debug(f"[GUI] Running CellSAM pipeline (custom implementation) for {acq_name}")
+                    
                     mask = cellsam_pipeline(
                         cellsam_input,
                         bbox_threshold=bbox_threshold,
@@ -5496,10 +5822,42 @@ class MainWindow(QtWidgets.QMainWindow):
                         gauge_cell_size=gauge_cell_size
                     )
                     
-                    # Store the mask
+                    # Custom implementation handles model caching internally
+                    _log_memory_debug(f"[GUI] CellSAM pipeline complete (custom implementation)")
+                    _log_memory_debug(f"[GUI] CellSAM pipeline complete, mask created", mask, "mask")
+                    
+                    # Explicitly release input images memory immediately after segmentation
+                    _log_memory_debug(f"[GUI] Deleting CellSAM input images for {acq_name}")
+                    del cellsam_input
+                    _log_memory_debug(f"[GUI] Deleted cellsam_input")
+                    if 'nuclear_img' in locals() and nuclear_img is not None:
+                        del nuclear_img
+                        _log_memory_debug(f"[GUI] Deleted nuclear_img")
+                    if 'cyto_img' in locals() and cyto_img is not None:
+                        del cyto_img
+                        _log_memory_debug(f"[GUI] Deleted cyto_img")
+                    import gc
+                    gc.collect()
+                    _log_memory_debug(f"[GUI] After GC, mask still exists", mask, "mask_after_cleanup")
+                    
+                    # Update acquisition info cache
+                    if acq_info:
+                        self.segmentation_masks.set_acq_info(acq_id, acq_info)
+                    
+                    # Store mask in memory (save to disk only if user requested)
+                    _log_memory_debug(f"[GUI] Storing mask for {acq_name}, save_masks={save_masks}")
                     if isinstance(mask, np.ndarray):
                         mask = mask.copy()
-                    self.segmentation_masks[acq_id] = mask
+                    self.mask_manager.set_mask(
+                        acq_id, mask,
+                        save_to_disk=save_masks,
+                        acq_info=acq_info,
+                        masks_directory=masks_directory
+                    )
+                    _log_memory_debug(f"[GUI] Mask stored (in-memory) for {acq_name}")
+                    # mask_manager.set_mask already saves with _segmentation_masks.tif naming
+                    # No need for redundant save
+                    
                     # Clear colors for this acquisition so they get regenerated
                     if acq_id in self.segmentation_colors:
                         del self.segmentation_colors[acq_id]
@@ -5509,10 +5867,6 @@ class MainWindow(QtWidgets.QMainWindow):
                         del self.cluster_color_map[acq_id]
                     
                     successful_segmentations += 1
-                    
-                    # Save mask if requested
-                    if save_masks:
-                        self._save_segmentation_masks_for_acquisition(mask, acq_id, masks_directory)
                     
                     # Update progress
                     progress_dlg.update_progress(
@@ -5550,8 +5904,11 @@ class MainWindow(QtWidgets.QMainWindow):
     
     def _perform_watershed_batch_segmentation(self, preprocessing_config: dict, denoise_source: str, 
                                                custom_denoise_settings: dict, save_masks: bool, 
-                                               masks_directory: str, dlg, progress_dlg, total_acquisitions: int):
+                                               masks_directory: str, dlg, progress_dlg, total_acquisitions: int,
+                                               acquisitions_to_process: List = None):
         """Perform sequential batch segmentation for Classical Watershed (one acquisition at a time)."""
+        if acquisitions_to_process is None:
+            acquisitions_to_process = self.acquisitions
         if dlg is None:
             QtWidgets.QMessageBox.critical(
                 self, "Missing Dialog", 
@@ -5559,6 +5916,11 @@ class MainWindow(QtWidgets.QMainWindow):
             )
             progress_dlg.close()
             return
+        
+        # Set up masks directory if saving to disk
+        if save_masks and masks_directory:
+            save_masks_directory_preference(masks_directory)
+            self.mask_manager.set_masks_directory(masks_directory)
         
         try:
             # Get watershed parameters from dialog
@@ -5594,7 +5956,7 @@ class MainWindow(QtWidgets.QMainWindow):
             # Process each acquisition sequentially
             successful_segmentations = 0
             
-            for acq_idx, acq in enumerate(self.acquisitions):
+            for acq_idx, acq in enumerate(acquisitions_to_process):
                 if progress_dlg.is_cancelled():
                     break
                 
@@ -5657,10 +6019,26 @@ class MainWindow(QtWidgets.QMainWindow):
                         rng_seed=rng_seed
                     )
                     
-                    # Store the mask
+                    # Explicitly release image stack memory immediately after segmentation
+                    del img_stack
+                    import gc
+                    gc.collect()
+                    
+                    # Store the mask using mask manager
                     if isinstance(mask, np.ndarray):
                         mask = mask.copy()
-                    self.segmentation_masks[acq_id] = mask
+                    
+                    # Update acquisition info cache for better mask file resolution
+                    self.segmentation_masks.set_acq_info(acq_id, acq_info)
+                    
+                    # Store mask in memory (save to disk only if user requested)
+                    self.mask_manager.set_mask(
+                        acq_id, mask, 
+                        save_to_disk=save_masks,
+                        acq_info=acq_info,
+                        masks_directory=masks_directory
+                    )
+                    
                     # Clear colors for this acquisition so they get regenerated
                     if acq_id in self.segmentation_colors:
                         del self.segmentation_colors[acq_id]
@@ -5670,10 +6048,6 @@ class MainWindow(QtWidgets.QMainWindow):
                         del self.cluster_color_map[acq_id]
                     
                     successful_segmentations += 1
-                    
-                    # Save mask if requested
-                    if save_masks:
-                        self._save_segmentation_masks_for_acquisition_with_info(mask, acq_info, masks_directory)
                     
                     # Update progress
                     n_cells = len(np.unique(mask)) - 1
@@ -5770,6 +6144,10 @@ class MainWindow(QtWidgets.QMainWindow):
             nuclear_img = combine_channels(nuclear_imgs, nuclear_combo_method, nuclear_weights)
             # Ensure combined image is in 0-1 range
             nuclear_img = self._ensure_0_1_range(nuclear_img)
+            # Release intermediate images immediately to free memory
+            del nuclear_imgs
+            import gc
+            gc.collect()
         
         # Load and normalize cytoplasm channels
         cyto_img = None
@@ -5803,6 +6181,14 @@ class MainWindow(QtWidgets.QMainWindow):
                 cyto_img = combine_channels(cyto_imgs, cyto_combo_method, cyto_weights)
                 # Ensure combined image is in 0-1 range
                 cyto_img = self._ensure_0_1_range(cyto_img)
+                # Release intermediate images immediately to free memory
+                del cyto_imgs
+                gc.collect()
+        
+        # Clear loader cache after preprocessing to free memory
+        if hasattr(loader, '_image_cache'):
+            loader._image_cache.clear()
+            gc.collect()
         
         return nuclear_img, cyto_img
     
@@ -6098,7 +6484,8 @@ class MainWindow(QtWidgets.QMainWindow):
             filepath = os.path.join(base_dir, filename)
         
         try:
-            tifffile.imwrite(filepath, masks.astype(np.uint16))
+            # Use uint16 format with compression to reduce file size
+            tifffile.imwrite(filepath, masks.astype(np.uint16), compression='lzw')
             print(f"Segmentation masks saved: {filepath}")
         except Exception as e:
             print(f"Error saving segmentation masks: {e}")
@@ -6883,7 +7270,7 @@ class MainWindow(QtWidgets.QMainWindow):
         # Check cache first
         cache_key = f"{acq_id}_{channel}_{norm_method}"
         if norm_method == 'arcsinh':
-            cofactor = config.get('arcsinh_cofactor', 10.0)
+            cofactor = config.get('arcsinh_cofactor', 1.0)
             cache_key += f"_{cofactor}"
         elif norm_method == 'percentile_clip':
             p_low, p_high = config.get('percentile_params', (1.0, 99.0))
@@ -6894,7 +7281,7 @@ class MainWindow(QtWidgets.QMainWindow):
         if norm_method == 'channelwise_minmax':
             return channelwise_minmax_normalize(img)
         elif norm_method == 'arcsinh':
-            cofactor = config.get('arcsinh_cofactor', 10.0)
+            cofactor = config.get('arcsinh_cofactor', 1.0)
             return arcsinh_normalize(img, cofactor)
         elif norm_method == 'percentile_clip':
             p_low, p_high = config.get('percentile_params', (1.0, 99.0))
@@ -7018,6 +7405,15 @@ class MainWindow(QtWidgets.QMainWindow):
         
         This now parallelizes both image loading and feature extraction for better performance.
         """
+        # Clear image caches to prevent massive RAM usage during feature extraction
+        self.image_cache.clear()
+        
+        # Clear loader image caches
+        for acq_id in selected_acquisitions:
+            loader = self._get_loader_for_acquisition(acq_id)
+            if loader is not None and hasattr(loader, '_image_cache'):
+                loader._image_cache.clear()
+        
         # Create progress dialog
         progress_dlg = ProgressDialog("Feature Extraction", self)
         progress_dlg.set_maximum(len(selected_acquisitions))  # One phase: loading + extraction combined
@@ -7033,10 +7429,21 @@ class MainWindow(QtWidgets.QMainWindow):
                     if current_acq_info is None:
                         print(f"[main] Acquisition {acq_id} not found, skipping")
                         continue
-                    mask = self.segmentation_masks[acq_id]
+                    
+                    # Check if mask is on disk - if so, pass path instead of array for efficiency
+                    mask_file_path = self.mask_manager.get_mask_file_path(acq_id, current_acq_info)
+                    if mask_file_path:
+                        # Mask is on disk - pass path instead of loading into memory
+                        mask = None  # Will be loaded by worker
+                        mask_path_for_worker = mask_file_path
+                    else:
+                        # Mask is in memory - pass array (will be written to temp file by worker)
+                        mask = self.segmentation_masks[acq_id]
+                        mask_path_for_worker = None
+                    
                     # Prepare preprocessing parameters
                     arcsinh_enabled = normalization_config is not None and normalization_config.get('method') == 'arcsinh'
-                    cofactor = normalization_config.get('cofactor', 10.0) if normalization_config else 10.0
+                    cofactor = normalization_config.get('cofactor', 1.0) if normalization_config else 1.0
                     
                     # Convert AcquisitionInfo to dictionary for pickling
                     acq_info_dict = {
@@ -7070,7 +7477,8 @@ class MainWindow(QtWidgets.QMainWindow):
                     acq_label = current_acq_info.well if current_acq_info.well else current_acq_info.name
                     mp_args.append((
                         original_acq_id,  # Use original ID for loader
-                        mask, 
+                        mask,  # Mask array (None if mask is on disk)
+                        mask_path_for_worker,  # Mask file path (None if mask is in memory)
                         selected_features, 
                         acq_info_dict, 
                         acq_label,  # acq_label - use well name if available
@@ -7093,42 +7501,113 @@ class MainWindow(QtWidgets.QMainWindow):
                 return
             
             # Use multiprocessing for parallel loading and feature extraction
+            # Use 'spawn' context to avoid issues with PyQt and other libraries (like QC analysis does)
             max_workers = max(1, min(mp.cpu_count() - 2, len(mp_args)))
             progress_dlg.update_progress(0, "Starting parallel loading and extraction", f"Using {max_workers} CPU cores")
             
             all_features = []
             try:
-                with mp.Pool(processes=max_workers) as pool:
+                # Use spawn context to avoid conflicts and hangs (same as QC analysis)
+                ctx = mp.get_context('spawn')
+                with ctx.Pool(processes=max_workers) as pool:
                     # Submit all tasks - each worker loads and extracts in parallel using core function
                     futures = []
-                    for (acq_id, mask, selected_features, acq_info_dict, acq_label, file_path, loader_type, arcsinh_enabled, cofactor, denoise_source, custom_denoise_settings, spillover_config, source_file, excluded_channels) in mp_args:
+                    for (acq_id, mask, mask_path, selected_features, acq_info_dict, acq_label, file_path, loader_type, arcsinh_enabled, cofactor, denoise_source, custom_denoise_settings, spillover_config, source_file, excluded_channels) in mp_args:
                         future = pool.apply_async(
                             _extract_features_worker,
-                            (acq_id, mask, selected_features, acq_info_dict, acq_label, file_path, loader_type, arcsinh_enabled, cofactor, denoise_source, custom_denoise_settings, spillover_config, source_file, excluded_channels)
+                            (acq_id, mask, mask_path, selected_features, acq_info_dict, acq_label, file_path, loader_type, arcsinh_enabled, cofactor, denoise_source, custom_denoise_settings, spillover_config, source_file, excluded_channels)
                         )
                         futures.append((acq_id, future))
                     
-                    # Collect results as they complete
+                    # Collect results as they complete using proper async result handling
                     completed = 0
-                    for acq_id, future in futures:
+                    pending = dict(futures)  # Convert to dict for easier removal
+                    total_tasks = len(futures)
+                    processed_acq_ids = set()
+                    
+                    import time
+                    start_time = time.time()
+                    worker_timeout = 300  # 5 minutes per worker (reduced from 10 minutes)
+                    last_progress_update = time.time()
+                    
+                    # Use a more efficient loop that checks ready() and processes events
+                    while completed < total_tasks:
+                        if progress_dlg.is_cancelled():
+                            # Cancel remaining tasks
+                            pool.terminate()
+                            pool.join()
+                            break
+                        
+                        # Check elapsed time for timeout detection
+                        elapsed = time.time() - start_time
+                        if elapsed > worker_timeout * len(pending):
+                            print(f"[main] [WARNING] Feature extraction taking too long ({elapsed:.1f}s), some workers may be stuck")
+                        
+                        # Check which futures are ready (non-blocking)
+                        ready_acq_ids = []
+                        for acq_id, future in list(pending.items()):
+                            if acq_id in processed_acq_ids:
+                                continue
+                            
+                            if future.ready():
+                                ready_acq_ids.append(acq_id)
+                        
+                        # Process ready futures
+                        for acq_id in ready_acq_ids:
+                            future = pending.pop(acq_id)
+                            processed_acq_ids.add(acq_id)
+                            try:
+                                result = future.get(timeout=1)  # Should be immediate since ready()
+                                if result is not None and not result.empty:
+                                    all_features.append(result)
+                            except Exception as e:
+                                print(f"[main] [ERROR] Feature extraction failed for acquisition {acq_id}: {e}")
+                                import traceback
+                                traceback.print_exc()
+                            
+                            completed += 1
+                            
+                            # Update progress (throttle updates to avoid UI lag)
+                            current_time = time.time()
+                            if current_time - last_progress_update > 0.1:  # Update every 100ms
+                                progress_dlg.update_progress(
+                                    completed,
+                                    f"Processed acquisition {completed}/{total_tasks}",
+                                    f"Extracted features from {len(all_features)} acquisitions"
+                                )
+                                last_progress_update = current_time
+                        
+                        # Process events to keep UI responsive (but not too frequently)
+                        if time.time() - last_progress_update > 0.05:  # Process events every 50ms
+                            QtWidgets.QApplication.processEvents()
+                        
+                        # If no futures are ready, sleep briefly to avoid busy-waiting
+                        if not ready_acq_ids:
+                            time.sleep(0.05)  # 50ms sleep
+                    
+                    # Collect any remaining futures (with timeout) - should be empty if loop worked correctly
+                    for acq_id, future in list(pending.items()):
                         if progress_dlg.is_cancelled():
                             break
+                        if acq_id in processed_acq_ids:
+                            continue
                         try:
-                            result = future.get(timeout=600)  # 10 minute timeout per acquisition (includes loading)
+                            result = future.get(timeout=worker_timeout)
                             if result is not None and not result.empty:
                                 all_features.append(result)
+                                completed += 1
+                                progress_dlg.update_progress(
+                                    completed,
+                                    f"Processed acquisition {completed}/{total_tasks}",
+                                    f"Extracted features from {len(all_features)} acquisitions"
+                                )
+                        except mp.TimeoutError:
+                            print(f"[main] [ERROR] Feature extraction timed out for acquisition {acq_id} after {worker_timeout}s")
+                            # Mark as failed but continue
                         except Exception as e:
-                            print(f"Feature extraction failed for acquisition {acq_id}: {e}")
+                            print(f"[main] [ERROR] Feature extraction failed for acquisition {acq_id}: {e}")
                             import traceback
                             traceback.print_exc()
-                            continue
-                        
-                        completed += 1
-                        progress_dlg.update_progress(
-                            completed,
-                            f"Processed acquisition {completed}/{len(futures)}",
-                            f"Extracted features from {len(all_features)} acquisitions"
-                        )
                         
             except Exception as mp_error:
                 print(f"Multiprocessing failed, falling back to sequential processing: {mp_error}")
@@ -7137,13 +7616,13 @@ class MainWindow(QtWidgets.QMainWindow):
                 progress_dlg.update_progress(0, "Multiprocessing failed, using sequential processing", "Processing acquisitions one by one")
                 
                 # Fallback to sequential processing
-                for i, (acq_id, mask, selected_features, acq_info_dict, acq_label, file_path, loader_type, arcsinh_enabled, cofactor, denoise_source, custom_denoise_settings, spillover_config, source_file, excluded_channels) in enumerate(mp_args):
+                for i, (acq_id, mask, mask_path, selected_features, acq_info_dict, acq_label, file_path, loader_type, arcsinh_enabled, cofactor, denoise_source, custom_denoise_settings, spillover_config, source_file, excluded_channels) in enumerate(mp_args):
                     if progress_dlg.is_cancelled():
                         break
                     
                     try:
                         result = _extract_features_worker(
-                            acq_id, mask, selected_features, acq_info_dict, acq_label, file_path, loader_type, arcsinh_enabled, cofactor, denoise_source, custom_denoise_settings, spillover_config, source_file, excluded_channels
+                            acq_id, mask, mask_path, selected_features, acq_info_dict, acq_label, file_path, loader_type, arcsinh_enabled, cofactor, denoise_source, custom_denoise_settings, spillover_config, source_file, excluded_channels
                         )
                         
                         if result is not None and not result.empty:
@@ -7167,6 +7646,19 @@ class MainWindow(QtWidgets.QMainWindow):
             
             # Combine all features
             combined_features = pd.concat(all_features, ignore_index=True)
+            
+            # Apply arcsinh transformation at the end if enabled (more efficient - single pass on all data)
+            if normalization_config and normalization_config.get('method') == 'arcsinh':
+                cofactor = normalization_config.get('cofactor', 1.0)
+                
+                # Find all intensity feature columns (exclude frac_pos as it's a proportion)
+                intensity_cols = [col for col in combined_features.columns 
+                                 if any(col.endswith(f"_{ft}") for ft in ['mean', 'median', 'std', 'mad', 'p10', 'p90', 'integrated'])
+                                 and not col.endswith('_frac_pos')]
+                
+                if intensity_cols:
+                    # Apply arcsinh to all intensity features at once
+                    combined_features[intensity_cols] = arcsinh_normalize(combined_features[intensity_cols].values, cofactor=cofactor)
             
             # Store in memory
             self.feature_dataframe = combined_features
@@ -7381,21 +7873,28 @@ class MainWindow(QtWidgets.QMainWindow):
         return features
     
     def _load_segmentation_masks(self):
-        """Load previously saved segmentation masks from a directory for all ROIs."""
+        """Load previously saved segmentation masks from a directory for all ROIs (using dynamic loading)."""
         if not self.acquisitions:
             QtWidgets.QMessageBox.warning(self, "No acquisitions", "No acquisitions available. Please load a file first.")
             return
         
-        # Ask user to select directory containing masks
+        # Ask user to select directory containing masks (use saved preference if available)
+        saved_dir = get_masks_directory_preference()
         masks_dir = QtWidgets.QFileDialog.getExistingDirectory(
             self, 
             "Select Directory Containing Segmentation Masks",
-            "",  # Start from current directory
+            saved_dir or "",  # Start from saved directory if available
             QtWidgets.QFileDialog.ShowDirsOnly | QtWidgets.QFileDialog.DontResolveSymlinks
         )
         
         if not masks_dir:
             return
+        
+        # Save masks directory to preferences
+        save_masks_directory_preference(masks_dir)
+        self.mask_manager.set_masks_directory(masks_dir)
+        
+        # Masks are always stored in memory (no force disk storage)
         
         # Load masks for all acquisitions
         loaded_count = 0
@@ -7448,16 +7947,37 @@ class MainWindow(QtWidgets.QMainWindow):
                 continue
             
             try:
-                # Load the mask file
-                if _HAVE_TIFFFILE:
-                    mask = tifffile.imread(mask_file)
-                else:
-                    # Fallback to PIL if tifffile not available
-                    from PIL import Image
-                    mask = np.array(Image.open(mask_file))
+                # Store mask file path in mask manager (dynamic loading)
+                self.mask_manager._mask_file_paths[acq_info.id] = mask_file
+                # Update acquisition info cache for better mask file resolution
+                self.segmentation_masks.set_acq_info(acq_info.id, acq_info)
                 
-                # Store the loaded mask
-                self.segmentation_masks[acq_info.id] = mask
+                # For small datasets, load mask into memory; for large datasets, keep on disk
+                if len(self.acquisitions) <= 50:
+                    # Load mask into memory for small datasets
+                    if _HAVE_TIFFFILE:
+                        mask = tifffile.imread(mask_file)
+                    else:
+                        # Fallback to PIL if tifffile not available
+                        from PIL import Image
+                        mask = np.array(Image.open(mask_file))
+                    self.mask_manager.set_mask(acq_info.id, mask, save_to_disk=False)
+                    cell_count = len(np.unique(mask)) - 1  # Subtract 1 for background
+                else:
+                    # For large datasets, just register the file path (load on demand)
+                    # Try to get cell count by loading mask temporarily
+                    try:
+                        if _HAVE_TIFFFILE:
+                            mask = tifffile.imread(mask_file)
+                        else:
+                            from PIL import Image
+                            mask = np.array(Image.open(mask_file))
+                        cell_count = len(np.unique(mask)) - 1
+                        # Don't keep in memory for large datasets
+                        del mask
+                    except Exception:
+                        cell_count = 0
+                
                 # Clear colors for this acquisition so they get regenerated
                 if acq_info.id in self.segmentation_colors:
                     del self.segmentation_colors[acq_info.id]
@@ -7467,7 +7987,6 @@ class MainWindow(QtWidgets.QMainWindow):
                     del self.cluster_color_map[acq_info.id]
                 
                 loaded_count += 1
-                cell_count = len(np.unique(mask)) - 1  # Subtract 1 for background
                 total_cells += cell_count
                 
             except Exception as e:
@@ -7782,7 +8301,9 @@ class MainWindow(QtWidgets.QMainWindow):
             return
         
         # Check if AdvancedSpatialAnalysisDialog is available
+        print(f"[DEBUG] _open_advanced_spatial_dialog: AdvancedSpatialAnalysisDialog is None: {AdvancedSpatialAnalysisDialog is None}")
         if AdvancedSpatialAnalysisDialog is None:
+            print("[DEBUG] AdvancedSpatialAnalysisDialog is None - showing fallback dialog")
             reply = QtWidgets.QMessageBox.question(
                 self,
                 "Squidpy Not Available",
@@ -7810,11 +8331,31 @@ class MainWindow(QtWidgets.QMainWindow):
                 self.advanced_spatial_dialog = None
         
         # Create new advanced spatial analysis dialog
-        self.advanced_spatial_dialog = AdvancedSpatialAnalysisDialog(
-            self.feature_dataframe, 
-            batch_corrected_dataframe=self.batch_corrected_dataframe,
-            parent=self
-        )
+        print("[DEBUG] Attempting to create AdvancedSpatialAnalysisDialog...")
+        try:
+            self.advanced_spatial_dialog = AdvancedSpatialAnalysisDialog(
+                self.feature_dataframe, 
+                batch_corrected_dataframe=self.batch_corrected_dataframe,
+                parent=self
+            )
+            print("[DEBUG] Successfully created AdvancedSpatialAnalysisDialog")
+        except RuntimeError as e:
+            print(f"[DEBUG] RuntimeError caught when creating dialog: {e}")
+            if "squidpy" in str(e).lower():
+                reply = QtWidgets.QMessageBox.question(
+                    self,
+                    "Squidpy Not Available",
+                    "Advanced Spatial Analysis requires squidpy, which is not installed.\n\n"
+                    "Install with: pip install squidpy anndata\n\n"
+                    "Would you like to open Simple Spatial Analysis instead?",
+                    QtWidgets.QMessageBox.Yes | QtWidgets.QMessageBox.No,
+                    QtWidgets.QMessageBox.Yes
+                )
+                if reply == QtWidgets.QMessageBox.Yes:
+                    self._open_simple_spatial_dialog()
+            else:
+                QtWidgets.QMessageBox.critical(self, "Error", f"Failed to open Advanced Spatial Analysis: {str(e)}")
+            return
         self.advanced_spatial_dialog.setModal(False)
         self.advanced_spatial_dialog.setAttribute(Qt.WA_DeleteOnClose, False)
         self.advanced_spatial_dialog.show()
@@ -8049,9 +8590,13 @@ class MainWindow(QtWidgets.QMainWindow):
             acq_info_for_core = AcquisitionInfo(
                 id=original_acq_id,
                 name=acq_info.name,
-                description=acq_info.description if hasattr(acq_info, 'description') else "",
-                slide_id=acq_info.slide_id if hasattr(acq_info, 'slide_id') else "",
-                well=acq_info.well if hasattr(acq_info, 'well') else None
+                well=acq_info.well,
+                size=acq_info.size,
+                channels=acq_info.channels,
+                channel_metals=acq_info.channel_metals,
+                channel_labels=acq_info.channel_labels,
+                metadata=acq_info.metadata,
+                source_file=acq_info.source_file
             )
             
             # Use core deconvolution function
@@ -8198,9 +8743,13 @@ class MainWindow(QtWidgets.QMainWindow):
                 acq_info_for_core = AcquisitionInfo(
                     id=original_acq_id,
                     name=acq.name,
-                    description=acq.description if hasattr(acq, 'description') else "",
-                    slide_id=acq.slide_id if hasattr(acq, 'slide_id') else "",
-                    well=acq.well if hasattr(acq, 'well') else None
+                    well=acq.well,
+                    size=acq.size,
+                    channels=acq.channels,
+                    channel_metals=acq.channel_metals,
+                    channel_labels=acq.channel_labels,
+                    metadata=acq.metadata,
+                    source_file=acq.source_file
                 )
                 
                 # Use core deconvolution function
@@ -8319,7 +8868,7 @@ class MainWindow(QtWidgets.QMainWindow):
             
             # Update window title
             dirname = os.path.basename(output_dir) or output_dir
-            self.setWindowTitle(f"IMC File Viewer - {dirname} (Deconvolved OME-TIFF)")
+            self.setWindowTitle(f"OpenIMC - {dirname} (Deconvolved OME-TIFF)")
             
             # Select first acquisition if available
             if self.acquisitions:

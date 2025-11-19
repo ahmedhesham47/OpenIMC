@@ -161,13 +161,26 @@ class CellClusteringDialog(QtWidgets.QDialog):
         self.patient_annotation_map = {}  # Store custom patient/source file labels
         self.feature_label_map = {}  # Store custom feature labels for y-axis ticks (friendly names)
         self.patient_legend_label = 'Patient/Source'  # Custom label for patient annotation legend
-        # Initialize patient annotation column with default priority (source_file, batch_group, source_well)
+        # Initialize patient annotation column with default priority (source_file, batch_group, source_well, then metadata columns)
         self.patient_annotation_column = None
         if self.feature_dataframe is not None:
+            # First check standard columns
             for col in ['source_file', 'batch_group', 'source_well']:
                 if col in self.feature_dataframe.columns:
                     self.patient_annotation_column = col
                     break
+            
+            # If no standard column found, check for metadata columns
+            if self.patient_annotation_column is None:
+                metadata_cols = self._get_metadata_columns(self.feature_dataframe)
+                if metadata_cols:
+                    # Prefer columns that might be batch identifiers (PID, patient_id, etc.)
+                    priority_metadata = [col for col in metadata_cols 
+                                       if any(keyword in col.lower() for keyword in ['pid', 'patient', 'batch', 'sample', 'subject'])]
+                    if priority_metadata:
+                        self.patient_annotation_column = priority_metadata[0]
+                    else:
+                        self.patient_annotation_column = metadata_cols[0]
         self.patient_annotation_enabled = False  # Track whether patient annotation is enabled
         self.feature_tick_fontsize = 8  # Font size for feature labels on y-axis
         self.gating_rules = []  # list of dict: {name, logic, conditions: [{column, op, threshold}]}
@@ -477,6 +490,15 @@ class CellClusteringDialog(QtWidgets.QDialog):
             available_group_cols.insert(0, 'source_file_acquisition_id')
         if not available_group_cols:
             available_group_cols = ['acquisition_name'] if 'acquisition_name' in self.feature_dataframe.columns else []
+        
+        # Add metadata columns for grouping
+        metadata_cols = self._get_metadata_columns(self.feature_dataframe)
+        if metadata_cols:
+            if available_group_cols:
+                available_group_cols.extend(metadata_cols)
+            else:
+                available_group_cols = metadata_cols
+        
         for col in available_group_cols:
             self.group_by_combo.addItem(col)
         viz_layout.addWidget(self.group_by_combo)
@@ -2529,6 +2551,50 @@ class CellClusteringDialog(QtWidgets.QDialog):
                 handles.append(handle)
                 labels.append(str(phenotype))
             ax.legend(handles, labels, loc='best', frameon=True, fontsize=8, title='Manual Phenotype')
+        elif color_by in self.feature_dataframe.columns:
+            # Handle metadata columns or other dataframe columns as categorical
+            metadata_cols = self._get_metadata_columns(self.feature_dataframe)
+            if color_by in metadata_cols or color_by == 'batch_group':
+                # Filter out dropped clusters (cluster 0) for metadata column coloring
+                if hasattr(self, 'tsne_index') and self.tsne_index is not None:
+                    cluster_labels_series = self.clustered_data['cluster']
+                    cluster_labels = cluster_labels_series.reindex(self.tsne_index).values
+                else:
+                    cluster_labels = self.clustered_data['cluster'].values
+                valid_mask = cluster_labels != 0
+                tsne_embedding_filtered = self.tsne_embedding[valid_mask]
+                
+                # Color by metadata column (categorical)
+                if hasattr(self, 'tsne_index') and self.tsne_index is not None:
+                    col_series = self.feature_dataframe.loc[self.tsne_index, color_by]
+                    col_values = col_series.fillna('Unknown').values[valid_mask]
+                else:
+                    col_values = self.feature_dataframe[color_by].fillna('Unknown').values[valid_mask]
+                unique_values = sorted([v for v in np.unique(col_values) if pd.notna(v)])
+                if len(unique_values) > 0:
+                    colors = _get_vivid_colors(len(unique_values))
+                    value_color_map = {v: colors[i] for i, v in enumerate(unique_values)}
+                    handles = []
+                    labels = []
+                    for value in unique_values:
+                        mask = col_values == value
+                        if np.any(mask):
+                            sc = ax.scatter(tsne_embedding_filtered[mask, 0], tsne_embedding_filtered[mask, 1],
+                                            c=[value_color_map[value]],
+                                            alpha=point_alpha, s=point_size, edgecolors='none')
+                            color = value_color_map[value]
+                            if len(color) == 4:
+                                rgb = tuple(color[:3])
+                            elif len(color) == 3:
+                                rgb = tuple(color)
+                            else:
+                                rgb = (color[0], color[1], color[2])
+                            handle = Line2D([0], [0], marker='o', color='none', markerfacecolor=rgb,
+                                           markeredgecolor='none', markersize=6, alpha=point_alpha)
+                            handles.append(handle)
+                            labels.append(str(value))
+                    if handles and labels:
+                        ax.legend(handles, labels, loc='best', frameon=True, fontsize=8, title=color_by)
         elif hasattr(self, 'tsne_raw_data') and color_by in getattr(self, 'tsne_selected_columns', []):
             # Filter out dropped clusters (cluster 0) for feature coloring
             if hasattr(self, 'tsne_index') and self.tsne_index is not None:
@@ -2572,9 +2638,16 @@ class CellClusteringDialog(QtWidgets.QDialog):
         
         self.figure.clear()
         
-        # Get selected color-by options
+        # Get selected color-by options (use stored data which contains actual column names)
         if hasattr(self, 'color_by_listwidget'):
-            selected_items = [item.text() for item in self.color_by_listwidget.selectedItems()]
+            selected_items = []
+            for item in self.color_by_listwidget.selectedItems():
+                # Use stored data (actual column name) if available, otherwise use text
+                actual_name = item.data(QtCore.Qt.UserRole)
+                if actual_name:
+                    selected_items.append(actual_name)
+                else:
+                    selected_items.append(item.text())
         else:
             # Fallback to combo box if list widget doesn't exist
             selected_items = [self.color_by_combo.currentText()] if hasattr(self, 'color_by_combo') else ['Cluster']
@@ -2666,8 +2739,8 @@ class CellClusteringDialog(QtWidgets.QDialog):
         # Point size and alpha visible only for UMAP and t-SNE
         if hasattr(self, 'point_size_label'):
             self.point_size_label.setVisible(view in ['UMAP', 't-SNE'])
-        if hasattr(self, 'point_size_spinbox'):
-            self.point_size_spinbox.setVisible(view in ['UMAP', 't-SNE'])
+            if hasattr(self, 'point_size_spinbox'):
+                self.point_size_spinbox.setVisible(view in ['UMAP', 't-SNE'])
         if hasattr(self, 'point_alpha_label'):
             self.point_alpha_label.setVisible(view in ['UMAP', 't-SNE'])
         if hasattr(self, 'point_alpha_spinbox'):
@@ -2758,10 +2831,18 @@ class CellClusteringDialog(QtWidgets.QDialog):
 
     def _select_feature_columns(self, df: pd.DataFrame):
         """Return numeric feature columns to plot, excluding non-numeric/meta columns."""
+        # Standard columns to exclude
         exclude_cols = { 'cluster', '__group__', 'cluster_phenotype', 'manual_phenotype' }
+        
+        # Get all metadata columns (including those added during batch correction)
+        metadata_cols = set(self._get_metadata_columns(df))
+        
+        # Combine exclusions
+        all_exclude_cols = exclude_cols | metadata_cols
+        
         feature_cols = []
         for col in df.columns:
-            if col in exclude_cols:
+            if col in all_exclude_cols:
                 continue
             try:
                 if pd.api.types.is_numeric_dtype(df[col]):
@@ -2797,6 +2878,10 @@ class CellClusteringDialog(QtWidgets.QDialog):
                 if col in self.feature_dataframe.columns:
                     has_patient_col = True
                     break
+            # Also check metadata columns
+            if not has_patient_col:
+                metadata_cols = self._get_metadata_columns(self.feature_dataframe)
+                has_patient_col = len(metadata_cols) > 0
         
         if hasattr(self, 'patient_annotate_btn'):
             self.patient_annotate_btn.setEnabled(state == 2 and has_patient_col)  # 2 = checked
@@ -2898,20 +2983,38 @@ class CellClusteringDialog(QtWidgets.QDialog):
     
     def _plot_umap_single(self, ax, color_by, point_size, point_alpha, title=None):
         """Plot a single UMAP subplot with specified coloring."""
+        # DEBUG: Print at the start of the function
+        print(f"[UMAP DEBUG] _plot_umap_single called with color_by='{color_by}'")
+        print(f"[UMAP DEBUG] color_by type: {type(color_by)}")
+        print(f"[UMAP DEBUG] hasattr(self, 'umap_raw_data'): {hasattr(self, 'umap_raw_data')}")
+        print(f"[UMAP DEBUG] hasattr(self, 'umap_selected_columns'): {hasattr(self, 'umap_selected_columns')}")
+        if hasattr(self, 'umap_selected_columns'):
+            print(f"[UMAP DEBUG] umap_selected_columns: {self.umap_selected_columns}")
+            print(f"[UMAP DEBUG] color_by in umap_selected_columns: {color_by in self.umap_selected_columns if self.umap_selected_columns else False}")
+        if hasattr(self, 'umap_raw_data'):
+            print(f"[UMAP DEBUG] umap_raw_data columns: {list(self.umap_raw_data.columns[:10])}... (showing first 10)")
+            print(f"[UMAP DEBUG] color_by in umap_raw_data.columns: {color_by in self.umap_raw_data.columns}")
+        
+        # Compute filtered embedding once at the start (used for spread control)
+        if hasattr(self, 'umap_index') and self.umap_index is not None:
+            cluster_labels_series = self.clustered_data['cluster']
+            cluster_labels = cluster_labels_series.reindex(self.umap_index).values
+        else:
+            cluster_labels = self.clustered_data['cluster'].values
+        valid_mask = cluster_labels != 0
+        umap_embedding_filtered = self.umap_embedding[valid_mask]
+        
+        print(f"[UMAP DEBUG] Checking conditions...")
+        print(f"[UMAP DEBUG] color_by == 'Cluster': {color_by == 'Cluster'}")
+        print(f"[UMAP DEBUG] self.clustered_data is not None: {self.clustered_data is not None}")
+        if self.clustered_data is not None:
+            print(f"[UMAP DEBUG] 'cluster' in self.clustered_data.columns: {'cluster' in self.clustered_data.columns}")
+        
         if color_by == 'Cluster' and self.clustered_data is not None and 'cluster' in self.clustered_data.columns:
-            # Align cluster labels to UMAP order
-            if hasattr(self, 'umap_index') and self.umap_index is not None:
-                cluster_labels_series = self.clustered_data['cluster']
-                cluster_labels = cluster_labels_series.reindex(self.umap_index).values
-            else:
-                cluster_labels = self.clustered_data['cluster'].values
+            # Use pre-computed filtered data
+            cluster_labels_filtered = cluster_labels[valid_mask]
             
-            # Filter out dropped clusters (cluster 0)
-            valid_mask = cluster_labels != 0
-            cluster_labels = cluster_labels[valid_mask]
-            umap_embedding_filtered = self.umap_embedding[valid_mask]
-            
-            unique_clusters = sorted(np.unique(cluster_labels))
+            unique_clusters = sorted(np.unique(cluster_labels_filtered))
             colors = _get_vivid_colors(len(unique_clusters))
             cluster_color_map = {cluster_id: colors[i] for i, cluster_id in enumerate(unique_clusters)}
             handles = []
@@ -2939,15 +3042,7 @@ class CellClusteringDialog(QtWidgets.QDialog):
             ncol = max(1, (n_clusters + 9) // 10) if n_clusters > 10 else 1
             ax.legend(handles, labels, loc='best', frameon=True, fontsize=8, ncol=ncol)
         elif color_by == 'Source File' and 'source_file' in self.feature_dataframe.columns:
-            # Filter out dropped clusters (cluster 0) for source file coloring
-            if hasattr(self, 'umap_index') and self.umap_index is not None:
-                cluster_labels_series = self.clustered_data['cluster']
-                cluster_labels = cluster_labels_series.reindex(self.umap_index).values
-            else:
-                cluster_labels = self.clustered_data['cluster'].values
-            valid_mask = cluster_labels != 0
-            umap_embedding_filtered = self.umap_embedding[valid_mask]
-            
+            # Use pre-computed filtered data
             # Color by source file to visualize batch effects (using custom patient labels)
             if hasattr(self, 'umap_index') and self.umap_index is not None:
                 source_file_series = self.feature_dataframe.loc[self.umap_index, 'source_file']
@@ -2987,15 +3082,7 @@ class CellClusteringDialog(QtWidgets.QDialog):
                 # Fallback if no source files
                 ax.scatter(umap_embedding_filtered[:, 0], umap_embedding_filtered[:, 1], c='blue', alpha=point_alpha, s=point_size, edgecolors='none')
         elif color_by == 'Phenotype' and self.clustered_data is not None and 'cluster_phenotype' in self.clustered_data.columns:
-            # Filter out dropped clusters (cluster 0) for phenotype coloring
-            if hasattr(self, 'umap_index') and self.umap_index is not None:
-                cluster_labels_series = self.clustered_data['cluster']
-                cluster_labels = cluster_labels_series.reindex(self.umap_index).values
-            else:
-                cluster_labels = self.clustered_data['cluster'].values
-            valid_mask = cluster_labels != 0
-            umap_embedding_filtered = self.umap_embedding[valid_mask]
-            
+            # Use pre-computed filtered data
             # Color by cluster phenotype
             if hasattr(self, 'umap_index') and self.umap_index is not None:
                 phenotype_series = self.clustered_data['cluster_phenotype'].reindex(self.umap_index)
@@ -3026,15 +3113,7 @@ class CellClusteringDialog(QtWidgets.QDialog):
                 labels.append(str(phenotype))
             ax.legend(handles, labels, loc='best', frameon=True, fontsize=8, title='Phenotype')
         elif color_by == 'Manual Phenotype' and 'manual_phenotype' in self.feature_dataframe.columns:
-            # Filter out dropped clusters (cluster 0) for manual phenotype coloring
-            if hasattr(self, 'umap_index') and self.umap_index is not None:
-                cluster_labels_series = self.clustered_data['cluster']
-                cluster_labels = cluster_labels_series.reindex(self.umap_index).values
-            else:
-                cluster_labels = self.clustered_data['cluster'].values
-            valid_mask = cluster_labels != 0
-            umap_embedding_filtered = self.umap_embedding[valid_mask]
-            
+            # Use pre-computed filtered data
             # Color by manual phenotype
             if hasattr(self, 'umap_index') and self.umap_index is not None:
                 manual_phenotype_series = self.feature_dataframe.loc[self.umap_index, 'manual_phenotype']
@@ -3065,32 +3144,151 @@ class CellClusteringDialog(QtWidgets.QDialog):
                 labels.append(str(phenotype))
             ax.legend(handles, labels, loc='best', frameon=True, fontsize=8, title='Manual Phenotype')
         elif hasattr(self, 'umap_raw_data') and color_by in getattr(self, 'umap_selected_columns', []):
-            # Filter out dropped clusters (cluster 0) for feature coloring
+            # Check all conditions before processing
+            print(f"[UMAP DEBUG] Reached intensity feature check...")
+            print(f"[UMAP DEBUG] hasattr(self, 'umap_raw_data'): {hasattr(self, 'umap_raw_data')}")
+            print(f"[UMAP DEBUG] getattr(self, 'umap_selected_columns', []): {getattr(self, 'umap_selected_columns', [])}")
+            print(f"[UMAP DEBUG] color_by in getattr(self, 'umap_selected_columns', []): {color_by in getattr(self, 'umap_selected_columns', [])}")
+            print(f"[UMAP DEBUG] Combined condition: {hasattr(self, 'umap_raw_data') and color_by in getattr(self, 'umap_selected_columns', [])}")
+            # DEBUG: Print diagnostic information
+            print(f"[DEBUG] Coloring by intensity feature: {color_by}")
+            print(f"[DEBUG] umap_raw_data exists: {hasattr(self, 'umap_raw_data')}")
+            print(f"[DEBUG] umap_selected_columns: {getattr(self, 'umap_selected_columns', None)}")
+            print(f"[DEBUG] color_by in umap_selected_columns: {color_by in getattr(self, 'umap_selected_columns', [])}")
+            print(f"[DEBUG] umap_index exists: {hasattr(self, 'umap_index')}")
+            if hasattr(self, 'umap_index'):
+                print(f"[DEBUG] umap_index length: {len(self.umap_index) if self.umap_index else 0}")
+            print(f"[DEBUG] umap_raw_data shape: {self.umap_raw_data.shape if hasattr(self, 'umap_raw_data') else 'N/A'}")
+            print(f"[DEBUG] umap_raw_data columns: {list(self.umap_raw_data.columns) if hasattr(self, 'umap_raw_data') else 'N/A'}")
+            print(f"[DEBUG] color_by in umap_raw_data.columns: {color_by in self.umap_raw_data.columns if hasattr(self, 'umap_raw_data') else False}")
+            print(f"[DEBUG] valid_mask shape: {valid_mask.shape}")
+            print(f"[DEBUG] valid_mask sum (valid points): {valid_mask.sum()}")
+            
+            # Use pre-computed filtered data
+            # Align umap_raw_data with umap_index order
             if hasattr(self, 'umap_index') and self.umap_index is not None:
-                cluster_labels_series = self.clustered_data['cluster']
-                cluster_labels = cluster_labels_series.reindex(self.umap_index).values
+                # Align umap_raw_data with umap_index order
+                print(f"[DEBUG] Using umap_index alignment")
+                print(f"[DEBUG] umap_index type: {type(self.umap_index)}")
+                print(f"[DEBUG] umap_index first few: {self.umap_index[:5] if len(self.umap_index) > 5 else self.umap_index}")
+                print(f"[DEBUG] umap_raw_data index type: {type(self.umap_raw_data.index)}")
+                print(f"[DEBUG] umap_raw_data index first few: {list(self.umap_raw_data.index[:5]) if len(self.umap_raw_data) > 5 else list(self.umap_raw_data.index)}")
+                
+                try:
+                    feature_series = self.umap_raw_data.loc[self.umap_index, color_by]
+                    vals = feature_series.values
+                    print(f"[DEBUG] Successfully extracted feature_series, length: {len(feature_series)}")
+                    print(f"[DEBUG] vals shape: {vals.shape}")
+                    print(f"[DEBUG] vals dtype: {vals.dtype}")
+                    print(f"[DEBUG] vals min/max: {np.nanmin(vals)}/{np.nanmax(vals)}")
+                    print(f"[DEBUG] vals NaN count: {np.isnan(vals).sum()}")
+                except Exception as e:
+                    print(f"[DEBUG] ERROR extracting feature_series: {e}")
+                    print(f"[DEBUG] Attempting direct column access...")
+                    vals = self.umap_raw_data[color_by].values
+                    print(f"[DEBUG] Direct access successful, vals length: {len(vals)}")
             else:
-                cluster_labels = self.clustered_data['cluster'].values
-            valid_mask = cluster_labels != 0
-            umap_embedding_filtered = self.umap_embedding[valid_mask]
+                print(f"[DEBUG] No umap_index, using direct column access")
+                vals = self.umap_raw_data[color_by].values
+                print(f"[DEBUG] vals shape: {vals.shape}")
+                print(f"[DEBUG] vals dtype: {vals.dtype}")
             
             # Continuous coloring by selected feature (aligned to UMAP order)
-            vals = self.umap_raw_data[color_by].values[valid_mask]
-            sc = ax.scatter(umap_embedding_filtered[:, 0], umap_embedding_filtered[:, 1], c=vals,
-                            cmap='viridis', alpha=point_alpha, s=point_size, edgecolors='none')
-            cbar = self.figure.colorbar(sc, ax=ax)
-            cbar.set_label(color_by)
-        else:
-            # Filter out dropped clusters (cluster 0) for fallback
-            if hasattr(self, 'umap_index') and self.umap_index is not None:
-                cluster_labels_series = self.clustered_data['cluster']
-                cluster_labels = cluster_labels_series.reindex(self.umap_index).values
-            else:
-                cluster_labels = self.clustered_data['cluster'].values
-            valid_mask = cluster_labels != 0
-            umap_embedding_filtered = self.umap_embedding[valid_mask]
+            vals_filtered = vals[valid_mask]
+            print(f"[DEBUG] vals_filtered shape: {vals_filtered.shape}")
+            print(f"[DEBUG] vals_filtered min/max: {np.nanmin(vals_filtered)}/{np.nanmax(vals_filtered)}")
+            print(f"[DEBUG] vals_filtered NaN count: {np.isnan(vals_filtered).sum()}")
+            print(f"[DEBUG] vals_filtered non-NaN count: {(~np.isnan(vals_filtered)).sum()}")
             
+            # Check for valid values
+            if len(vals_filtered) == 0:
+                print(f"[DEBUG] ERROR: vals_filtered is empty!")
+                ax.scatter(umap_embedding_filtered[:, 0], umap_embedding_filtered[:, 1], c='blue', 
+                          alpha=point_alpha, s=point_size, edgecolors='none')
+                ax.text(0.5, 0.5, 'No valid values for coloring', transform=ax.transAxes, 
+                       ha='center', va='center')
+            elif np.all(np.isnan(vals_filtered)):
+                print(f"[DEBUG] ERROR: All values are NaN!")
+                ax.scatter(umap_embedding_filtered[:, 0], umap_embedding_filtered[:, 1], c='blue', 
+                          alpha=point_alpha, s=point_size, edgecolors='none')
+                ax.text(0.5, 0.5, 'All values are NaN', transform=ax.transAxes, 
+                       ha='center', va='center')
+            else:
+                # Remove NaN values for plotting
+                valid_vals_mask = ~np.isnan(vals_filtered)
+                print(f"[DEBUG] valid_vals_mask sum: {valid_vals_mask.sum()}")
+                if np.any(valid_vals_mask):
+                    print(f"[DEBUG] Creating scatter plot with {valid_vals_mask.sum()} valid points")
+                    print(f"[DEBUG] umap_embedding_filtered shape: {umap_embedding_filtered.shape}")
+                    print(f"[DEBUG] umap_embedding_filtered[valid_vals_mask] shape: {umap_embedding_filtered[valid_vals_mask].shape}")
+                    print(f"[DEBUG] vals_filtered[valid_vals_mask] shape: {vals_filtered[valid_vals_mask].shape}")
+                    print(f"[DEBUG] vals_filtered[valid_vals_mask] range: [{np.min(vals_filtered[valid_vals_mask])}, {np.max(vals_filtered[valid_vals_mask])}]")
+                    
+                    try:
+                        sc = ax.scatter(umap_embedding_filtered[valid_vals_mask, 0], 
+                                      umap_embedding_filtered[valid_vals_mask, 1], 
+                                      c=vals_filtered[valid_vals_mask],
+                                      cmap='viridis', alpha=point_alpha, s=point_size, edgecolors='none')
+                        cbar = self.figure.colorbar(sc, ax=ax)
+                        cbar.set_label(color_by)
+                        print(f"[DEBUG] Scatter plot created successfully")
+                    except Exception as e:
+                        print(f"[DEBUG] ERROR creating scatter plot: {e}")
+                        import traceback
+                        traceback.print_exc()
+                        ax.scatter(umap_embedding_filtered[:, 0], umap_embedding_filtered[:, 1], c='blue', 
+                                  alpha=point_alpha, s=point_size, edgecolors='none')
+                        ax.text(0.5, 0.5, f'Error: {str(e)}', transform=ax.transAxes, 
+                               ha='center', va='center', fontsize=8)
+                else:
+                    print(f"[DEBUG] ERROR: No valid (non-NaN) values after filtering!")
+                    ax.scatter(umap_embedding_filtered[:, 0], umap_embedding_filtered[:, 1], c='blue', 
+                              alpha=point_alpha, s=point_size, edgecolors='none')
+                    ax.text(0.5, 0.5, 'No valid values for coloring', transform=ax.transAxes, 
+                           ha='center', va='center')
+        elif color_by in self.feature_dataframe.columns:
+            # Handle metadata columns or other dataframe columns as categorical
+            # (This comes after intensity feature check to avoid conflicts)
+            metadata_cols = self._get_metadata_columns(self.feature_dataframe)
+            if color_by in metadata_cols or color_by == 'batch_group':
+                # Use pre-computed filtered data
+                # Color by metadata column (categorical)
+                if hasattr(self, 'umap_index') and self.umap_index is not None:
+                    col_series = self.feature_dataframe.loc[self.umap_index, color_by]
+                    col_values = col_series.fillna('Unknown').values[valid_mask]
+                else:
+                    col_values = self.feature_dataframe[color_by].fillna('Unknown').values[valid_mask]
+                unique_values = sorted([v for v in np.unique(col_values) if pd.notna(v)])
+                if len(unique_values) > 0:
+                    colors = _get_vivid_colors(len(unique_values))
+                    value_color_map = {v: colors[i] for i, v in enumerate(unique_values)}
+                    handles = []
+                    labels = []
+                    for value in unique_values:
+                        mask = col_values == value
+                        if np.any(mask):
+                            sc = ax.scatter(umap_embedding_filtered[mask, 0], umap_embedding_filtered[mask, 1],
+                                            c=[value_color_map[value]],
+                                            alpha=point_alpha, s=point_size, edgecolors='none')
+                            color = value_color_map[value]
+                            if len(color) == 4:
+                                rgb = tuple(color[:3])
+                            elif len(color) == 3:
+                                rgb = tuple(color)
+                            else:
+                                rgb = (color[0], color[1], color[2])
+                            handle = Line2D([0], [0], marker='o', color='none', markerfacecolor=rgb,
+                                           markeredgecolor='none', markersize=6, alpha=point_alpha)
+                            handles.append(handle)
+                            labels.append(str(value))
+                    if handles and labels:
+                        ax.legend(handles, labels, loc='best', frameon=True, fontsize=8, title=color_by)
+        else:
+            # Use pre-computed filtered data
             # Fallback single color
+            print(f"[UMAP DEBUG] Falling through to else branch (fallback)")
+            print(f"[UMAP DEBUG] color_by value: '{color_by}'")
+            print(f"[UMAP DEBUG] All conditions checked, none matched. Using fallback blue scatter.")
             ax.scatter(umap_embedding_filtered[:, 0], umap_embedding_filtered[:, 1], c='blue', alpha=point_alpha, s=point_size, edgecolors='none')
         
         ax.set_xlabel('UMAP 1')
@@ -3107,9 +3305,16 @@ class CellClusteringDialog(QtWidgets.QDialog):
         
         self.figure.clear()
         
-        # Get selected color-by options
+        # Get selected color-by options (use stored data which contains actual column names)
         if hasattr(self, 'color_by_listwidget'):
-            selected_items = [item.text() for item in self.color_by_listwidget.selectedItems()]
+            selected_items = []
+            for item in self.color_by_listwidget.selectedItems():
+                # Use stored data (actual column name) if available, otherwise use text
+                actual_name = item.data(QtCore.Qt.UserRole)
+                if actual_name:
+                    selected_items.append(actual_name)
+                else:
+                    selected_items.append(item.text())
         else:
             # Fallback to combo box if list widget doesn't exist
             selected_items = [self.color_by_combo.currentText()] if hasattr(self, 'color_by_combo') else ['Cluster']
@@ -3149,8 +3354,14 @@ class CellClusteringDialog(QtWidgets.QDialog):
         """Populate the color-by list widget with Cluster + used features."""
         if not hasattr(self, 'color_by_listwidget'):
             return
-        # Get currently selected items
-        selected_items = [item.text() for item in self.color_by_listwidget.selectedItems()]
+        # Get currently selected items (use stored data for actual column names)
+        selected_items = []
+        for item in self.color_by_listwidget.selectedItems():
+            actual_name = item.data(QtCore.Qt.UserRole)
+            if actual_name:
+                selected_items.append(actual_name)
+            else:
+                selected_items.append(item.text())
         if not selected_items:
             selected_items = ['Cluster']  # Default selection
         
@@ -3162,13 +3373,28 @@ class CellClusteringDialog(QtWidgets.QDialog):
         # Add source_file if available
         if 'source_file' in self.feature_dataframe.columns:
             options.append('Source File')
-        # Add feature columns from UMAP or t-SNE
+        # Add batch_group if available
+        if 'batch_group' in self.feature_dataframe.columns:
+            options.append('Batch Group')
+        # Add metadata columns for coloring
+        metadata_cols = self._get_metadata_columns(self.feature_dataframe)
+        for col in metadata_cols:
+            if col not in options:
+                options.append(col)
+        # Add feature columns from UMAP or t-SNE (use display names for UI, but store actual column names)
         for col in getattr(self, 'umap_selected_columns', []) or []:
-            if col not in options:
-                options.append(col)
+            # Check if column is already in options (either as string or as tuple)
+            already_in = col in options or any(isinstance(opt, tuple) and opt[1] == col for opt in options)
+            if not already_in:
+                # Use display name for UI, but we'll store the actual column name
+                display_name = self._get_feature_display_name(col)
+                options.append((display_name, col))  # Store as (display, actual) tuple
         for col in getattr(self, 'tsne_selected_columns', []) or []:
-            if col not in options:
-                options.append(col)
+            # Check if column is already in options (either as string or as tuple)
+            already_in = col in options or any(isinstance(opt, tuple) and opt[1] == col for opt in options)
+            if not already_in:
+                display_name = self._get_feature_display_name(col)
+                options.append((display_name, col))
         # Add phenotype if available
         if hasattr(self, 'clustered_data') and self.clustered_data is not None and 'cluster_phenotype' in self.clustered_data.columns:
             if 'Phenotype' not in options:
@@ -3180,9 +3406,20 @@ class CellClusteringDialog(QtWidgets.QDialog):
         
         # Add items to list widget
         for option in options:
-            item = QtWidgets.QListWidgetItem(option)
+            if isinstance(option, tuple):
+                # Feature column: (display_name, actual_column_name)
+                display_name, actual_name = option
+                item = QtWidgets.QListWidgetItem(display_name)
+                item.setData(QtCore.Qt.UserRole, actual_name)  # Store actual column name
+            else:
+                # Standard option (Cluster, Source File, etc.)
+                item = QtWidgets.QListWidgetItem(option)
+                item.setData(QtCore.Qt.UserRole, option)  # Store same value
             self.color_by_listwidget.addItem(item)
-            if option in selected_items:
+            # Check if this item should be selected (compare display name or actual name)
+            item_text = item.text()
+            item_data = item.data(QtCore.Qt.UserRole)
+            if item_text in selected_items or item_data in selected_items:
                 item.setSelected(True)
         
         # Ensure at least "Cluster" is selected if nothing was selected
@@ -4906,11 +5143,23 @@ class CellClusteringDialog(QtWidgets.QDialog):
         if hasattr(self, 'patient_annotation_column') and self.patient_annotation_column:
             patient_col = self.patient_annotation_column
         else:
-            # Default priority order
+            # Default priority order: standard columns first, then metadata
             for col in ['source_file', 'batch_group', 'source_well']:
                 if col in self.feature_dataframe.columns:
                     patient_col = col
                     break
+            
+            # If no standard column, check metadata
+            if patient_col is None:
+                metadata_cols = self._get_metadata_columns(self.feature_dataframe)
+                if metadata_cols:
+                    # Prefer columns that might be batch identifiers
+                    priority_metadata = [col for col in metadata_cols 
+                                       if any(keyword in col.lower() for keyword in ['pid', 'patient', 'batch', 'sample', 'subject'])]
+                    if priority_metadata:
+                        patient_col = priority_metadata[0]
+                    else:
+                        patient_col = metadata_cols[0]
         
         if not patient_col or patient_col not in self.feature_dataframe.columns:
             QtWidgets.QMessageBox.warning(self, "No Patient Annotation Data", 
@@ -5075,6 +5324,37 @@ class CellClusteringDialog(QtWidgets.QDialog):
         if feature_name in self.feature_label_map:
             return self.feature_label_map[feature_name]
         return feature_name
+    
+    def _get_metadata_columns(self, df) -> List[str]:
+        """Identify metadata columns (non-feature, non-standard columns) in the dataframe."""
+        if df is None or df.empty:
+            return []
+        
+        # Standard metadata columns to exclude
+        exclude_cols = {
+            'label', 'cell_id', 'acquisition_id', 'acquisition_name', 'acquisition_label',
+            'well', 'cluster', 'source_file', 'source_well', 'source_file_acquisition_id',
+            'centroid_x', 'centroid_y', 'batch_group', 'cluster_phenotype', 'cluster_id'
+        }
+        
+        # Identify feature columns (intensity and morphology)
+        feature_cols = set()
+        for col in df.columns:
+            if col in exclude_cols:
+                continue
+            # Check if it's a feature column (has intensity suffix or is morphology)
+            if any(col.endswith(suffix) for suffix in ['_mean', '_median', '_std', '_mad', '_p10', '_p90', '_integrated', '_frac_pos']):
+                feature_cols.add(col)
+            elif col in ['area_um2', 'perimeter_um', 'equivalent_diameter_um', 'eccentricity',
+                        'solidity', 'extent', 'circularity', 'major_axis_len_um', 'minor_axis_len_um',
+                        'aspect_ratio', 'bbox_area_um2', 'touches_border', 'holes_count']:
+                feature_cols.add(col)
+        
+        # Metadata columns are everything else
+        metadata_cols = [col for col in df.columns 
+                        if col not in exclude_cols and col not in feature_cols]
+        
+        return sorted(metadata_cols)
 
     def _apply_cluster_annotations(self):
         """Apply current annotation map to clustered_data and feature_dataframe as 'cluster_phenotype'."""

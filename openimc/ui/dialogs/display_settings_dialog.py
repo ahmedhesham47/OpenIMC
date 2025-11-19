@@ -75,6 +75,17 @@ def save_font_size_preference(font_size: int):
     _save_user_preferences({'font_size': font_size})
 
 
+def get_masks_directory_preference() -> Optional[str]:
+    """Get the saved masks directory preference, or None if not set."""
+    prefs = _load_user_preferences()
+    return prefs.get('masks_directory')
+
+
+def save_masks_directory_preference(masks_directory: str):
+    """Save the masks directory preference."""
+    _save_user_preferences({'masks_directory': masks_directory})
+
+
 def get_default_font_size() -> int:
     """Get the default font size based on platform."""
     if platform.system() == 'Windows':

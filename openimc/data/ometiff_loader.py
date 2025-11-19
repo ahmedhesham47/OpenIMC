@@ -103,7 +103,13 @@ class OMETIFFLoader:
         for idx, tiff_path in enumerate(tiff_files):
             acq_id = f"file_{idx}"
             filename = os.path.basename(tiff_path)
-            name = os.path.splitext(os.path.splitext(filename)[0])[0]  # Remove .ome.tif extensions
+            # Remove known extensions: .ome.tiff, .ome.tif, .tiff, .tif
+            # Handle files with multiple dots in the name correctly
+            name = filename
+            for ext in ['.ome.tiff', '.ome.tif', '.tiff', '.tif']:
+                if name.lower().endswith(ext.lower()):
+                    name = name[:-len(ext)]
+                    break
             
             # Try to read OME metadata
             try:
@@ -219,13 +225,45 @@ class OMETIFFLoader:
                     # If no channels found in metadata, infer from image dimensions
                     if not channels:
                         if img_shape:
-                            # Assume last dimension is channels
+                            # Infer channel count based on channel_format
                             if len(img_shape) == 3:
-                                n_channels = img_shape[2]
-                            elif len(img_shape) == 4:  # TZCYX format
-                                n_channels = img_shape[1] if img_shape[0] == 1 else img_shape[0]
-                            elif len(img_shape) == 5:  # TZCYX format
-                                n_channels = img_shape[2]
+                                # 3D: Could be (C, H, W) or (H, W, C)
+                                if self.channel_format == 'CHW':
+                                    # Channels first: (C, H, W)
+                                    n_channels = img_shape[0]
+                                else:
+                                    # Channels last: (H, W, C)
+                                    n_channels = img_shape[2]
+                            elif len(img_shape) == 4:
+                                # 4D: Could be (T, C, H, W), (T, H, W, C), (Z, C, H, W), etc.
+                                if self.channel_format == 'CHW':
+                                    # Try to identify channel dimension
+                                    # Common patterns: (T, C, H, W) or (Z, C, H, W)
+                                    if img_shape[0] == 1:
+                                        # (1, C, H, W) - channels at index 1
+                                        n_channels = img_shape[1]
+                                    elif img_shape[1] < img_shape[2] and img_shape[1] < img_shape[3]:
+                                        # Likely (T, C, H, W) where C < H and C < W
+                                        n_channels = img_shape[1]
+                                    else:
+                                        # Fallback: assume channels at index 1
+                                        n_channels = img_shape[1]
+                                else:
+                                    # HWC format: (T, H, W, C) or (Z, H, W, C)
+                                    if img_shape[0] == 1:
+                                        # (1, H, W, C) - channels at index 3
+                                        n_channels = img_shape[3]
+                                    else:
+                                        # Fallback: assume channels at last index
+                                        n_channels = img_shape[3]
+                            elif len(img_shape) == 5:
+                                # 5D: (T, Z, C, H, W) or (T, Z, H, W, C)
+                                if self.channel_format == 'CHW':
+                                    # (T, Z, C, H, W) - channels at index 2
+                                    n_channels = img_shape[2]
+                                else:
+                                    # (T, Z, H, W, C) - channels at index 4
+                                    n_channels = img_shape[4]
                             else:
                                 n_channels = 1
                             

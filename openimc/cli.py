@@ -260,7 +260,7 @@ def preprocess_command(args):
                 output_dir=output_dir,
                 denoise_settings=denoise_settings,
                 normalization_method="None",  # No normalization applied to exported images
-                arcsinh_cofactor=10.0,  # Unused but kept for function signature
+                arcsinh_cofactor=1.0,  # Unused but kept for function signature
                 percentile_params=(1.0, 99.0),
                 viewer_denoise_func=None  # Not used in CLI
             )
@@ -292,7 +292,7 @@ def segment_command(args):
             - acquisition: Optional acquisition ID or name (uses first if not specified)
             - denoise: Optional flag to apply denoising before segmentation
             - arcsinh: Optional flag to apply arcsinh normalization
-            - arcsinh_cofactor: Arcsinh cofactor (default: 10.0)
+            - arcsinh_cofactor: Arcsinh cofactor (default: 1.0)
             - Various method-specific parameters (model, diameter, thresholds, etc.)
     
     Examples:
@@ -371,7 +371,7 @@ def segment_command(args):
                 output_dir=output_dir,
                 denoise_settings=denoise_settings,
                 normalization_method='arcsinh' if args.arcsinh else 'None',
-                arcsinh_cofactor=args.arcsinh_cofactor if args.arcsinh else 10.0,
+                arcsinh_cofactor=args.arcsinh_cofactor if args.arcsinh else 1.0,
                 percentile_params=(1.0, 99.0),
                 nuclear_combo_method=args.nuclear_fusion_method,
                 cyto_combo_method=args.cyto_fusion_method,
@@ -419,7 +419,7 @@ def extract_features_command(args):
             - morphological: Extract morphological features (default: True)
             - intensity: Extract intensity features (default: True)
             - arcsinh: Apply arcsinh normalization to intensity features
-            - arcsinh_cofactor: Arcsinh cofactor (default: 10.0)
+            - arcsinh_cofactor: Arcsinh cofactor (default: 1.0)
             - denoise: Optional flag to apply denoising to all channels
             - denoise_method: Denoising method
             - denoise_settings: JSON file or string with per-channel denoise settings
@@ -481,7 +481,7 @@ def extract_features_command(args):
             intensity=intensity,
             denoise_settings=denoise_settings,
             arcsinh=args.arcsinh,
-            arcsinh_cofactor=args.arcsinh_cofactor if args.arcsinh else 10.0,
+            arcsinh_cofactor=args.arcsinh_cofactor if args.arcsinh else 1.0,
             spillover_config=None,  # CLI doesn't support spillover correction yet
             excluded_channels=None  # CLI doesn't support channel exclusion yet
         )
@@ -1662,7 +1662,7 @@ def workflow_command(args):
         prep_args.channel_format = prep_config.get('channel_format', config.get('channel_format', 'CHW'))
         prep_args.denoise_settings = prep_config.get('denoise_settings')
         prep_args.arcsinh = prep_config.get('arcsinh', False)
-        prep_args.arcsinh_cofactor = prep_config.get('arcsinh_cofactor', 10.0)
+        prep_args.arcsinh_cofactor = prep_config.get('arcsinh_cofactor', 1.0)
         
         preprocess_command(prep_args)
         workflow_state['preprocessing_output'] = prep_output
@@ -1759,7 +1759,7 @@ def workflow_command(args):
         seg_args.low_contrast_enhancement = seg_config.get('low_contrast_enhancement', False)
         seg_args.gauge_cell_size = seg_config.get('gauge_cell_size', False)
         seg_args.arcsinh = seg_config.get('arcsinh', False)
-        seg_args.arcsinh_cofactor = seg_config.get('arcsinh_cofactor', 10.0)
+        seg_args.arcsinh_cofactor = seg_config.get('arcsinh_cofactor', 1.0)
         
         # Handle denoise settings
         denoise_settings = seg_config.get('denoise_settings')
@@ -1810,7 +1810,7 @@ def workflow_command(args):
         extract_args.morphological = feat_config.get('morphological', True)
         extract_args.intensity = feat_config.get('intensity', True)
         extract_args.arcsinh = feat_config.get('arcsinh', False)
-        extract_args.arcsinh_cofactor = feat_config.get('arcsinh_cofactor', 10.0)
+        extract_args.arcsinh_cofactor = feat_config.get('arcsinh_cofactor', 1.0)
         
         # Handle denoise settings
         denoise_settings = feat_config.get('denoise_settings')
@@ -2136,7 +2136,7 @@ def main():
         epilog="""
 Examples:
   # Preprocess images with denoising and arcsinh scaling
-  openimc preprocess input.mcd output/ --arcsinh --arcsinh-cofactor 10.0
+  openimc preprocess input.mcd output/ --arcsinh --arcsinh-cofactor 1.0
 
   # Segment cells using Cellpose (cytoplasm channels optional for cyto3)
   openimc segment input.mcd output/ --method cellpose --nuclear-channels DAPI --model cyto3 --gpu-id 0
@@ -2174,7 +2174,7 @@ Examples:
     preprocess_parser.add_argument('input', help='Input MCD file or OME-TIFF directory')
     preprocess_parser.add_argument('output', help='Output directory for processed OME-TIFF files')
     preprocess_parser.add_argument('--arcsinh', action='store_true', help='(Deprecated) Arcsinh normalization is not applied to exported images. Use during feature extraction instead.')
-    preprocess_parser.add_argument('--arcsinh-cofactor', type=float, default=10.0, help='(Deprecated) Arcsinh cofactor (default: 10.0). Not used for export.')
+    preprocess_parser.add_argument('--arcsinh-cofactor', type=float, default=1.0, help='(Deprecated) Arcsinh cofactor (default: 1.0). Not used for export.')
     preprocess_parser.add_argument('--denoise', choices=['all'], help='Apply denoising to all channels (use "all" for hot pixel removal on all channels)')
     preprocess_parser.add_argument('--denoise-method', choices=['median3', 'n_sd_local_median'], default='median3', help='Hot pixel removal method: median3 (3x3 median filter) or n_sd_local_median (replace pixels above N SD over local median, default: median3)')
     preprocess_parser.add_argument('--denoise-n-sd', type=float, default=5.0, help='Number of standard deviations for n_sd_local_median method only (ignored for median3, default: 5.0)')
@@ -2211,7 +2211,7 @@ Examples:
     segment_parser.add_argument('--low-contrast-enhancement', action='store_true', help='Enable low contrast enhancement for CellSAM (for poor contrast images)')
     segment_parser.add_argument('--gauge-cell-size', action='store_true', help='Enable gauge cell size for CellSAM (runs twice: estimates error, then returns mask)')
     segment_parser.add_argument('--arcsinh', action='store_true', help='Apply arcsinh normalization before segmentation')
-    segment_parser.add_argument('--arcsinh-cofactor', type=float, default=10.0, help='Arcsinh cofactor (default: 10.0)')
+    segment_parser.add_argument('--arcsinh-cofactor', type=float, default=1.0, help='Arcsinh cofactor (default: 1.0)')
     segment_parser.add_argument('--denoise', choices=['all'], help='Apply denoising to all channels (use "all" for hot pixel removal on all channels)')
     segment_parser.add_argument('--denoise-method', choices=['median3', 'n_sd_local_median'], default='median3', help='Hot pixel removal method: median3 (3x3 median filter) or n_sd_local_median (replace pixels above N SD over local median, default: median3)')
     segment_parser.add_argument('--denoise-n-sd', type=float, default=5.0, help='Number of standard deviations for n_sd_local_median method only (ignored for median3, default: 5.0)')
@@ -2229,7 +2229,7 @@ Examples:
     extract_parser.add_argument('--morphological', action='store_true', help='Extract morphological features')
     extract_parser.add_argument('--intensity', action='store_true', help='Extract intensity features')
     extract_parser.add_argument('--arcsinh', action='store_true', help='Apply arcsinh transformation to extracted intensity features (mean, median, std, etc.), not to raw images')
-    extract_parser.add_argument('--arcsinh-cofactor', type=float, default=10.0, help='Arcsinh cofactor (default: 10.0)')
+    extract_parser.add_argument('--arcsinh-cofactor', type=float, default=1.0, help='Arcsinh cofactor (default: 1.0)')
     extract_parser.add_argument('--denoise', choices=['all'], help='Apply denoising to all channels (use "all" for hot pixel removal on all channels)')
     extract_parser.add_argument('--denoise-method', choices=['median3', 'n_sd_local_median'], default='median3', help='Hot pixel removal method: median3 (3x3 median filter) or n_sd_local_median (replace pixels above N SD over local median, default: median3)')
     extract_parser.add_argument('--denoise-n-sd', type=float, default=5.0, help='Number of standard deviations for n_sd_local_median method only (ignored for median3, default: 5.0)')

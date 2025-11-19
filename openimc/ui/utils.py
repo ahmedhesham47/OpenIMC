@@ -41,7 +41,7 @@ def robust_percentile_scale(arr: np.ndarray, low: float = 1.0, high: float = 99.
     return a
 
 
-def arcsinh_normalize(arr: np.ndarray, cofactor: float = 10.0) -> np.ndarray:
+def arcsinh_normalize(arr: np.ndarray, cofactor: float = 1.0) -> np.ndarray:
     """Apply arcsinh transformation (without normalizing to 0-1).
     
     Note: For segmentation, normalization to 0-1 is handled separately

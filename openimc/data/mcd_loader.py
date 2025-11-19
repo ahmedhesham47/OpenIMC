@@ -19,6 +19,8 @@
 
 from dataclasses import dataclass
 from typing import List, Optional, Tuple, Dict
+import os
+import threading
 
 import numpy as np
 
@@ -44,7 +46,11 @@ class AcquisitionInfo:
 
 
 class MCDLoader:
-    """Loader for IMC .mcd files using the readimc library with f.read_acquisition() method."""
+    """Loader for IMC .mcd files using the readimc library with f.read_acquisition() method.
+    
+    Note: The readimc library's McdFile context manager is not thread-safe.
+    This class uses a lock to serialize access to file operations.
+    """
 
     def __init__(self):
         if not _HAVE_READIMC:
@@ -58,6 +64,8 @@ class MCDLoader:
         self._acq_name: Dict[str, str] = {}
         self._acq_well: Dict[str, Optional[str]] = {}
         self._acq_metadata: Dict[str, Dict] = {}
+        # Lock to serialize access to file operations (readimc is not thread-safe)
+        self._file_lock = threading.Lock()
 
     def open(self, path: str):
         """Open an .mcd file."""
@@ -159,31 +167,71 @@ class MCDLoader:
         return self._acq_channels[acq_id]
 
     def get_image(self, acq_id: str, channel: str) -> np.ndarray:
-        """Get image data for a specific acquisition and channel."""
+        """Get image data for a specific acquisition and channel.
+        
+        This method is thread-safe - uses a lock to serialize file access.
+        """
+        if self.mcd is None:
+            raise RuntimeError("MCD file is not open. Call open() first.")
+        
         acq = self._acq_map[acq_id]
         channels = self._acq_channels[acq_id]
         if channel not in channels:
             raise ValueError(f"Channel '{channel}' not found in acquisition {acq_id}.")
         ch_idx = channels.index(channel)
-        assert self.mcd is not None
-        with self.mcd as f:  # type: ignore
-            img = f.read_acquisition(acq)
-            img = np.transpose(img, (1, 2, 0))
-            return img[..., ch_idx]
+        
+        # Serialize access to file operations (readimc is not thread-safe)
+        with self._file_lock:
+            try:
+                with self.mcd as f:  # type: ignore
+                    img = f.read_acquisition(acq)
+                    img = np.transpose(img, (1, 2, 0))
+                    return img[..., ch_idx]
+            except OSError as e:
+                if e.errno == 9:  # Bad file descriptor
+                    raise RuntimeError(
+                        f"File descriptor error when reading acquisition {acq_id}, channel {channel}. "
+                        "The file may have been closed or is in an invalid state. "
+                        "Try reloading the file."
+                    ) from e
+                raise
 
     def get_all_channels(self, acq_id: str) -> np.ndarray:
-        """Get all channels for a specific acquisition as a 3D array (H, W, C)."""
+        """Get all channels for a specific acquisition as a 3D array (H, W, C).
+        
+        This method is thread-safe - uses a lock to serialize file access.
+        """
+        if self.mcd is None:
+            raise RuntimeError("MCD file is not open. Call open() first.")
+        
         acq = self._acq_map[acq_id]
-        assert self.mcd is not None
-        with self.mcd as f:  # type: ignore
-            img = f.read_acquisition(acq)
-            img = np.transpose(img, (1, 2, 0))
-            return img
+        
+        # Serialize access to file operations (readimc is not thread-safe)
+        with self._file_lock:
+            try:
+                with self.mcd as f:  # type: ignore
+                    img = f.read_acquisition(acq)
+                    img = np.transpose(img, (1, 2, 0))
+                    return img
+            except OSError as e:
+                if e.errno == 9:  # Bad file descriptor
+                    raise RuntimeError(
+                        f"File descriptor error when reading acquisition {acq_id}. "
+                        "The file may have been closed or is in an invalid state. "
+                        "Try reloading the file."
+                    ) from e
+                raise
 
     def close(self):
         """Close the .mcd file."""
         if self.mcd and hasattr(self.mcd, "close"):
-            self.mcd.close()
+            try:
+                self.mcd.close()
+            except OSError as e:
+                # Ignore errors when closing (file may already be closed)
+                if e.errno != 9:  # Only ignore Bad file descriptor, raise others
+                    raise
+        self.mcd = None
 
 
 

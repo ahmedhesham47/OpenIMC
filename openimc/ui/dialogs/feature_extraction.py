@@ -207,7 +207,7 @@ class FeatureExtractionDialog(QtWidgets.QDialog):
         self.arcsinh_cofactor_spin = QtWidgets.QDoubleSpinBox()
         self.arcsinh_cofactor_spin.setRange(0.1, 100.0)
         self.arcsinh_cofactor_spin.setDecimals(1)
-        self.arcsinh_cofactor_spin.setValue(10.0)
+        self.arcsinh_cofactor_spin.setValue(1.0)
         self.arcsinh_cofactor_spin.setSingleStep(0.1)
         cofactor_layout.addWidget(self.arcsinh_cofactor_spin)
         cofactor_layout.addStretch()

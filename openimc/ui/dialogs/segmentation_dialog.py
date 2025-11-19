@@ -254,7 +254,7 @@ class SegmentationDialog(QtWidgets.QDialog):
         cofactor_row.addWidget(QtWidgets.QLabel("Cofactor:"))
         self.arcsinh_cofactor_spin = QtWidgets.QDoubleSpinBox()
         self.arcsinh_cofactor_spin.setRange(0.1, 100.0)
-        self.arcsinh_cofactor_spin.setValue(10.0)
+        self.arcsinh_cofactor_spin.setValue(1.0)
         self.arcsinh_cofactor_spin.setDecimals(1)
         cofactor_row.addWidget(self.arcsinh_cofactor_spin)
         cofactor_row.addStretch()
@@ -771,6 +771,7 @@ class SegmentationDialog(QtWidgets.QDialog):
         self.masks_dir_edit = QtWidgets.QLineEdit()
         self.masks_dir_edit.setPlaceholderText("Select directory for saving masks...")
         self.masks_dir_edit.setReadOnly(True)
+        self.masks_dir_edit.textChanged.connect(self._update_segment_missing_visibility)
         self.masks_dir_btn = QtWidgets.QPushButton("Browse...")
         self.masks_dir_btn.clicked.connect(self._select_masks_directory)
         
@@ -787,6 +788,13 @@ class SegmentationDialog(QtWidgets.QDialog):
         self.segment_all_chk.setChecked(False)
         self.segment_all_chk.toggled.connect(self._on_segment_all_toggled)
         options_layout.addWidget(self.segment_all_chk)
+        
+        # Button for segmenting missing masks
+        self.segment_missing_btn = QtWidgets.QPushButton("Segment Missing Masks")
+        self.segment_missing_btn.setToolTip("Segment all acquisitions that don't already have masks in the masks directory")
+        self.segment_missing_btn.clicked.connect(self._on_segment_missing_clicked)
+        self.segment_missing_btn.setVisible(False)  # Only visible when masks directory is set
+        options_layout.addWidget(self.segment_missing_btn)
         
         # Warning for batch segmentation
         self.batch_warning = QtWidgets.QLabel("⚠️ For batch segmentation, consider enabling 'Save segmentation masks' to preserve results")
@@ -828,6 +836,7 @@ class SegmentationDialog(QtWidgets.QDialog):
         self._detect_and_populate_gpus()
         self.gpu_combo.currentTextChanged.connect(self._on_gpu_selection_changed)
         self._on_segment_all_toggled()
+        self._update_segment_missing_visibility()  # Check if masks directory exists on init
         
         # Initialize denoising
         self._populate_denoise_channel_list()
@@ -1102,6 +1111,8 @@ class SegmentationDialog(QtWidgets.QDialog):
     def _on_save_masks_toggled(self):
         """Update UI when save masks checkbox is toggled."""
         self.masks_dir_frame.setVisible(self.save_masks_chk.isChecked())
+        # Show segment missing button when masks directory is set
+        self._update_segment_missing_visibility()
     
     def _select_masks_directory(self):
         """Open directory selection dialog for saving masks."""
@@ -1114,6 +1125,102 @@ class SegmentationDialog(QtWidgets.QDialog):
         
         if directory:
             self.masks_dir_edit.setText(directory)
+            self._update_segment_missing_visibility()
+    
+    def _update_segment_missing_visibility(self):
+        """Update visibility of segment missing button based on masks directory."""
+        masks_dir = self.masks_dir_edit.text().strip()
+        has_masks_dir = bool(masks_dir and os.path.exists(masks_dir))
+        self.segment_missing_btn.setVisible(has_masks_dir)
+    
+    def _on_segment_missing_clicked(self):
+        """Handle click on 'Segment Missing Masks' button."""
+        masks_dir = self.masks_dir_edit.text().strip()
+        if not masks_dir or not os.path.exists(masks_dir):
+            QtWidgets.QMessageBox.warning(
+                self,
+                "No Masks Directory",
+                "Please set a masks directory first by enabling 'Save segmentation masks'."
+            )
+            return
+        
+        # Get parent window and acquisitions
+        parent = self.parent()
+        if not hasattr(parent, 'acquisitions') or not parent.acquisitions:
+            QtWidgets.QMessageBox.warning(
+                self,
+                "No Acquisitions",
+                "No acquisitions available."
+            )
+            return
+        
+        # Check which acquisitions already have masks
+        acquisitions_without_masks = []
+        for acq in parent.acquisitions:
+            # Check if mask exists for this acquisition
+            mask_path = self._get_mask_path_for_acquisition(acq, masks_dir)
+            if not mask_path or not os.path.exists(mask_path):
+                acquisitions_without_masks.append(acq)
+        
+        if not acquisitions_without_masks:
+            QtWidgets.QMessageBox.information(
+                self,
+                "All Masks Found",
+                "All acquisitions already have masks in the masks directory."
+            )
+            return
+        
+        # Confirm with user
+        reply = QtWidgets.QMessageBox.question(
+            self,
+            "Segment Missing Masks",
+            f"Found {len(acquisitions_without_masks)} acquisition(s) without masks.\n"
+            f"Will segment only these acquisitions.\n\n"
+            f"Proceed?",
+            QtWidgets.QMessageBox.Yes | QtWidgets.QMessageBox.No,
+            QtWidgets.QMessageBox.Yes
+        )
+        
+        if reply == QtWidgets.QMessageBox.Yes:
+            # Store the list of acquisitions to segment
+            self._acquisitions_to_segment = acquisitions_without_masks
+            # Set segment all flag to True and close dialog
+            self.segment_all_chk.setChecked(True)
+            self.accept()
+    
+    def _get_mask_path_for_acquisition(self, acq, masks_dir):
+        """Get the expected mask file path for an acquisition."""
+        if not hasattr(acq, 'source_file') or not acq.source_file:
+            return None
+        
+        source_basename = os.path.splitext(os.path.basename(acq.source_file))[0]
+        safe_source = self._sanitize_filename(source_basename)
+        
+        # Try different possible filenames
+        possible_filenames = []
+        
+        if acq.well:
+            safe_well = self._sanitize_filename(acq.well)
+            possible_filenames.append(f"{safe_source}_{safe_well}_segmentation.tiff")
+            possible_filenames.append(f"{safe_source}_{safe_well}_segmentation.tif")
+        
+        safe_name = self._sanitize_filename(acq.name)
+        possible_filenames.append(f"{safe_source}_{safe_name}_segmentation.tiff")
+        possible_filenames.append(f"{safe_source}_{safe_name}_segmentation.tif")
+        
+        for filename in possible_filenames:
+            filepath = os.path.join(masks_dir, filename)
+            if os.path.exists(filepath):
+                return filepath
+        
+        return None
+    
+    def _sanitize_filename(self, filename):
+        """Sanitize filename by removing invalid characters."""
+        invalid_chars = '<>:"/\\|?*'
+        for char in invalid_chars:
+            filename = filename.replace(char, '_')
+        return filename
     
     def get_masks_directory(self):
         """Get the selected directory for saving masks."""

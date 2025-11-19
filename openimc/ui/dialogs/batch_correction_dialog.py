@@ -67,6 +67,9 @@ class BatchCorrectionDialog(QtWidgets.QDialog):
         self.corrected_dataframe: Optional[pd.DataFrame] = None
         self.custom_grouping: Optional[Dict[str, str]] = None  # Maps acquisition_id -> group_name
         
+        # Store metadata files: {file_path: {'filename_column': str, 'dataframe': pd.DataFrame}}
+        self.metadata_files: Dict[str, Dict[str, any]] = {}
+        
         self._create_ui()
         self._update_ui_state()
     
@@ -150,6 +153,48 @@ class BatchCorrectionDialog(QtWidgets.QDialog):
         source_layout.addWidget(self.file_list_widget)
         
         content_layout.addWidget(source_group)
+        
+        # Metadata upload section
+        metadata_group = QtWidgets.QGroupBox("Additional Metadata (Optional)")
+        metadata_layout = QtWidgets.QVBoxLayout(metadata_group)
+        metadata_layout.setContentsMargins(8, 8, 8, 8)
+        metadata_layout.setSpacing(4)
+        
+        metadata_info = QtWidgets.QLabel(
+            "Upload metadata CSV files to attach additional information (e.g., patient ID, clinical data) "
+            "to single-cell features. Metadata will be merged based on filename matching. "
+            "You can upload multiple metadata files from different IMC facilities."
+        )
+        metadata_info.setWordWrap(True)
+        metadata_info.setStyleSheet("QLabel { color: #666; font-size: 8pt; }")
+        metadata_layout.addWidget(metadata_info)
+        
+        # Metadata file list
+        metadata_list_label = QtWidgets.QLabel("Metadata files:")
+        metadata_layout.addWidget(metadata_list_label)
+        
+        self.metadata_list = QtWidgets.QListWidget()
+        self.metadata_list.setMaximumHeight(120)
+        self.metadata_list.setToolTip("Double-click a file to configure its filename column")
+        self.metadata_list.itemDoubleClicked.connect(self._configure_metadata_file)
+        metadata_layout.addWidget(self.metadata_list)
+        
+        metadata_buttons_layout = QtWidgets.QHBoxLayout()
+        self.add_metadata_btn = QtWidgets.QPushButton("Add Metadata File...")
+        self.add_metadata_btn.clicked.connect(self._add_metadata_file)
+        metadata_buttons_layout.addWidget(self.add_metadata_btn)
+        
+        self.configure_metadata_btn = QtWidgets.QPushButton("Configure Selected...")
+        self.configure_metadata_btn.clicked.connect(self._configure_metadata_file)
+        metadata_buttons_layout.addWidget(self.configure_metadata_btn)
+        
+        self.remove_metadata_btn = QtWidgets.QPushButton("Remove Selected")
+        self.remove_metadata_btn.clicked.connect(self._remove_metadata_file)
+        metadata_buttons_layout.addWidget(self.remove_metadata_btn)
+        metadata_buttons_layout.addStretch()
+        metadata_layout.addLayout(metadata_buttons_layout)
+        
+        content_layout.addWidget(metadata_group)
         
         # Batch correction method section
         method_group = QtWidgets.QGroupBox("Batch Correction Method")
@@ -351,6 +396,67 @@ class BatchCorrectionDialog(QtWidgets.QDialog):
             self.custom_grouping = None
             self.custom_grouping_status.setText("")
     
+    def _update_batch_var_options(self):
+        """Update batch variable combo box to include metadata columns."""
+        # Store current selection
+        current_selection = self.batch_var_combo.currentText() if self.batch_var_combo.count() > 0 else None
+        
+        # Get combined dataframe to see what columns are available
+        # Use a flag to prevent recursion during metadata merge
+        try:
+            combined_df = self._get_combined_dataframe()
+        except Exception:
+            # If there's an error, just use standard options
+            combined_df = None
+        
+        # Clear and rebuild options
+        self.batch_var_combo.clear()
+        
+        # Always include standard options
+        standard_options = ["source_file", "acquisition_id", "Custom grouping"]
+        self.batch_var_combo.addItems(standard_options)
+        
+        # Add metadata columns if available
+        if combined_df is not None and not combined_df.empty:
+            # Identify metadata columns (non-feature, non-standard columns)
+            exclude_cols = {
+                'label', 'cell_id', 'acquisition_id', 'acquisition_name', 'acquisition_label',
+                'well', 'cluster', 'source_file', 'source_well', 'source_file_acquisition_id',
+                'centroid_x', 'centroid_y', 'batch_group'
+            }
+            
+            # Exclude feature columns (intensity and morphology)
+            feature_cols = set()
+            for col in combined_df.columns:
+                if col in exclude_cols:
+                    continue
+                # Check if it's a feature column (has intensity suffix or is morphology)
+                if any(col.endswith(suffix) for suffix in ['_mean', '_median', '_std', '_mad', '_p10', '_p90', '_integrated', '_frac_pos']):
+                    feature_cols.add(col)
+                elif col in ['area_um2', 'perimeter_um', 'equivalent_diameter_um', 'eccentricity',
+                            'solidity', 'extent', 'circularity', 'major_axis_len_um', 'minor_axis_len_um',
+                            'aspect_ratio', 'bbox_area_um2', 'touches_border', 'holes_count']:
+                    feature_cols.add(col)
+            
+            # Metadata columns are everything else
+            metadata_cols = [col for col in combined_df.columns 
+                           if col not in exclude_cols and col not in feature_cols]
+            
+            # Add metadata columns to combo
+            if metadata_cols:
+                # Sort for consistency
+                metadata_cols = sorted(metadata_cols)
+                # Add separator if we have metadata
+                self.batch_var_combo.insertSeparator(self.batch_var_combo.count())
+                self.batch_var_combo.addItems(metadata_cols)
+        
+        # Restore selection if it still exists
+        if current_selection and self.batch_var_combo.findText(current_selection) >= 0:
+            self.batch_var_combo.setCurrentText(current_selection)
+        elif self.batch_var_combo.count() > 0:
+            # Default to first option
+            self.batch_var_combo.setCurrentIndex(0)
+    
     def _open_custom_grouping_dialog(self):
         """Open the custom grouping dialog."""
         # Get combined dataframe to pass to dialog
@@ -446,6 +552,144 @@ class BatchCorrectionDialog(QtWidgets.QDialog):
             self.loaded_files.pop(index)
             self.file_list.takeItem(index)
             self._populate_features()
+    
+    def _add_metadata_file(self):
+        """Add a metadata file to the list."""
+        file_path, _ = QtWidgets.QFileDialog.getOpenFileName(
+            self,
+            "Select Metadata CSV File",
+            "",
+            "CSV Files (*.csv);;All Files (*)"
+        )
+        
+        if file_path:
+            try:
+                df = pd.read_csv(file_path)
+                if df.empty:
+                    QtWidgets.QMessageBox.warning(
+                        self,
+                        "Empty File",
+                        "The metadata file is empty."
+                    )
+                    return
+                
+                # If file not already added, add it
+                if file_path not in self.metadata_files:
+                    # Auto-detect filename column (common names)
+                    filename_col = None
+                    for col in df.columns:
+                        col_lower = col.lower()
+                        if any(keyword in col_lower for keyword in ['filename', 'file_name', 'file', 'name']):
+                            if 'full' in col_lower or 'stack' in col_lower or 'ome' in col_lower or 'tiff' in col_lower:
+                                filename_col = col
+                                break
+                            elif filename_col is None:
+                                filename_col = col
+                    
+                    # If no auto-detection, prompt user
+                    if filename_col is None:
+                        filename_col = self._select_filename_column(df, file_path)
+                        if filename_col is None:
+                            return  # User cancelled
+                    
+                    self.metadata_files[file_path] = {
+                        'filename_column': filename_col,
+                        'dataframe': df
+                    }
+                    self._update_metadata_list()
+            except Exception as e:
+                QtWidgets.QMessageBox.critical(
+                    self,
+                    "Error",
+                    f"Failed to load metadata file:\n{str(e)}"
+                )
+    
+    def _select_filename_column(self, df: pd.DataFrame, file_path: str) -> Optional[str]:
+        """Dialog to select which column contains the filename."""
+        dialog = QtWidgets.QDialog(self)
+        dialog.setWindowTitle("Select Filename Column")
+        dialog.setModal(True)
+        dialog.resize(400, 200)
+        
+        layout = QtWidgets.QVBoxLayout(dialog)
+        
+        info_label = QtWidgets.QLabel(
+            f"Select the column in '{os.path.basename(file_path)}' that contains the OME-TIFF filename "
+            f"(this will be matched against the 'source_file' column in features):"
+        )
+        info_label.setWordWrap(True)
+        layout.addWidget(info_label)
+        
+        combo = QtWidgets.QComboBox()
+        combo.addItems(df.columns.tolist())
+        layout.addWidget(combo)
+        
+        button_layout = QtWidgets.QHBoxLayout()
+        button_layout.addStretch()
+        ok_btn = QtWidgets.QPushButton("OK")
+        ok_btn.clicked.connect(dialog.accept)
+        cancel_btn = QtWidgets.QPushButton("Cancel")
+        cancel_btn.clicked.connect(dialog.reject)
+        button_layout.addWidget(cancel_btn)
+        button_layout.addWidget(ok_btn)
+        layout.addLayout(button_layout)
+        
+        if dialog.exec_() == QtWidgets.QDialog.Accepted:
+            return combo.currentText()
+        return None
+    
+    def _configure_metadata_file(self):
+        """Configure the filename column for a metadata file."""
+        current_item = self.metadata_list.currentItem()
+        if not current_item:
+            return
+        
+        # Find the file path for this item
+        file_path = None
+        for path, info in self.metadata_files.items():
+            display_text = self._format_metadata_item(path, info['filename_column'])
+            if current_item.text() == display_text:
+                file_path = path
+                break
+        
+        if file_path is None:
+            return
+        
+        df = self.metadata_files[file_path]['dataframe']
+        filename_col = self._select_filename_column(df, file_path)
+        if filename_col is not None:
+            self.metadata_files[file_path]['filename_column'] = filename_col
+            self._update_metadata_list()
+    
+    def _format_metadata_item(self, file_path: str, filename_column: str) -> str:
+        """Format metadata file item for display."""
+        basename = os.path.basename(file_path)
+        return f"{basename} (filename: {filename_column})"
+    
+    def _update_metadata_list(self):
+        """Update the metadata file list display."""
+        self.metadata_list.clear()
+        for file_path, info in self.metadata_files.items():
+            item_text = self._format_metadata_item(file_path, info['filename_column'])
+            self.metadata_list.addItem(item_text)
+        # Update batch variable options to include metadata columns
+        self._update_batch_var_options()
+    
+    def _remove_metadata_file(self):
+        """Remove selected metadata file from the list."""
+        current_item = self.metadata_list.currentItem()
+        if current_item:
+            # Find the file path for this item
+            file_path = None
+            for path, info in self.metadata_files.items():
+                display_text = self._format_metadata_item(path, info['filename_column'])
+                if current_item.text() == display_text:
+                    file_path = path
+                    break
+            
+            if file_path:
+                del self.metadata_files[file_path]
+                self._update_metadata_list()
     
     def _on_filter_changed(self):
         """Handle filter checkbox changes - repopulate feature list."""
@@ -543,38 +787,140 @@ class BatchCorrectionDialog(QtWidgets.QDialog):
             col_name = item.text()
             if col_name.endswith('_mean') or col_name.endswith('_median'):
                 item.setSelected(True)
+        
+        # Update batch variable options to include metadata columns
+        self._update_batch_var_options()
     
     def _get_combined_dataframe(self) -> Optional[pd.DataFrame]:
-        """Get the combined dataframe from current source or loaded files."""
+        """Get the combined dataframe from current source or loaded files, with metadata merged."""
+        # Get base dataframe
         if self.use_current_radio.isChecked():
-            return self.feature_dataframe
+            combined = self.feature_dataframe.copy() if self.feature_dataframe is not None else None
+        else:
+            if not self.loaded_files:
+                return None
+            
+            # Load and combine all files
+            dfs = []
+            for file_path in self.loaded_files:
+                try:
+                    df = pd.read_csv(file_path)
+                    # Ensure source_file column exists
+                    if 'source_file' not in df.columns:
+                        df['source_file'] = os.path.basename(file_path)
+                    dfs.append(df)
+                except Exception as e:
+                    QtWidgets.QMessageBox.warning(
+                        self,
+                        "Load Error",
+                        f"Failed to load {os.path.basename(file_path)}:\n{str(e)}"
+                    )
+                    continue
+            
+            if not dfs:
+                return None
+            
+            # Combine dataframes
+            combined = pd.concat(dfs, ignore_index=True)
         
-        if not self.loaded_files:
+        if combined is None or combined.empty:
             return None
         
-        # Load and combine all files
-        dfs = []
-        for file_path in self.loaded_files:
-            try:
-                df = pd.read_csv(file_path)
-                # Ensure source_file column exists
-                if 'source_file' not in df.columns:
-                    df['source_file'] = os.path.basename(file_path)
-                dfs.append(df)
-            except Exception as e:
+        # Merge metadata if any metadata files are loaded
+        if self.metadata_files:
+            combined = self._merge_metadata(combined)
+        
+        return combined
+    
+    def _merge_metadata(self, features_df: pd.DataFrame) -> pd.DataFrame:
+        """Merge metadata from all loaded metadata files into the features dataframe.
+        
+        Metadata is merged based on filename matching:
+        - Features have a 'source_file' column (basename of OME-TIFF file)
+        - Metadata files have a user-specified filename column
+        - Matching is done by comparing these columns (case-insensitive, ignoring extensions)
+        - Columns with the same name in multiple metadata files are recognized as the same column
+          and merged together (last value wins if there are conflicts for the same filename)
+        """
+        if features_df.empty or 'source_file' not in features_df.columns:
+            return features_df
+        
+        result_df = features_df.copy()
+        
+        # Normalize source_file for matching (lowercase, remove common extensions)
+        def normalize_filename(filename):
+            if pd.isna(filename):
+                return None
+            filename = str(filename).lower().strip()
+            # Remove common extensions
+            for ext in ['.ome.tif', '.ome.tiff', '.tif', '.tiff', '.mcd', '.mcdx']:
+                if filename.endswith(ext):
+                    filename = filename[:-len(ext)]
+            return filename
+        
+        result_df['_match_key'] = result_df['source_file'].apply(normalize_filename)
+        
+        # First, combine all metadata files into a single dataframe
+        # This allows columns with the same name to be recognized as the same column
+        combined_metadata_list = []
+        
+        for file_path, metadata_info in self.metadata_files.items():
+            metadata_df = metadata_info['dataframe'].copy()
+            filename_col = metadata_info['filename_column']
+            
+            if filename_col not in metadata_df.columns:
                 QtWidgets.QMessageBox.warning(
                     self,
-                    "Load Error",
-                    f"Failed to load {os.path.basename(file_path)}:\n{str(e)}"
+                    "Metadata Error",
+                    f"Filename column '{filename_col}' not found in {os.path.basename(file_path)}"
                 )
                 continue
+            
+            # Normalize metadata filename column
+            metadata_df['_match_key'] = metadata_df[filename_col].apply(normalize_filename)
+            
+            # Get columns to merge (exclude the filename column and match key)
+            cols_to_merge = [col for col in metadata_df.columns 
+                           if col not in [filename_col, '_match_key']]
+            
+            if not cols_to_merge:
+                continue
+            
+            # Select only the match key and columns to merge
+            metadata_subset = metadata_df[['_match_key'] + cols_to_merge].copy()
+            combined_metadata_list.append(metadata_subset)
         
-        if not dfs:
-            return None
+        # If we have metadata to merge, combine all metadata files first
+        if combined_metadata_list:
+            # Combine all metadata dataframes
+            # Columns with the same name will be recognized as the same column
+            # Strategy: concatenate all metadata, then group by match_key and take last non-null value for each column
+            all_metadata = pd.concat(combined_metadata_list, ignore_index=True)
+            
+            # Group by match_key and aggregate columns
+            # For each column, take the last non-null value (this handles cases where same filename appears in multiple files)
+            def take_last_nonnull(series):
+                # Remove nulls and take the last value, or last value if all are null
+                nonnull_values = series.dropna()
+                if len(nonnull_values) > 0:
+                    return nonnull_values.iloc[-1]
+                return series.iloc[-1] if len(series) > 0 else None
+            
+            # Aggregate by match_key, using last non-null value for each column
+            combined_metadata = all_metadata.groupby('_match_key').agg(take_last_nonnull).reset_index()
+            
+            # Now merge the combined metadata into the features dataframe
+            result_df = result_df.merge(
+                combined_metadata,
+                on='_match_key',
+                how='left'
+            )
         
-        # Combine dataframes
-        combined = pd.concat(dfs, ignore_index=True)
-        return combined
+        # Remove temporary match key column
+        if '_match_key' in result_df.columns:
+            result_df = result_df.drop(columns=['_match_key'])
+        
+        return result_df
     
     def _select_all_features(self):
         """Select all features in the list."""
@@ -655,6 +1001,9 @@ class BatchCorrectionDialog(QtWidgets.QDialog):
         # Populate features if we have current data
         if self.feature_dataframe is not None and not self.feature_dataframe.empty:
             self._populate_features()
+        
+        # Update batch variable options
+        self._update_batch_var_options()
     
     def get_corrected_dataframe(self) -> Optional[pd.DataFrame]:
         """Get the batch-corrected dataframe."""

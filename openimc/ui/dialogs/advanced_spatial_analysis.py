@@ -24,7 +24,31 @@ This module provides the advanced spatial analysis dialog using squidpy.
 """
 
 import os
+import sys
+# CRITICAL: Configure dask BEFORE any imports that might trigger dask.dataframe import
+# This must be done at the very top, before any other imports
 os.environ.setdefault('DASK_DATAFRAME__QUERY_PLANNING', 'False')
+
+# Also try direct config if dask is available (must be before squidpy import)
+try:
+    import dask
+    # Check if dask.dataframe has already been imported (too late to configure)
+    dask_dataframe_imported = 'dask.dataframe' in sys.modules
+    if dask_dataframe_imported:
+        print("[DEBUG] WARNING: dask.dataframe already imported - configuration may be too late!")
+    else:
+        print("[DEBUG] dask.dataframe not yet imported - configuring dask...")
+    # Set configuration before dask.dataframe is imported
+    dask.config.set({'dataframe.query-planning': False})
+    print("[DEBUG] Configured dask: dataframe.query-planning = False")
+except (ImportError, AttributeError) as e:
+    print(f"[DEBUG] Could not configure dask: {e}")
+    pass
+except Exception as e:
+    print(f"[DEBUG] Unexpected error configuring dask: {e}")
+    import traceback
+    traceback.print_exc()
+    pass
 
 from typing import Optional, Dict, Any
 import numpy as np
@@ -34,7 +58,9 @@ from matplotlib.backends.backend_qt5agg import FigureCanvasQTAgg as FigureCanvas
 from matplotlib.backends.backend_qt5agg import NavigationToolbar2QT as NavigationToolbar
 from matplotlib.figure import Figure
 import matplotlib.pyplot as plt
+from matplotlib.patches import Circle
 from scipy.spatial import Delaunay
+import seaborn as sns
 from openimc.ui.dialogs.figure_save_dialog import save_figure_with_options
 from openimc.ui.dialogs.spatial_analysis import (
     SourceFileFilterDialog,
@@ -52,17 +78,46 @@ from openimc.core import (
     export_anndata
 )
 
+print("[DEBUG] advanced_spatial_analysis.py: Starting squidpy import check...")
+print(f"[DEBUG] _HAVE_SQUIDPY (from spatial_analysis): {_HAVE_SQUIDPY}")
 try:
     # Suppress FutureWarning about anndata.read_text deprecation and squidpy __version__ deprecation
     import warnings
     with warnings.catch_warnings():
         warnings.filterwarnings('ignore', category=FutureWarning, message='.*read_text.*')
         warnings.filterwarnings('ignore', category=FutureWarning, message='.*__version__.*')
+        print("[DEBUG] Attempting to import squidpy...")
         import squidpy as sq
+        print(f"[DEBUG] Successfully imported squidpy, version: {getattr(sq, '__version__', 'unknown')}")
+        print("[DEBUG] Attempting to import anndata...")
         import anndata as ad
-except ImportError:
+        print(f"[DEBUG] Successfully imported anndata, version: {getattr(ad, '__version__', 'unknown')}")
+    _HAVE_SQUIDPY_LOCAL = True
+    _SQUIDPY_IMPORT_ERROR = None
+    print("[DEBUG] _HAVE_SQUIDPY_LOCAL set to True")
+except (ImportError, RuntimeError) as e:
     sq = None
     ad = None
+    _HAVE_SQUIDPY_LOCAL = False
+    _SQUIDPY_IMPORT_ERROR = str(e)
+    print(f"[DEBUG] FAILED to import squidpy/anndata: {e}")
+    print(f"[DEBUG] Exception type: {type(e)}")
+    import traceback
+    print(f"[DEBUG] Traceback:")
+    traceback.print_exc()
+    # Log the error for debugging
+    import warnings
+    warnings.warn(f"Failed to import squidpy in advanced_spatial_analysis: {e}. Squidpy features will be disabled.", ImportWarning)
+except Exception as e:
+    sq = None
+    ad = None
+    _HAVE_SQUIDPY_LOCAL = False
+    _SQUIDPY_IMPORT_ERROR = str(e)
+    print(f"[DEBUG] UNEXPECTED ERROR importing squidpy/anndata: {e}")
+    print(f"[DEBUG] Exception type: {type(e)}")
+    import traceback
+    print(f"[DEBUG] Traceback:")
+    traceback.print_exc()
 
 try:
     from scipy import sparse as sp
@@ -73,8 +128,22 @@ except Exception:
 class AdvancedSpatialAnalysisDialog(QtWidgets.QDialog):
     """Advanced Spatial Analysis Dialog using squidpy for all analyses."""
     def __init__(self, feature_dataframe: pd.DataFrame, batch_corrected_dataframe=None, parent=None):
-        if not _HAVE_SQUIDPY:
-            raise RuntimeError("squidpy is required for AdvancedSpatialAnalysisDialog")
+        print("[DEBUG] AdvancedSpatialAnalysisDialog.__init__: Starting initialization...")
+        print(f"[DEBUG] _HAVE_SQUIDPY (from spatial_analysis): {_HAVE_SQUIDPY}")
+        print(f"[DEBUG] _HAVE_SQUIDPY_LOCAL (local import): {_HAVE_SQUIDPY_LOCAL}")
+        print(f"[DEBUG] _SQUIDPY_IMPORT_ERROR: {_SQUIDPY_IMPORT_ERROR if '_SQUIDPY_IMPORT_ERROR' in globals() else 'N/A'}")
+        print(f"[DEBUG] sq is None: {sq is None}")
+        print(f"[DEBUG] ad is None: {ad is None}")
+        
+        # Check both the imported flag and local import status
+        if not _HAVE_SQUIDPY and not _HAVE_SQUIDPY_LOCAL:
+            print("[DEBUG] Both _HAVE_SQUIDPY and _HAVE_SQUIDPY_LOCAL are False - raising error")
+            error_msg = "squidpy is required for AdvancedSpatialAnalysisDialog. Please install with: pip install squidpy anndata"
+            if '_SQUIDPY_IMPORT_ERROR' in globals() and _SQUIDPY_IMPORT_ERROR:
+                error_msg += f"\n\nImport error details: {_SQUIDPY_IMPORT_ERROR}"
+            raise RuntimeError(error_msg)
+        
+        print("[DEBUG] Squidpy check passed, continuing initialization...")
         
         super().__init__(parent)
         self.setWindowTitle("Advanced Spatial Analysis (Squidpy)")
@@ -876,9 +945,15 @@ class AdvancedSpatialAnalysisDialog(QtWidgets.QDialog):
                     except Exception as e:
                         print(f"[DEBUG] Error re-running enrichment for ROI {roi_id}: {e}")
     
-    def _update_cooccur_ref_cluster_combo(self, adata: 'ad.AnnData'):
+    def _update_cooccur_ref_cluster_combo(self, adata: 'ad.AnnData', preserve_selection: bool = True):
         """Update the reference cluster combo box with available clusters."""
         cluster_key = self.sq_cooccur_cluster_combo.currentText()
+        
+        # Preserve current selection if requested
+        current_selection = None
+        if preserve_selection:
+            current_selection = self.sq_cooccur_ref_cluster_combo.currentData()
+        
         self.sq_cooccur_ref_cluster_combo.clear()
         self.sq_cooccur_ref_cluster_combo.addItem("All clusters", None)
         
@@ -892,6 +967,14 @@ class AdvancedSpatialAnalysisDialog(QtWidgets.QDialog):
                 self.sq_cooccur_ref_cluster_combo.addItem(
                     self._get_cluster_display_name(cat), cat
                 )
+            
+            # Restore previous selection if it still exists, otherwise set default
+            if preserve_selection and current_selection is not None:
+                # Try to restore the previous selection
+                for i in range(self.sq_cooccur_ref_cluster_combo.count()):
+                    if self.sq_cooccur_ref_cluster_combo.itemData(i) == current_selection:
+                        self.sq_cooccur_ref_cluster_combo.setCurrentIndex(i)
+                        return
             
             # Set default to "1" if it exists, otherwise use first cluster
             default_cluster = None
@@ -1071,9 +1154,11 @@ class AdvancedSpatialAnalysisDialog(QtWidgets.QDialog):
     
     def _run_sq_nhood_enrichment(self):
         """Run neighborhood enrichment analysis using core function."""
-        print(f"[DEBUG] _run_sq_nhood_enrichment: Starting")
+        print(f"[DEBUG] _run_sq_nhood_enrichment: Starting", flush=True)
+        import sys
+        sys.stdout.flush()
         if not self.spatial_graph_built:
-            print(f"[DEBUG] Spatial graph not built")
+            print(f"[DEBUG] Spatial graph not built", flush=True)
             QtWidgets.QMessageBox.warning(self, "Graph Required", 
                 "Please create the spatial graph first (Step 1 at the top).")
             return
@@ -1082,7 +1167,8 @@ class AdvancedSpatialAnalysisDialog(QtWidgets.QDialog):
             cluster_key = self.sq_nhood_cluster_combo.currentText()
             roi_id = self._get_selected_roi(self.sq_nhood_roi_combo)
             agg_method = self.sq_nhood_agg_combo.currentText().lower()  # "mean" or "sum"
-            print(f"[DEBUG] Cluster key: {cluster_key}, ROI: {roi_id}, Aggregation: {agg_method}")
+            print(f"[DEBUG] Cluster key: {cluster_key}, ROI: {roi_id}, Aggregation: {agg_method}", flush=True)
+            sys.stdout.flush()
             
             # Check if cluster column exists
             filtered_df = self._get_filtered_dataframe()
@@ -1113,13 +1199,38 @@ class AdvancedSpatialAnalysisDialog(QtWidgets.QDialog):
                 return
             
             # Use core function
-            results = spatial_neighborhood_enrichment(
-                anndata_dict=anndata_dict,
-                cluster_key=cluster_key,
-                aggregation=agg_method
-            )
+            print(f"[DEBUG] Calling spatial_neighborhood_enrichment with {len(anndata_dict)} ROI(s)", flush=True)
+            import sys
+            sys.stdout.flush()
+            try:
+                print(f"[DEBUG] About to call spatial_neighborhood_enrichment...", flush=True)
+                results = spatial_neighborhood_enrichment(
+                    anndata_dict=anndata_dict,
+                    cluster_key=cluster_key,
+                    aggregation=agg_method
+                )
+                print(f"[DEBUG] spatial_neighborhood_enrichment returned", flush=True)
+                sys.stdout.flush()
+                print(f"[DEBUG] Results keys: {list(results.keys())}", flush=True)
+                print(f"[DEBUG] Results has 'results': {'results' in results}", flush=True)
+                print(f"[DEBUG] Results has 'aggregated': {'aggregated' in results}", flush=True)
+                print(f"[DEBUG] Results has 'significant_counts': {'significant_counts' in results}", flush=True)
+                if 'results' in results:
+                    print(f"[DEBUG] Number of result ROIs: {len(results['results'])}", flush=True)
+                if 'aggregated' in results:
+                    print(f"[DEBUG] Aggregated is None: {results['aggregated'] is None}", flush=True)
+                    if results['aggregated'] is not None:
+                        print(f"[DEBUG] Aggregated shape: {results['aggregated'].shape}", flush=True)
+                sys.stdout.flush()
+            except Exception as e:
+                print(f"[DEBUG] ERROR in spatial_neighborhood_enrichment: {e}", flush=True)
+                import traceback
+                traceback.print_exc()
+                sys.stdout.flush()
+                raise
             
             # Update cache with results
+            print(f"[DEBUG] Updating cache with results")
             self.anndata_cache.update(results['results'])
             
             # Update status
@@ -1135,10 +1246,11 @@ class AdvancedSpatialAnalysisDialog(QtWidgets.QDialog):
                 print(f"[DEBUG] Cluster categories: {results['cluster_categories']}")
                 
                 class TempAnnData:
-                    def __init__(self, matrix, cluster_key, obs):
+                    def __init__(self, matrix, cluster_key, obs, significant_counts=None):
                         self.uns = {'nhood_enrichment': {'zscore': matrix}}
                         self.obs = obs
                         self._cluster_key = cluster_key
+                        self._significant_counts = significant_counts
                 
                 import pandas as pd
                 cluster_categories = results['cluster_categories']
@@ -1146,7 +1258,12 @@ class AdvancedSpatialAnalysisDialog(QtWidgets.QDialog):
                 obs_df.index = [str(c) for c in cluster_categories]
                 obs_df[cluster_key] = obs_df[cluster_key].astype('category')
                 
-                temp_adata = TempAnnData(results['aggregated'], cluster_key, obs_df)
+                temp_adata = TempAnnData(
+                    results['aggregated'], 
+                    cluster_key, 
+                    obs_df,
+                    significant_counts=results.get('significant_counts')
+                )
                 print(f"[DEBUG] TempAnnData created: uns keys={list(temp_adata.uns.keys())}, obs shape={obs_df.shape}")
                 print(f"[DEBUG] TempAnnData.uns['nhood_enrichment'] keys={list(temp_adata.uns['nhood_enrichment'].keys())}")
                 print(f"[DEBUG] TempAnnData.uns['nhood_enrichment']['zscore'] shape={temp_adata.uns['nhood_enrichment']['zscore'].shape}")
@@ -1159,7 +1276,25 @@ class AdvancedSpatialAnalysisDialog(QtWidgets.QDialog):
                 
                 # Plot aggregated results
                 print(f"[DEBUG] Calling _plot_sq_nhood_enrichment with TempAnnData")
+                print(f"[DEBUG] TempAnnData.uns keys: {list(temp_adata.uns.keys())}")
+                print(f"[DEBUG] TempAnnData has significant_counts: {hasattr(temp_adata, '_significant_counts')}")
+                if hasattr(temp_adata, '_significant_counts') and temp_adata._significant_counts is not None:
+                    print(f"[DEBUG] significant_counts shape: {temp_adata._significant_counts.shape}")
+                # Switch to neighborhood enrichment tab to show the plot
+                nhood_tab_idx = None
+                for i in range(self.tabs.count()):
+                    if self.tabs.tabText(i) == "Neighborhood Enrichment":
+                        nhood_tab_idx = i
+                        break
+                if nhood_tab_idx is not None:
+                    self.tabs.setCurrentIndex(nhood_tab_idx)
+                    print(f"[DEBUG] Switched to Neighborhood Enrichment tab (index {nhood_tab_idx})")
+                
                 self._plot_sq_nhood_enrichment(temp_adata)
+                # Ensure canvas is visible
+                self.sq_nhood_canvas.setVisible(True)
+                self.sq_nhood_canvas.show()
+                self.sq_nhood_canvas.update()
                 self.sq_nhood_save_btn.setEnabled(True)
             else:
                 # Plot first ROI result
@@ -1169,12 +1304,27 @@ class AdvancedSpatialAnalysisDialog(QtWidgets.QDialog):
                     print(f"[DEBUG] First ROI adata.uns keys: {list(first_adata.uns.keys())}")
                     if 'nhood_enrichment' in first_adata.uns:
                         print(f"[DEBUG] First ROI nhood_enrichment keys: {list(first_adata.uns['nhood_enrichment'].keys()) if isinstance(first_adata.uns['nhood_enrichment'], dict) else 'N/A'}")
+                    # Switch to neighborhood enrichment tab to show the plot
+                    nhood_tab_idx = None
+                    for i in range(self.tabs.count()):
+                        if self.tabs.tabText(i) == "Neighborhood Enrichment":
+                            nhood_tab_idx = i
+                            break
+                    if nhood_tab_idx is not None:
+                        self.tabs.setCurrentIndex(nhood_tab_idx)
+                        print(f"[DEBUG] Switched to Neighborhood Enrichment tab (index {nhood_tab_idx})")
+                    
                     self._plot_sq_nhood_enrichment(first_adata)
+                    # Ensure canvas is visible
+                    self.sq_nhood_canvas.setVisible(True)
+                    self.sq_nhood_canvas.show()
+                    self.sq_nhood_canvas.update()
                     self.sq_nhood_save_btn.setEnabled(True)
                     QtWidgets.QMessageBox.information(self, "Enrichment Complete", 
                         f"Neighborhood enrichment completed for {len(results['results'])} ROI(s).")
                 
         except Exception as e:
+            print(f"[DEBUG] EXCEPTION in _run_sq_nhood_enrichment: {e}")
             import traceback
             traceback.print_exc()
             QtWidgets.QMessageBox.critical(self, "Error", f"Error running enrichment: {str(e)}")
@@ -1254,6 +1404,7 @@ class AdvancedSpatialAnalysisDialog(QtWidgets.QDialog):
         
         if matrix is not None and isinstance(matrix, np.ndarray) and matrix.ndim == 2:
             print(f"[DEBUG] Plotting matrix with shape {matrix.shape}")
+            print(f"[DEBUG] Matrix dtype: {matrix.dtype}, min: {np.nanmin(matrix)}, max: {np.nanmax(matrix)}")
             try:
                 # Handle NaN/inf values
                 if np.any(np.isnan(matrix)) or np.any(np.isinf(matrix)):
@@ -1276,9 +1427,179 @@ class AdvancedSpatialAnalysisDialog(QtWidgets.QDialog):
                             vmax = np.percentile(finite_vals, 95)
                         print(f"[DEBUG] Using vmin={vmin}, vmax={vmax}")
                 
-                im = ax.imshow(matrix, cmap='RdBu_r', aspect='auto', vmin=vmin, vmax=vmax)
-                self.sq_nhood_canvas.figure.colorbar(im, ax=ax, label='Z-Score')
+                # Create square heatmap with aspect='equal' for square cells
+                # Use extent to ensure proper square cells
+                n_rows, n_cols = matrix.shape
+                im = ax.imshow(matrix, cmap='RdBu_r', aspect='equal', vmin=vmin, vmax=vmax, 
+                              interpolation='nearest', origin='upper', 
+                              extent=[-0.5, n_cols - 0.5, n_rows - 0.5, -0.5])
+                print(f"[DEBUG] imshow created with extent=[-0.5, {n_cols-0.5}, {n_rows-0.5}, -0.5]")
+                
+                # Add colorbar with proper spacing
+                # Use pad to control spacing between plot and colorbar
+                cbar = self.sq_nhood_canvas.figure.colorbar(im, ax=ax, label='Z-Score', pad=0.02, shrink=0.8)
+                print(f"[DEBUG] Colorbar created")
+                
+                # Set axis limits to ensure proper display
+                ax.set_xlim(-0.5, n_cols - 0.5)
+                ax.set_ylim(n_rows - 0.5, -0.5)
+                print(f"[DEBUG] Axis limits set: x=[-0.5, {n_cols-0.5}], y=[{n_rows-0.5}, -0.5]")
                 print(f"[DEBUG] imshow and colorbar created successfully")
+                
+                # Add circles for significant interactions if available
+                significant_counts = None
+                # Try to get significant_counts from adata object
+                if hasattr(adata, '_significant_counts') and adata._significant_counts is not None:
+                    significant_counts = adata._significant_counts
+                    print(f"[DEBUG] Found significant_counts in adata, shape: {significant_counts.shape}")
+                else:
+                    # For single ROI, compute from matrix (threshold = 2.0)
+                    # This is a fallback - ideally we'd have it from the core function
+                    significance_threshold = 2.0
+                    significant_counts = (np.abs(matrix) > significance_threshold).astype(int)
+                    print(f"[DEBUG] Computed significant_counts from matrix (single ROI), threshold={significance_threshold}")
+                
+                if significant_counts is not None and significant_counts.shape == matrix.shape:
+                    print(f"[DEBUG] Adding circles for significant interactions")
+                    # Normalize circle sizes (0 to max count)
+                    max_count = np.max(significant_counts) if significant_counts.size > 0 else 1
+                    if max_count > 0:
+                        # Circle size will be proportional to count, scaled to fit within cell
+                        # Use a fraction of cell size (e.g., 0.3 to 0.8 of cell width)
+                        n_rows, n_cols = matrix.shape
+                        # Calculate cell size in data coordinates
+                        cell_size = 1.0  # Since we're using integer indices
+                        min_radius = 0.15 * cell_size  # Minimum circle radius
+                        max_radius = 0.4 * cell_size   # Maximum circle radius
+                        
+                        # Draw circles for each cell
+                        # With extent=[-0.5, n_cols-0.5, n_rows-0.5, -0.5] and origin='upper',
+                        # cell (i, j) has center at (j, i) in data coordinates
+                        circles_added = 0
+                        for i in range(n_rows):
+                            for j in range(n_cols):
+                                count = significant_counts[i, j]
+                                if count > 0:
+                                    # Scale radius based on count
+                                    radius = min_radius + (max_radius - min_radius) * (count / max_count)
+                                    # Center of cell in data coordinates
+                                    # Row i corresponds to y = i (with origin='upper', y decreases downward)
+                                    # Column j corresponds to x = j
+                                    circle = Circle((j, i), radius, color='black', 
+                                                   fill=False, linewidth=1.5, alpha=0.7)
+                                    ax.add_patch(circle)
+                                    circles_added += 1
+                        print(f"[DEBUG] Added {circles_added} circles for cells with significant interactions")
+                        
+                        # Add legend for circle sizes
+                        # Show legend for 1, max_count//2, and max_count (or closest values)
+                        legend_counts = [1]
+                        if max_count > 1:
+                            if max_count > 2:
+                                mid_count = max(1, max_count // 2)
+                                if mid_count not in legend_counts:
+                                    legend_counts.append(mid_count)
+                            if max_count not in legend_counts:
+                                legend_counts.append(max_count)
+                        
+                        # Remove duplicates and sort
+                        legend_counts = sorted(set(legend_counts))
+                        
+                        # Create legend using a custom handler that properly scales circles
+                        from matplotlib.legend_handler import HandlerPatch
+                        
+                        # Store radius information for the handler
+                        class CircleLegendHandler(HandlerPatch):
+                            def __init__(self, radius_data, max_radius_data, ax_ref):
+                                super().__init__()
+                                self.radius_data = radius_data
+                                self.max_radius_data = max_radius_data
+                                self.ax_ref = ax_ref
+                            
+                            def create_artists(self, legend, orig_handle,
+                                             xdescent, ydescent, width, height, fontsize, trans):
+                                # Convert data radius to display coordinates
+                                # Get the transform from data to display coordinates
+                                data_to_display = self.ax_ref.transData
+                                
+                                # Use a reference point in the plot (center of a cell at (0, 0))
+                                # Convert the radius from data coordinates to display coordinates
+                                p_center = data_to_display.transform((0, 0))
+                                p_radius = data_to_display.transform((self.radius_data, 0))
+                                
+                                # Calculate display radius in pixels
+                                display_radius = abs(p_radius[0] - p_center[0])
+                                
+                                # Now convert display radius to legend box coordinates
+                                # The legend box uses a transform that maps to display coordinates
+                                # We need to scale the display radius to fit in the legend box
+                                # Use a reasonable fraction of the legend box size
+                                max_legend_size = min(width, height) * 0.4  # Max circle size in legend box
+                                
+                                # Scale the display radius to fit in legend box
+                                # We want the largest circle to be max_legend_size
+                                # First, get the max radius in display coordinates for reference
+                                p_max_center = data_to_display.transform((0, 0))
+                                p_max_radius = data_to_display.transform((self.max_radius_data, 0))
+                                max_display_radius = abs(p_max_radius[0] - p_max_center[0])
+                                
+                                # Scale proportionally
+                                if max_display_radius > 0:
+                                    scale_factor = max_legend_size / max_display_radius
+                                    legend_radius = display_radius * scale_factor
+                                else:
+                                    # Fallback: use proportional scaling based on data radius
+                                    legend_radius = max_legend_size * (self.radius_data / self.max_radius_data) if self.max_radius_data > 0 else max_legend_size
+                                
+                                center_x = xdescent + width / 2
+                                center_y = ydescent + height / 2
+                                circle = Circle((center_x, center_y), legend_radius,
+                                              color='black', fill=False, linewidth=1.5, alpha=0.7,
+                                              transform=trans)
+                                return [circle]
+                        
+                        # Create legend handles with radius information
+                        legend_handles = []
+                        legend_labels = []
+                        handler_map = {}
+                        
+                        for count_val in legend_counts:
+                            # Calculate the actual radius used in the plot (in data coordinates)
+                            radius_data = min_radius + (max_radius - min_radius) * (count_val / max_count)
+                            
+                            # Create a dummy circle patch (size doesn't matter, handler will override)
+                            legend_circle = Circle((0, 0), 1.0, 
+                                                  color='black', fill=False, 
+                                                  linewidth=1.5, alpha=0.7)
+                            legend_circle._radius_data = radius_data  # Store actual radius
+                            legend_handles.append(legend_circle)
+                            label = f"{count_val} image{'s' if count_val > 1 else ''}"
+                            legend_labels.append(label)
+                            
+                            # Create handler for this circle with radius info
+                            handler_map[legend_circle] = CircleLegendHandler(radius_data, max_radius, ax)
+                        
+                        # Create legend positioned on top of the plot, horizontal layout
+                        legend_created = False
+                        if legend_handles:
+                            # Position legend on top, centered, horizontal layout
+                            # Move it higher to avoid overlapping with title
+                            legend = ax.legend(legend_handles, legend_labels,
+                                             title='Significant Interactions',
+                                             loc='lower center',
+                                             bbox_to_anchor=(0.5, 1.08),
+                                             frameon=True,
+                                             fancybox=True,
+                                             shadow=True,
+                                             fontsize=9,
+                                             ncol=len(legend_handles),  # Horizontal layout
+                                             handler_map=handler_map)
+                            legend.get_frame().set_facecolor('white')
+                            legend.get_frame().set_alpha(0.95)
+                            legend.get_title().set_fontsize(9)
+                            legend_created = True
+                            print(f"[DEBUG] Added legend with {len(legend_handles)} entries")
+                
             except Exception as e:
                 print(f"[DEBUG] Error during plotting: {e}")
                 import traceback
@@ -1311,7 +1632,9 @@ class AdvancedSpatialAnalysisDialog(QtWidgets.QDialog):
                 ax.set_xticks(np.arange(min(matrix.shape[1], 10)))
                 ax.set_yticks(np.arange(min(matrix.shape[0], 10)))
             
-            ax.set_title("Neighborhood Enrichment")
+            # Set title with padding to avoid overlap with legend
+            has_legend_at_title = ax.get_legend() is not None
+            ax.set_title("Neighborhood Enrichment", pad=25 if has_legend_at_title else 10)
             ax.set_xlabel("Neighbor Cluster")
             ax.set_ylabel("Cell Cluster")
             print(f"[DEBUG] Plot completed successfully")
@@ -1330,13 +1653,36 @@ class AdvancedSpatialAnalysisDialog(QtWidgets.QDialog):
                    ha='center', va='center', transform=ax.transAxes, fontsize=8)
         
         try:
-            self.sq_nhood_canvas.figure.tight_layout()
-            print(f"[DEBUG] tight_layout completed")
+            print(f"[DEBUG] Applying layout adjustments...")
+            # Check if legend exists on the axis
+            has_legend = ax.get_legend() is not None
+            
+            # Adjust subplot parameters to center the plot and make room for legend/colorbar
+            # Legend is now on top, so adjust top margin accordingly
+            if has_legend:
+                top_margin = 0.85  # Less space on top to make room for legend above title
+            else:
+                top_margin = 0.95   # Normal top margin without legend
+            
+            self.sq_nhood_canvas.figure.subplots_adjust(
+                left=0.10,           # Left margin
+                right=0.88,          # Right margin (for colorbar)
+                top=top_margin,      # Top margin (adjusted for legend on top)
+                bottom=0.10,         # Bottom margin
+                wspace=0.1,          # Width space between subplots
+                hspace=0.1           # Height space between subplots
+            )
+            print(f"[DEBUG] subplots_adjust completed")
+            print(f"[DEBUG] Drawing canvas...")
             self.sq_nhood_canvas.draw()
             print(f"[DEBUG] Canvas draw completed")
-            # Force update
+            # Force update and repaint
+            print(f"[DEBUG] Updating canvas...")
             self.sq_nhood_canvas.update()
-            print(f"[DEBUG] Canvas update completed")
+            self.sq_nhood_canvas.repaint()
+            print(f"[DEBUG] Canvas update and repaint completed")
+            print(f"[DEBUG] Canvas size: {self.sq_nhood_canvas.size()}")
+            print(f"[DEBUG] Figure size: {self.sq_nhood_canvas.figure.get_size_inches()}")
         except Exception as e:
             print(f"[DEBUG] Error during canvas update: {e}")
             import traceback
@@ -1442,8 +1788,9 @@ class AdvancedSpatialAnalysisDialog(QtWidgets.QDialog):
             if results:
                 # Use first ROI for plotting and reference cluster combo
                 plot_adata = list(results.values())[0]
-                # Update reference cluster combo (this will set default to "1")
-                self._update_cooccur_ref_cluster_combo(plot_adata)
+                # Update reference cluster combo (preserve selection if combo already has items)
+                preserve = self.sq_cooccur_ref_cluster_combo.count() > 0
+                self._update_cooccur_ref_cluster_combo(plot_adata, preserve_selection=preserve)
                 
                 QtWidgets.QMessageBox.information(self, "Co-occurrence Complete", 
                     f"Co-occurrence analysis completed for {len(results)} ROI(s).")
@@ -1461,7 +1808,7 @@ class AdvancedSpatialAnalysisDialog(QtWidgets.QDialog):
             QtWidgets.QMessageBox.critical(self, "Error", f"Error running co-occurrence: {str(e)}")
     
     def _plot_sq_cooccurrence(self, adata: 'ad.AnnData'):
-        """Plot co-occurrence results."""
+        """Plot co-occurrence results using squidpy's plotting function."""
         print(f"[DEBUG] _plot_sq_cooccurrence: Starting")
         print(f"[DEBUG] adata: {adata}")
         if adata is None:
@@ -1476,19 +1823,19 @@ class AdvancedSpatialAnalysisDialog(QtWidgets.QDialog):
         print(f"[DEBUG] adata.uns keys: {list(adata.uns.keys())}")
         
         # Check for co_occurrence key or alternatives
-        cooccur_data = None
+        cooccur_key = None
         if 'co_occurrence' in adata.uns:
-            cooccur_data = adata.uns['co_occurrence']
+            cooccur_key = 'co_occurrence'
             print(f"[DEBUG] Found 'co_occurrence' key")
         else:
             # Try alternative key names
             for key in adata.uns.keys():
                 if 'co' in key.lower() and 'occur' in key.lower():
-                    cooccur_data = adata.uns[key]
+                    cooccur_key = key
                     print(f"[DEBUG] Found alternative key: {key}")
                     break
         
-        if cooccur_data is None:
+        if cooccur_key is None:
             print(f"[DEBUG] No co-occurrence data found in adata.uns")
             self.sq_cooccur_canvas.figure.clear()
             ax = self.sq_cooccur_canvas.figure.add_subplot(111)
@@ -1497,9 +1844,9 @@ class AdvancedSpatialAnalysisDialog(QtWidgets.QDialog):
             self.sq_cooccur_canvas.draw()
             return
         
-        # Manual plotting (more reliable than squidpy's plotting with custom canvas)
-        self.sq_cooccur_canvas.figure.clear()
-        
+        # Use manual plotting (squidpy's plotting functions don't work well with custom canvases)
+        # sq.pl.co_occurrence() doesn't support custom axes and creates its own figure
+        cooccur_data = adata.uns[cooccur_key]
         cluster_key = self.sq_cooccur_cluster_combo.currentText()
         plot_type = self.sq_cooccur_plot_type_combo.currentText()
         
@@ -1625,178 +1972,182 @@ class AdvancedSpatialAnalysisDialog(QtWidgets.QDialog):
                 self.sq_cooccur_canvas.draw()
                 return
         
-        # Continue with curve plotting (original logic)
-        ax = self.sq_cooccur_canvas.figure.add_subplot(111)
+        # Plot using squidpy's exact approach
+        # Based on sq.pl.co_occurrence source code
+        occurrence_data = cooccur_data
+        out = occurrence_data["occ"]
+        interval = occurrence_data["interval"][1:]  # Skip first value like squidpy does
         
-        # Extract data for plotting
-        plotted = False
+        # IMPORTANT: The 'out' array shape is determined by the categories used when
+        # co-occurrence was computed. We need to use those categories, not necessarily
+        # the current ROI's categories. The array shape is (n_clusters, n_clusters, n_distances)
+        # So we need to get the categories that match the array dimensions.
+        out_shape = out.shape
+        print(f"[DEBUG] Co-occurrence 'out' array shape: {out_shape}")
         
-        if isinstance(cooccur_data, dict):
-            print(f"[DEBUG] Co-occurrence dict with {len(cooccur_data)} keys: {list(cooccur_data.keys())[:10]}...")
-            
-            # Try to find interval/distances from the data structure
-            interval = None
-            if 'interval' in cooccur_data:
-                interval = cooccur_data['interval']
-                print(f"[DEBUG] Found top-level interval: {interval}")
-            elif 'distances' in cooccur_data:
-                interval = cooccur_data['distances']
-                print(f"[DEBUG] Found top-level distances: {interval}")
-            
-            # Check for 'occ' key - this is the co-occurrence matrix/array
-            if 'occ' in cooccur_data:
-                occ_array = cooccur_data['occ']
-                print(f"[DEBUG] Found 'occ' array, shape: {occ_array.shape}, ndim: {occ_array.ndim}")
-                
-                if interval is not None:
-                    distances = np.array(interval)
-                    print(f"[DEBUG] Using distances: {distances}")
-                    
-                    if occ_array.ndim == 3:
-                        # 3D array: (cluster1, cluster2, distance_index)
-                        # Shape: (n_clusters, n_clusters, n_distances)
-                        print(f"[DEBUG] 3D occ array: shape {occ_array.shape}")
-                        n_clusters = occ_array.shape[0]
-                        n_distances = occ_array.shape[2]
-                        
-                        # Handle dimension mismatch: use first n_distances from interval
-                        if len(distances) >= n_distances:
-                            plot_distances = distances[:n_distances]
-                            print(f"[DEBUG] Using first {n_distances} distances from interval: {plot_distances}")
-                        elif len(distances) == n_distances:
-                            plot_distances = distances
-                        else:
-                            # Create distance indices if interval doesn't match
-                            plot_distances = np.arange(n_distances)
-                            print(f"[DEBUG] Interval length mismatch, using indices: {plot_distances}")
-                        
-                        # Get selected reference cluster
-                        ref_cluster = self.sq_cooccur_ref_cluster_combo.currentData()
-                        print(f"[DEBUG] Reference cluster selected: {ref_cluster}")
-                        
-                        if ref_cluster is None:
-                            # Plot all clusters: self-co-occurrence for each
-                            for i in range(min(n_clusters, len(categories))):
-                                cluster = categories[i]
-                                self_occ = occ_array[i, i, :]  # Self-co-occurrence
-                                if len(self_occ) == len(plot_distances):
-                                    ax.plot(plot_distances, self_occ, 
-                                           label=f"{self._get_cluster_display_name(cluster)} (self)",
-                                           marker='o', markersize=4, linewidth=1.5)
-                                    plotted = True
-                                    print(f"[DEBUG] Plotted self-co-occurrence for cluster {cluster}: {len(self_occ)} points")
-                        else:
-                            # Plot co-occurrence with respect to selected reference cluster
-                            try:
-                                ref_idx = categories.index(ref_cluster)
-                                if ref_idx < n_clusters:
-                                    # Plot co-occurrence of all clusters with the reference cluster
-                                    for i in range(min(n_clusters, len(categories))):
-                                        cluster = categories[i]
-                                        if i == ref_idx:
-                                            # Self-co-occurrence
-                                            co_occ = occ_array[i, i, :]
-                                            label = f"{self._get_cluster_display_name(cluster)} (self)"
-                                        else:
-                                            # Co-occurrence with reference
-                                            co_occ = occ_array[i, ref_idx, :]
-                                            label = f"{self._get_cluster_display_name(cluster)} with {self._get_cluster_display_name(ref_cluster)}"
-                                        
-                                        if len(co_occ) == len(plot_distances):
-                                            ax.plot(plot_distances, co_occ, 
-                                                   label=label,
-                                                   marker='o', markersize=4, linewidth=1.5)
-                                            plotted = True
-                                            print(f"[DEBUG] Plotted co-occurrence for {label}: {len(co_occ)} points")
-                            except ValueError:
-                                print(f"[DEBUG] Reference cluster {ref_cluster} not found in categories")
-                    
-                    elif occ_array.ndim == 2:
-                        # 2D array: could be (cluster_pairs, distances) or (clusters, distances)
-                        print(f"[DEBUG] 2D occ array: shape {occ_array.shape}")
-                        if occ_array.shape[1] == len(distances):
-                            # Each row is a cluster pair, columns are distances
-                            for i in range(min(occ_array.shape[0], len(categories))):
-                                if i < len(categories):
-                                    cluster = categories[i]
-                                    ax.plot(distances, occ_array[i, :], 
-                                           label=self._get_cluster_display_name(cluster),
-                                           marker='o', markersize=4, linewidth=1.5)
-                                    plotted = True
-                                    print(f"[DEBUG] Plotted curve for cluster {cluster}")
-                        elif occ_array.shape[0] == len(distances):
-                            # Each column is a cluster, rows are distances
-                            for i in range(min(occ_array.shape[1], len(categories))):
-                                if i < len(categories):
-                                    cluster = categories[i]
-                                    ax.plot(distances, occ_array[:, i], 
-                                           label=self._get_cluster_display_name(cluster),
-                                           marker='o', markersize=4, linewidth=1.5)
-                                    plotted = True
-                                    print(f"[DEBUG] Plotted curve for cluster {cluster}")
-                    
-                    elif occ_array.ndim == 1:
-                        # 1D array: single curve
-                        if len(occ_array) == len(distances):
-                            ax.plot(distances, occ_array, 
-                                   label="Co-occurrence",
-                                   marker='o', markersize=4, linewidth=1.5)
-                            plotted = True
-                            print(f"[DEBUG] Plotted single co-occurrence curve")
-            
-            # Fallback: Try old format (cluster pairs as keys)
-            if not plotted:
-                print(f"[DEBUG] Trying fallback format - cluster pairs as keys")
-                for key, value in cooccur_data.items():
-                    if isinstance(value, dict):
-                        # Extract interval/distances and co-occurrence values
-                        if 'interval' in value:
-                            distances = np.array(value['interval'])
-                        elif 'distances' in value:
-                            distances = np.array(value['distances'])
-                        else:
-                            distances = interval if interval is not None else None
-                        
-                        # Extract co-occurrence values
-                        if 'occ' in value:
-                            cooccur_values = np.array(value['occ'])
-                        elif 'cooccurrence' in value:
-                            cooccur_values = np.array(value['cooccurrence'])
-                        else:
-                            continue
-                        
-                        # Get cluster pair label
-                        if isinstance(key, tuple) and len(key) == 2:
-                            cat1, cat2 = key
-                            label = f"{self._get_cluster_display_name(cat1)}-{self._get_cluster_display_name(cat2)}"
-                        elif isinstance(key, str) and '_' in key:
-                            parts = key.split('_', 1)
-                            label = f"{self._get_cluster_display_name(parts[0])}-{self._get_cluster_display_name(parts[1])}"
-                        else:
-                            label = str(key)
-                        
-                        if distances is not None and len(distances) > 0 and len(cooccur_values) > 0:
-                            # Ensure they have the same length
-                            min_len = min(len(distances), len(cooccur_values))
-                            if min_len > 0:
-                                ax.plot(distances[:min_len], cooccur_values[:min_len], 
-                                       label=label, marker='o', markersize=4, linewidth=1.5)
-                                plotted = True
-                                print(f"[DEBUG] Plotted curve for {label}: {min_len} points")
+        # The out array should be (n_clusters, n_clusters, n_distances)
+        # Use the actual dimensions from the array
+        n_clusters_in_data = out_shape[0] if len(out_shape) >= 2 else 0
         
-        if plotted:
-            ax.set_xlabel('Distance (µm)')
-            ax.set_ylabel('Co-occurrence')
-            ax.set_title("Co-occurrence Analysis")
-            handles, labels = ax.get_legend_handles_labels()
-            if len(handles) > 0:
-                ax.legend(handles, labels, bbox_to_anchor=(1.05, 1), loc='upper left', fontsize=8)
-            ax.grid(True, alpha=0.3)
-            print(f"[DEBUG] Plot completed successfully")
+        # Try to get categories from the data structure if available
+        # Otherwise, use categories from current ROI but ensure they match array size
+        if n_clusters_in_data > 0:
+            # Check if categories match the array size
+            if len(categories) == n_clusters_in_data:
+                categories_list = categories
+            else:
+                # Categories don't match - try to get from adata.obs categories
+                # or use indices if categories are missing
+                print(f"[DEBUG] Category mismatch: {len(categories)} categories but array has {n_clusters_in_data} clusters")
+                # Use the categories from the adata that was used to compute co-occurrence
+                # If the current ROI has fewer categories, we need to handle this
+                if len(categories) < n_clusters_in_data:
+                    # Current ROI has fewer categories - this means some clusters are missing
+                    # We should use the categories from when co-occurrence was computed
+                    # For now, create placeholder categories or use indices
+                    print(f"[DEBUG] Warning: Current ROI has fewer categories than co-occurrence data")
+                    # Try to get all possible categories from the cluster column's categories
+                    if cluster_key in adata.obs.columns and hasattr(adata.obs[cluster_key], 'cat'):
+                        all_categories = list(adata.obs[cluster_key].cat.categories)
+                        if len(all_categories) >= n_clusters_in_data:
+                            categories_list = all_categories[:n_clusters_in_data]
+                        else:
+                            # Still not enough - use indices as fallback
+                            categories_list = [f"Cluster_{i}" for i in range(n_clusters_in_data)]
+                    else:
+                        categories_list = [f"Cluster_{i}" for i in range(n_clusters_in_data)]
+                else:
+                    # Current ROI has more categories - use first n_clusters_in_data
+                    categories_list = categories[:n_clusters_in_data]
         else:
-            print(f"[DEBUG] Failed to plot - data format not recognized")
-            ax.text(0.5, 0.5, 'Unable to plot co-occurrence data.\nData format not recognized.\nCheck debug output for details.', 
+            categories_list = categories
+        
+        print(f"[DEBUG] Using {len(categories_list)} categories for plotting: {categories_list[:5]}...")
+        
+        # Get clusters to plot (use reference cluster if selected, otherwise all)
+        clusters_to_plot = None
+        ref_cluster = self.sq_cooccur_ref_cluster_combo.currentData()
+        if ref_cluster is not None:
+            # Plot only the reference cluster (like squidpy's clusters parameter)
+            clusters_to_plot = [ref_cluster] if ref_cluster in categories_list else categories_list
+        else:
+            # Plot all clusters
+            clusters_to_plot = categories_list
+        
+        # Filter to valid clusters
+        clusters_to_plot = [c for c in clusters_to_plot if c in categories_list]
+        
+        if not clusters_to_plot:
+            ax = self.sq_cooccur_canvas.figure.add_subplot(111)
+            ax.text(0.5, 0.5, 'No valid clusters to plot.', 
                    ha='center', va='center', transform=ax.transAxes)
+            self.sq_cooccur_canvas.draw()
+            return
+        
+        # Create subplots like squidpy does (1 row, len(clusters) columns)
+        n_clusters = len(clusters_to_plot)
+        self.sq_cooccur_canvas.figure.clear()
+        
+        # Get palette using tab20/tab60 for consistent cluster coloring
+        # Use _get_vivid_colors which provides tab20, tab20b, tab20c for up to 60 clusters
+        n_categories = len(categories_list)
+        if n_categories > 0:
+            # Get colors using tab20/tab60 scheme
+            color_array = _get_vivid_colors(n_categories)
+            # Convert to dict mapping category to color (RGBA tuple)
+            palette = {cat: tuple(color_array[i]) for i, cat in enumerate(categories_list)}
+        else:
+            palette = {}
+        
+        # Create subplots
+        if n_clusters == 1:
+            axs = [self.sq_cooccur_canvas.figure.add_subplot(111)]
+        else:
+            # Create grid of subplots
+            n_cols = min(n_clusters, 4)  # Limit columns for readability
+            n_rows = (n_clusters + n_cols - 1) // n_cols
+            axs = []
+            for i in range(n_clusters):
+                ax = self.sq_cooccur_canvas.figure.add_subplot(n_rows, n_cols, i + 1)
+                axs.append(ax)
+        
+        # Plot each cluster like squidpy does
+        for g, ax in zip(clusters_to_plot, axs):
+            # Find index of cluster in categories_list
+            try:
+                idx = categories_list.index(g)
+            except ValueError:
+                print(f"[DEBUG] Warning: Cluster {g} not found in categories_list, skipping")
+                continue
+            
+            # Create DataFrame like squidpy: out[idx, :, :].T with columns=categories
+            # Shape: (n_distances, n_clusters)
+            cluster_data = out[idx, :, :].T
+            actual_n_cols = cluster_data.shape[1]
+            
+            # Ensure the number of columns matches categories_list length
+            if actual_n_cols != len(categories_list):
+                print(f"[DEBUG] Warning: cluster_data has {actual_n_cols} columns but categories_list has {len(categories_list)} items")
+                # Use categories that match the actual data shape
+                if actual_n_cols <= len(categories_list):
+                    # Use first actual_n_cols categories
+                    df_columns = categories_list[:actual_n_cols]
+                else:
+                    # More columns than categories - pad with placeholder names
+                    df_columns = list(categories_list) + [f"Cluster_{i}" for i in range(len(categories_list), actual_n_cols)]
+                df = pd.DataFrame(cluster_data, columns=df_columns)
+            else:
+                df = pd.DataFrame(cluster_data, columns=categories_list)
+            
+            # Melt to long format like squidpy
+            df_melted = df.melt(var_name=cluster_key, value_name="probability")
+            df_melted["distance"] = np.tile(interval, len(categories_list))
+            
+            # Use seaborn lineplot like squidpy
+            # Convert palette dict to list if needed (seaborn can handle both)
+            plot_palette = palette
+            if isinstance(palette, dict):
+                # Convert dict to list in the order of categories_list
+                plot_palette = [palette.get(cat, '#000000') for cat in categories_list]
+            
+            sns.lineplot(
+                x="distance",
+                y="probability",
+                data=df_melted,
+                dashes=False,
+                hue=cluster_key,
+                hue_order=categories_list,
+                palette=plot_palette,
+                ax=ax,
+                legend='full',  # Ensure all entries are shown
+            )
+            
+            # Set legend like squidpy - ensure all entries are shown
+            legend_kwargs = {"loc": "center left", "bbox_to_anchor": (1, 0.5)}
+            
+            # Get all handles and labels from the axes (works across matplotlib versions)
+            handles, labels = ax.get_legend_handles_labels()
+            
+            # Remove duplicates while preserving order
+            seen = set()
+            unique_handles = []
+            unique_labels = []
+            for h, l in zip(handles, labels):
+                if l not in seen:
+                    seen.add(l)
+                    unique_handles.append(h)
+                    unique_labels.append(l)
+            
+            # Recreate legend with all unique entries
+            if unique_handles:
+                ax.legend(unique_handles, unique_labels, **legend_kwargs)
+            else:
+                # If no handles, create default legend
+                ax.legend(**legend_kwargs)
+            
+            # Set title like squidpy (LaTeX format)
+            ax.set_title(rf"$\frac{{p(exp|{g})}}{{p(exp)}}$")
+            ax.set_ylabel("value")
         
         self.sq_cooccur_canvas.figure.tight_layout()
         self.sq_cooccur_canvas.draw()
@@ -1886,7 +2237,7 @@ class AdvancedSpatialAnalysisDialog(QtWidgets.QDialog):
             QtWidgets.QMessageBox.critical(self, "Error", f"Error running autocorrelation: {str(e)}")
     
     def _plot_sq_autocorrelation(self, adata: 'ad.AnnData'):
-        """Plot spatial autocorrelation results."""
+        """Plot spatial autocorrelation results using squidpy's plotting function."""
         print(f"[DEBUG] _plot_sq_autocorrelation: Starting")
         print(f"[DEBUG] adata: {adata}")
         if adata is None:
@@ -1901,19 +2252,19 @@ class AdvancedSpatialAnalysisDialog(QtWidgets.QDialog):
         print(f"[DEBUG] adata.uns keys: {list(adata.uns.keys())}")
         
         # Check for moranI key or alternatives
-        moran_data = None
+        moran_key = None
         if 'moranI' in adata.uns:
-            moran_data = adata.uns['moranI']
+            moran_key = 'moranI'
             print(f"[DEBUG] Found 'moranI' key")
         else:
             # Try alternative key names
             for key in adata.uns.keys():
                 if 'moran' in key.lower() or 'autocorr' in key.lower():
-                    moran_data = adata.uns[key]
+                    moran_key = key
                     print(f"[DEBUG] Found alternative key: {key}")
                     break
         
-        if moran_data is None:
+        if moran_key is None:
             print(f"[DEBUG] No Moran's I data found in adata.uns")
             self.sq_autocorr_canvas.figure.clear()
             ax = self.sq_autocorr_canvas.figure.add_subplot(111)
@@ -1922,9 +2273,11 @@ class AdvancedSpatialAnalysisDialog(QtWidgets.QDialog):
             self.sq_autocorr_canvas.draw()
             return
         
-        # Manual plotting (more reliable than squidpy's plotting with custom canvas)
+        # Squidpy doesn't have a spatial_autocorr plotting function
+        # Use manual plotting which works well
         self.sq_autocorr_canvas.figure.clear()
         ax = self.sq_autocorr_canvas.figure.add_subplot(111)
+        moran_data = adata.uns[moran_key]
         
         print(f"[DEBUG] moran_data type: {type(moran_data)}")
         
@@ -2092,8 +2445,17 @@ class AdvancedSpatialAnalysisDialog(QtWidgets.QDialog):
                 self.analysis_status[roi_id]['ripley'] = True
             
             if results:
-                # Use first ROI for plotting
-                plot_adata = list(results.values())[0]
+                # Check if aggregation is needed (multiple ROIs and aggregation selected)
+                agg_method = self.sq_ripley_agg_combo.currentText().lower()
+                should_aggregate = (roi_id is None and len(results) > 1 and agg_method in ['mean', 'sum'])
+                
+                if should_aggregate:
+                    # Aggregate results across ROIs
+                    print(f"[DEBUG] Aggregating Ripley results using {agg_method} for {len(results)} ROIs")
+                    plot_adata = self._aggregate_ripley_results(results, cluster_key, mode, agg_method)
+                else:
+                    # Use first ROI for plotting
+                    plot_adata = list(results.values())[0]
                 
                 QtWidgets.QMessageBox.information(self, "Ripley Complete", 
                     f"Ripley analysis completed for {len(results)} ROI(s).")
@@ -2111,8 +2473,91 @@ class AdvancedSpatialAnalysisDialog(QtWidgets.QDialog):
             traceback.print_exc()
             QtWidgets.QMessageBox.critical(self, "Error", f"Error running Ripley: {str(e)}")
     
+    def _aggregate_ripley_results(self, results: Dict[str, 'ad.AnnData'], cluster_key: str, mode: str, agg_method: str) -> 'ad.AnnData':
+        """Aggregate Ripley results across multiple ROIs."""
+        from squidpy._constants._constants import RipleyStat
+        
+        mode_enum = RipleyStat(mode)
+        stat_key = f"{mode_enum.s}_stat"
+        sims_stat_key = "sims_stat"
+        
+        # Collect all stat dataframes
+        stat_dfs = []
+        sims_stat_dfs = []
+        all_bins = None
+        all_clusters = set()
+        
+        for roi_id, adata in results.items():
+            if 'ripley' not in adata.uns:
+                continue
+            
+            ripley_data = adata.uns['ripley']
+            if stat_key not in ripley_data:
+                continue
+            
+            stat_df = ripley_data[stat_key]
+            stat_dfs.append(stat_df)
+            
+            # Collect unique clusters and bins
+            if cluster_key in stat_df.columns:
+                all_clusters.update(stat_df[cluster_key].unique())
+            if 'bins' in stat_df.columns:
+                if all_bins is None:
+                    all_bins = stat_df['bins'].unique()
+                else:
+                    # Ensure bins match across ROIs
+                    bins_this_roi = stat_df['bins'].unique()
+                    if len(bins_this_roi) != len(all_bins) or not np.allclose(bins_this_roi, all_bins):
+                        print(f"[DEBUG] Warning: Bins mismatch for ROI {roi_id}, using first ROI's bins")
+            
+            # Collect simulation stats if available
+            if sims_stat_key in ripley_data:
+                sims_stat_dfs.append(ripley_data[sims_stat_key])
+        
+        if not stat_dfs:
+            # Fallback: return first result
+            return list(results.values())[0]
+        
+        # Aggregate stat dataframes
+        # Combine all dataframes
+        combined_stat_df = pd.concat(stat_dfs, ignore_index=True)
+        
+        # Group by bins and cluster_key, then aggregate stats
+        grouped = combined_stat_df.groupby(['bins', cluster_key], as_index=False)
+        if agg_method == 'mean':
+            aggregated_stat_df = grouped.agg({'stats': 'mean'}).reset_index(drop=True)
+        else:  # sum
+            aggregated_stat_df = grouped.agg({'stats': 'sum'}).reset_index(drop=True)
+        
+        # Aggregate simulation stats if available
+        aggregated_sims_stat = None
+        if sims_stat_dfs:
+            combined_sims_df = pd.concat(sims_stat_dfs, ignore_index=True)
+            grouped_sims = combined_sims_df.groupby('bins', as_index=False)
+            if agg_method == 'mean':
+                aggregated_sims_stat = grouped_sims.agg({'stats': 'mean'}).reset_index(drop=True)
+            else:  # sum
+                aggregated_sims_stat = grouped_sims.agg({'stats': 'sum'}).reset_index(drop=True)
+        
+        # Create aggregated result structure
+        aggregated_ripley_data = {
+            stat_key: aggregated_stat_df
+        }
+        if aggregated_sims_stat is not None:
+            aggregated_ripley_data[sims_stat_key] = aggregated_sims_stat
+        
+        # Create a new AnnData object with aggregated results
+        # Use the first ROI's structure as template
+        first_adata = list(results.values())[0]
+        aggregated_adata = first_adata.copy()
+        aggregated_adata.uns['ripley'] = aggregated_ripley_data
+        
+        print(f"[DEBUG] Aggregated Ripley results: {len(aggregated_stat_df)} rows, {len(all_clusters)} clusters")
+        
+        return aggregated_adata
+    
     def _plot_sq_ripley(self, adata: 'ad.AnnData', cluster_key: str):
-        """Plot Ripley results."""
+        """Plot Ripley results using squidpy's plotting function."""
         print(f"[DEBUG] _plot_sq_ripley: Starting")
         print(f"[DEBUG] adata: {adata}, cluster_key: {cluster_key}")
         if adata is None:
@@ -2127,19 +2572,19 @@ class AdvancedSpatialAnalysisDialog(QtWidgets.QDialog):
         print(f"[DEBUG] adata.uns keys: {list(adata.uns.keys())}")
         
         # Check for ripley key or alternatives
-        ripley_data = None
+        ripley_key = None
         if 'ripley' in adata.uns:
-            ripley_data = adata.uns['ripley']
+            ripley_key = 'ripley'
             print(f"[DEBUG] Found 'ripley' key")
         else:
             # Try alternative key names
             for key in adata.uns.keys():
                 if 'ripley' in key.lower():
-                    ripley_data = adata.uns[key]
+                    ripley_key = key
                     print(f"[DEBUG] Found alternative key: {key}")
                     break
         
-        if ripley_data is None:
+        if ripley_key is None:
             print(f"[DEBUG] No Ripley data found in adata.uns")
             self.sq_ripley_canvas.figure.clear()
             ax = self.sq_ripley_canvas.figure.add_subplot(111)
@@ -2148,267 +2593,88 @@ class AdvancedSpatialAnalysisDialog(QtWidgets.QDialog):
             self.sq_ripley_canvas.draw()
             return
         
-        # Manual plotting (more reliable than squidpy's plotting with custom canvas)
+        # Use manual plotting (squidpy's plotting functions don't work well with custom canvases)
+        # sq.pl.ripley() doesn't support custom axes properly
         mode = self.sq_ripley_mode_combo.currentText()
         self.sq_ripley_canvas.figure.clear()
         ax = self.sq_ripley_canvas.figure.add_subplot(111)
+        ripley_data = adata.uns[ripley_key]
         
         print(f"[DEBUG] ripley_data type: {type(ripley_data)}")
         
-        # Extract data for plotting
-        if isinstance(ripley_data, dict) and len(ripley_data) > 0:
-            print(f"[DEBUG] ripley_data is dict with {len(ripley_data)} keys: {list(ripley_data.keys())[:10]}...")
-            
-            plotted = False
-            
-            # Check for the actual squidpy structure: bins, F_stat/G_stat/L_stat, etc.
-            if 'bins' in ripley_data:
-                bins = ripley_data['bins']
-                print(f"[DEBUG] Found 'bins' key, shape: {bins.shape if hasattr(bins, 'shape') else 'N/A'}")
-                distances = np.array(bins) if not isinstance(bins, np.ndarray) else bins
-                
-                # Look for the statistic DataFrame (F_stat, G_stat, or L_stat)
-                stat_key = f'{mode}_stat'
-                if stat_key in ripley_data:
-                    stat_df = ripley_data[stat_key]
-                    print(f"[DEBUG] Found '{stat_key}' DataFrame, shape: {stat_df.shape}, columns: {list(stat_df.columns)}")
-                    
-                    if isinstance(stat_df, pd.DataFrame):
-                        # Check if DataFrame is in long format (bins, cluster, stats) or wide format (clusters as columns)
-                        if 'cluster' in stat_df.columns and 'stats' in stat_df.columns:
-                            # Long format: pivot to wide format
-                            print(f"[DEBUG] DataFrame is in long format, pivoting...")
-                            
-                            # Get unique bins and clusters
-                            unique_bins = sorted(stat_df['bins'].unique()) if 'bins' in stat_df.columns else None
-                            unique_clusters = sorted(stat_df['cluster'].unique())
-                            print(f"[DEBUG] Unique bins: {len(unique_bins) if unique_bins is not None else 'N/A'}, "
-                                  f"Unique clusters: {len(unique_clusters)}")
-                            
-                            if 'bins' in stat_df.columns:
-                                # Pivot using bins as index
-                                try:
-                                    pivot_df = stat_df.pivot(index='bins', columns='cluster', values='stats')
-                                    print(f"[DEBUG] Pivoted DataFrame shape: {pivot_df.shape}, columns: {list(pivot_df.columns)}")
-                                    
-                                    # Align distances with pivot_df index
-                                    # pivot_df.index contains bin indices (0, 1, 2, ...) or actual distance values
-                                    if pivot_df.index.dtype in [np.int64, np.int32]:
-                                        # Index is bin indices, use distances array
-                                        if len(distances) >= len(pivot_df.index):
-                                            # Map bin indices to distances
-                                            plot_distances = distances[pivot_df.index.values]
-                                        else:
-                                            # Use index as distances if distances array is shorter
-                                            plot_distances = pivot_df.index.values
-                                    else:
-                                        # Index might be actual distance values
-                                        plot_distances = pivot_df.index.values
-                                    
-                                    # Store plot_distances for CSR line calculation
-                                    stored_plot_distances = plot_distances.copy()
-                                    
-                                    # Plot each cluster column
-                                    for col in pivot_df.columns:
-                                        values = pivot_df[col].values
-                                        # Remove NaN values
-                                        valid_mask = ~np.isnan(values)
-                                        if np.any(valid_mask):
-                                            valid_distances = plot_distances[valid_mask]
-                                            valid_values = values[valid_mask]
-                                            if len(valid_distances) > 0 and len(valid_values) > 0:
-                                                ax.plot(valid_distances, valid_values, 
-                                                       label=self._get_cluster_display_name(col),
-                                                       marker='o', markersize=4, linewidth=1.5)
-                                                plotted = True
-                                                print(f"[DEBUG] Plotted curve for cluster {col}: {len(valid_distances)} points")
-                                    
-                                    # Add expected CSR line after plotting all clusters
-                                    if mode == 'L' and len(stored_plot_distances) > 0:
-                                        # For L function, expected under CSR is L(r) = r
-                                        ax.plot(stored_plot_distances, stored_plot_distances, 
-                                               color='gray', linestyle='--', linewidth=1.5, alpha=0.7,
-                                               label='Expected (CSR)', zorder=0)
-                                except Exception as e:
-                                    print(f"[DEBUG] Pivot failed: {e}, trying alternative approach")
-                                    # Alternative: group by cluster and plot directly
-                                    for cluster in unique_clusters:
-                                        cluster_data = stat_df[stat_df['cluster'] == cluster]
-                                        if 'bins' in cluster_data.columns:
-                                            # Use bins as indices into distances array
-                                            bin_indices = cluster_data['bins'].values.astype(int)
-                                            cluster_values = cluster_data['stats'].values
-                                            if len(bin_indices) > 0 and len(bin_indices) <= len(distances):
-                                                valid_indices = bin_indices[bin_indices < len(distances)]
-                                                if len(valid_indices) > 0:
-                                                    cluster_distances = distances[valid_indices]
-                                                    cluster_vals = cluster_values[bin_indices < len(distances)]
-                                                    valid_mask = ~np.isnan(cluster_vals)
-                                                    if np.any(valid_mask):
-                                                        ax.plot(cluster_distances[valid_mask], cluster_vals[valid_mask],
-                                                               label=self._get_cluster_display_name(cluster),
-                                                               marker='o', markersize=4, linewidth=1.5)
-                                                        plotted = True
-                                                        print(f"[DEBUG] Plotted curve for cluster {cluster}: {len(cluster_distances[valid_mask])} points")
-                                    
-                                    # Add expected CSR line for L function in alternative approach
-                                    if mode == 'L' and len(distances) > 0:
-                                        ax.plot(distances, distances, 
-                                               color='gray', linestyle='--', linewidth=1.5, alpha=0.7,
-                                               label='Expected (CSR)', zorder=0)
-                            else:
-                                # No bins column, use index
-                                pivot_df = stat_df.pivot(index=stat_df.index, columns='cluster', values='stats')
-                                print(f"[DEBUG] Pivoted DataFrame shape: {pivot_df.shape}, columns: {list(pivot_df.columns)}")
-                                
-                                # Use distances array if it matches, otherwise use index
-                                if len(distances) == len(pivot_df.index):
-                                    plot_distances = distances
-                                else:
-                                    plot_distances = np.arange(len(pivot_df.index))
-                                
-                                # Plot each cluster column
-                                for col in pivot_df.columns:
-                                    values = pivot_df[col].values
-                                    valid_mask = ~np.isnan(values)
-                                    if np.any(valid_mask):
-                                        valid_distances = plot_distances[valid_mask]
-                                        valid_values = values[valid_mask]
-                                        if len(valid_distances) > 0 and len(valid_values) > 0:
-                                            ax.plot(valid_distances, valid_values, 
-                                                   label=self._get_cluster_display_name(col),
-                                                   marker='o', markersize=4, linewidth=1.5)
-                                            plotted = True
-                                            print(f"[DEBUG] Plotted curve for cluster {col}: {len(valid_distances)} points")
-                        else:
-                            # Wide format: each column is a cluster, rows are distance bins
-                            print(f"[DEBUG] DataFrame is in wide format")
-                            for col in stat_df.columns:
-                                if col == 'bins':  # Skip bins column if it exists
-                                    continue
-                                values = stat_df[col].values
-                                # Remove NaN values
-                                valid_mask = ~np.isnan(values)
-                                if np.any(valid_mask):
-                                    valid_distances = distances[valid_mask]
-                                    valid_values = values[valid_mask]
-                                    if len(valid_distances) > 0 and len(valid_values) > 0:
-                                        ax.plot(valid_distances, valid_values, 
-                                               label=self._get_cluster_display_name(col),
-                                               marker='o', markersize=4, linewidth=1.5)
-                                        plotted = True
-                                        print(f"[DEBUG] Plotted curve for cluster {col}: {len(valid_distances)} points")
-                else:
-                    print(f"[DEBUG] No '{stat_key}' found in ripley_data")
-            
-            # Fallback: Try old format (cluster-specific keys)
-            if not plotted:
-                print(f"[DEBUG] Trying fallback format - cluster-specific keys")
-                # Get cluster categories
-                if cluster_key in adata.obs.columns:
-                    if hasattr(adata.obs[cluster_key], 'cat'):
-                        categories = adata.obs[cluster_key].cat.categories
-                    else:
-                        categories = adata.obs[cluster_key].unique()
-                else:
-                    categories = []
-                
-                for cluster in categories:
-                    for key_format in [f"{cluster_key}_{cluster}", f"{cluster}", str(cluster)]:
-                        if key_format in ripley_data:
-                            data = ripley_data[key_format]
-                            print(f"[DEBUG] Found data for key: {key_format}, type: {type(data)}")
-                            if isinstance(data, dict):
-                                distances = data.get('distances', data.get('interval', []))
-                                values = data.get(mode, data.get(mode.lower(), []))
-                                print(f"[DEBUG] Extracted distances: {len(distances) if hasattr(distances, '__len__') else 'N/A'}, values: {len(values) if hasattr(values, '__len__') else 'N/A'}")
-                                if len(distances) > 0 and len(values) > 0:
-                                    distances = np.array(distances) if not isinstance(distances, np.ndarray) else distances
-                                    values = np.array(values) if not isinstance(values, np.ndarray) else values
-                                    min_len = min(len(distances), len(values))
-                                    if min_len > 0:
-                                        ax.plot(distances[:min_len], values[:min_len], 
-                                               label=self._get_cluster_display_name(cluster), 
-                                               marker='o', markersize=4, linewidth=1.5)
-                                        plotted = True
-                                        print(f"[DEBUG] Plotted curve for cluster {cluster}: {min_len} points")
-                                        break
-            
-            # Last resort: try to find any plottable data
-            if not plotted:
-                print(f"[DEBUG] No cluster-specific data found, trying all keys")
-                for key, value in ripley_data.items():
-                    print(f"[DEBUG] Checking key: {key}, value type: {type(value)}")
-                    if isinstance(value, pd.DataFrame):
-                        # DataFrame - try to plot columns
-                        print(f"[DEBUG] DataFrame with columns: {list(value.columns)}")
-                        # Try to infer distances from index or use row numbers
-                        if 'bins' in ripley_data:
-                            distances = np.array(ripley_data['bins'])
-                            for col in value.columns:
-                                values = value[col].values
-                                valid_mask = ~np.isnan(values)
-                                if np.any(valid_mask) and len(distances) == len(values):
-                                    valid_distances = distances[valid_mask]
-                                    valid_values = values[valid_mask]
-                                    if len(valid_distances) > 0:
-                                        ax.plot(valid_distances, valid_values, 
-                                               label=str(col), marker='o', markersize=4, linewidth=1.5)
-                                        plotted = True
-                                        print(f"[DEBUG] Plotted curve for column {col}")
-                    elif isinstance(value, dict):
-                        distances = value.get('distances', value.get('interval', []))
-                        values = value.get(mode, value.get(mode.lower(), []))
-                        print(f"[DEBUG] Key {key}: distances={len(distances) if hasattr(distances, '__len__') else 'N/A'}, values={len(values) if hasattr(values, '__len__') else 'N/A'}")
-                        if len(distances) > 0 and len(values) > 0:
-                            distances = np.array(distances) if not isinstance(distances, np.ndarray) else distances
-                            values = np.array(values) if not isinstance(values, np.ndarray) else values
-                            min_len = min(len(distances), len(values))
-                            if min_len > 0:
-                                ax.plot(distances[:min_len], values[:min_len], 
-                                       label=str(key), marker='o', markersize=4, linewidth=1.5)
-                                plotted = True
-                                print(f"[DEBUG] Plotted curve for key {key}: {min_len} points")
-            
-            if plotted:
-                ax.set_xlabel('Distance (µm)')
-                ax.set_ylabel(f"Ripley's {mode}")
-                ax.set_title(f"Ripley's {mode} Function")
-                
-                # Add expected random pattern line for uncentered Ripley functions
-                # Squidpy returns uncentered versions:
-                # - F(r): cumulative distribution function, under CSR: F(r) = 1 - exp(-λπr²) where λ is density
-                # - G(r): nearest neighbor distance CDF, under CSR: G(r) = 1 - exp(-λπr²)
-                # - L(r): L(r) = sqrt(K(r)/π), under CSR where K(r) = πr²: L(r) = r
-                # For L function, we can plot L(r) = r as the expected line
-                # For F and G, we need density estimation which is complex, so we skip for now
-                if 'bins' in ripley_data and mode == 'L':
-                    bins = ripley_data['bins']
-                    if isinstance(bins, np.ndarray) and len(bins) > 0:
-                        # For L function, expected value under CSR is L(r) = r
-                        expected_values = bins
-                        ax.plot(bins, expected_values, color='gray', 
-                               linestyle='--', linewidth=1.5, alpha=0.7,
-                               label='Expected (CSR)', zorder=0)
-                
-                handles, labels = ax.get_legend_handles_labels()
-                if len(handles) > 0:
-                    ax.legend(handles, labels, bbox_to_anchor=(1.05, 1), loc='upper left', fontsize=8)
-                ax.grid(True, alpha=0.3)
-                print(f"[DEBUG] Plot completed successfully")
+        # Plot using squidpy's exact approach
+        # Based on sq.pl.ripley source code
+        from squidpy._constants._constants import RipleyStat
+        
+        res = ripley_data
+        mode_enum = RipleyStat(mode)
+        
+        # Get categories and palette like squidpy does
+        if cluster_key in adata.obs.columns:
+            if hasattr(adata.obs[cluster_key], 'cat'):
+                categories_list = list(adata.obs[cluster_key].cat.categories)
             else:
-                print(f"[DEBUG] Failed to plot - data format not recognized")
-                ax.text(0.5, 0.5, f'Unable to plot Ripley\'s {mode} data.\nData format not recognized.\nCheck debug output for details.', 
-                       ha='center', va='center', transform=ax.transAxes)
-        elif isinstance(ripley_data, pd.DataFrame):
-            print(f"[DEBUG] ripley_data is DataFrame, shape: {ripley_data.shape}, columns: {list(ripley_data.columns)}")
-            # Handle DataFrame format if needed
-            ax.text(0.5, 0.5, f'Ripley data is in DataFrame format.\nPlotting not yet implemented for DataFrame.\nCheck debug output for structure.', 
-                   ha='center', va='center', transform=ax.transAxes)
+                categories_list = sorted(adata.obs[cluster_key].unique())
         else:
-            print(f"[DEBUG] ripley_data is unexpected type: {type(ripley_data)}")
-            ax.text(0.5, 0.5, 'No Ripley data found.\nPlease run Ripley analysis first.', 
+            categories_list = []
+        
+        # Get palette using tab20/tab60 for consistent cluster coloring
+        # Use _get_vivid_colors which provides tab20, tab20b, tab20c for up to 60 clusters
+        n_categories = len(categories_list)
+        if n_categories > 0:
+            # Get colors using tab20/tab60 scheme
+            color_array = _get_vivid_colors(n_categories)
+            # Convert to dict mapping category to color (RGBA tuple)
+            palette = {cat: tuple(color_array[i]) for i, cat in enumerate(categories_list)}
+        else:
+            palette = {}
+        
+        # Get the statistic DataFrame
+        stat_key = f"{mode_enum.s}_stat"
+        if stat_key not in res:
+            ax.text(0.5, 0.5, f'No {stat_key} found in Ripley data.', 
                    ha='center', va='center', transform=ax.transAxes)
+            self.sq_ripley_canvas.draw()
+            return
+        
+        stat_df = res[stat_key]
+        
+        # Convert palette dict to list if needed (seaborn can handle both)
+        plot_palette = palette
+        if isinstance(palette, dict):
+            # Convert dict to list in the order of categories_list
+            plot_palette = [palette.get(cat, '#000000') for cat in categories_list]
+        
+        # Use seaborn lineplot like squidpy does
+        sns.lineplot(
+            y="stats",
+            x="bins",
+            hue=cluster_key,
+            data=stat_df,
+            hue_order=categories_list,
+            palette=plot_palette,
+            ax=ax,
+        )
+        
+        # Plot simulations if available (like squidpy's plot_sims parameter)
+        if "sims_stat" in res:
+            sns.lineplot(
+                y="stats", 
+                x="bins", 
+                errorbar="sd", 
+                alpha=0.01, 
+                color="gray", 
+                data=res["sims_stat"], 
+                ax=ax
+            )
+        
+        # Set legend like squidpy
+        legend_kwargs = {"loc": "center left", "bbox_to_anchor": (1, 0.5)}
+        ax.legend(**legend_kwargs)
+        
+        # Set labels like squidpy
+        ax.set_ylabel("value")
+        ax.set_title(f"Ripley's {mode_enum.s}")
         
         self.sq_ripley_canvas.figure.tight_layout()
         self.sq_ripley_canvas.draw()

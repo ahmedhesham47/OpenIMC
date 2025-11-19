@@ -33,3 +33,4 @@ openimc.egg-info/
 
 openimc-egg.info/
 htmlcov/
+benchmarks/
