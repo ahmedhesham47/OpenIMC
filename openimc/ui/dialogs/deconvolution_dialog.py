@@ -605,6 +605,46 @@ class DeconvolutionDialog(QtWidgets.QDialog):
             return energy_widget.value()
         return 0.0
     
+    def _parse_roi_name(self, roi_name):
+        """Parse pass number and energy from ROI name.
+        
+        Examples:
+            "pass_1_-10db" -> pass_num=1, energy=-10
+            "20250319_JWAB_TMA_consecutive_SHRIMP_Classic_0dB_pass_1_8_008" -> pass_num=1, energy=0
+        
+        Args:
+            roi_name: The ROI name string to parse
+            
+        Returns:
+            Tuple of (pass_num, energy) where both can be None if not parseable
+        """
+        import re
+        
+        pass_num = None
+        energy = None
+        
+        # Try to parse pass number: look for "pass_" followed by a number
+        # Pattern: pass_ followed by optional negative sign, digits, optional decimal point and more digits
+        pass_pattern = r'pass[_\s]+(-?\d+\.?\d*)'
+        pass_match = re.search(pass_pattern, roi_name, re.IGNORECASE)
+        if pass_match:
+            try:
+                pass_num = float(pass_match.group(1))
+            except (ValueError, IndexError):
+                pass_num = None
+        
+        # Try to parse energy: look for number followed by "db" or "dB"
+        # Pattern: optional negative sign, digits, optional decimal point and more digits, followed by "db" or "dB"
+        energy_pattern = r'(-?\d+\.?\d*)\s*[dD][bB]'
+        energy_match = re.search(energy_pattern, roi_name)
+        if energy_match:
+            try:
+                energy = float(energy_match.group(1))
+            except (ValueError, IndexError):
+                energy = None
+        
+        return pass_num, energy
+    
     def _add_roi_to_passes(self):
         """Add selected ROIs to the pass table."""
         selected_items = self.available_roi_list.selectedItems()
@@ -633,8 +673,15 @@ class DeconvolutionDialog(QtWidgets.QDialog):
             row = self.roi_pass_table.rowCount()
             self.roi_pass_table.insertRow(row)
             
-            # Pass number (editable, defaults to row number but can be changed)
-            pass_item = QtWidgets.QTableWidgetItem(str(row + 1))
+            # Try to parse pass number and energy from ROI name
+            parsed_pass, parsed_energy = self._parse_roi_name(display_name)
+            
+            # Pass number (editable, defaults to parsed value or row number)
+            if parsed_pass is not None:
+                default_pass = str(parsed_pass)
+            else:
+                default_pass = str(row + 1)
+            pass_item = QtWidgets.QTableWidgetItem(default_pass)
             pass_item.setTextAlignment(Qt.AlignCenter)
             pass_item.setFlags(pass_item.flags() | Qt.ItemIsEditable)  # Make editable
             self.roi_pass_table.setItem(row, 0, pass_item)
@@ -648,7 +695,11 @@ class DeconvolutionDialog(QtWidgets.QDialog):
             energy_spin = QtWidgets.QDoubleSpinBox()
             energy_spin.setRange(-999999.0, 999999.0)
             energy_spin.setDecimals(2)
-            energy_spin.setValue(0.0)
+            # Use parsed energy if available, otherwise default to 0.0
+            if parsed_energy is not None:
+                energy_spin.setValue(parsed_energy)
+            else:
+                energy_spin.setValue(0.0)
             energy_spin.setButtonSymbols(QtWidgets.QAbstractSpinBox.NoButtons)  # No up/down buttons for cleaner look
             self.roi_pass_table.setCellWidget(row, 2, energy_spin)
             
