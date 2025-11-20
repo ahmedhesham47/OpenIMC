@@ -12,7 +12,31 @@ For complete documentation, installation instructions, and usage guides, please 
 
 ## Quick Start
 
-After installation (see Installation section in documentation), you can run:
+### Installation
+
+The most common installation pattern:
+
+```bash
+# Clone the repository
+git clone https://github.com/dean-tessone/OpenIMC.git
+cd OpenIMC
+
+# Create conda environment
+conda create -n openimc python=3.11
+conda activate openimc
+
+# Install dependencies
+pip install -r requirements.txt
+
+# Install the package
+pip install .
+```
+
+For detailed installation instructions, including alternative methods and troubleshooting, see the [Installation documentation](https://dean-tessone.github.io/OpenIMC/installation.html).
+
+### Running OpenIMC
+
+After installation, you can run:
 
 ```bash
 # Start the GUI application
