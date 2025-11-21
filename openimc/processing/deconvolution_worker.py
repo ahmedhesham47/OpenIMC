@@ -38,19 +38,42 @@ def RLD_HRIMC_circle(
     image_stack: np.ndarray,
     x0: float = 7.0,
     iterations: int = 4,
-    output_format: str = "float"
+    output_format: str = "float",
+    passes: np.ndarray = None,
+    contributions: np.ndarray = None,
+    kernel: np.ndarray = None,
 ) -> np.ndarray:
     """
     Apply Richardson-Lucy deconvolution to high resolution IMC image stack.
     
+    There are three modes of operation for the PSF kernel:
+    1. Direct kernel override (recommended for new HR-IMC usage):
+       - Provide a 3×3 kernel via `kernel`.
+       - `passes` / `contributions` / `x0` are ignored for PSF construction
+         (x0 should be baked into the kernel by the generator).
+    2. Custom Passes/Contributions path (for advanced users):
+       - Provide 1D arrays `passes` and `contributions` of equal shape.
+       - Kernel is built from Passes_scaled = logistic(passes, x0) * contributions
+         using the same index grouping as the original HR-IMC code. This only
+         makes sense if you match the original 97-element indexing convention.
+    3. Legacy hard-coded HR-IMC kernel (default):
+       - If neither `kernel` nor (`passes` + `contributions`) are provided,
+         the original Passes/Contributions arrays from the HR-IMC code are used.
+    
     Args:
         image_stack: Image stack with shape (C, H, W) or (H, W, C)
-        x0: Parameter for kernel calculation (default: 7.0)
+        x0: Parameter for kernel calculation in legacy / Passes-based paths.
+            Ignored when `kernel` is provided directly. (default: 7.0)
         iterations: Number of Richardson-Lucy iterations (default: 4)
         output_format: Output format, either 'float' or 'uint16' (default: 'float')
+        passes: Optional array of pass counts per subpixel. If None, uses default hard-coded array.
+        contributions: Optional array of contributions per subpixel. If None, uses default hard-coded array.
+                      Must be provided if passes is provided.
+        kernel: Optional direct 3×3 PSF kernel for HR-IMC. If provided, this overrides the
+                Passes/Contributions logic entirely.
     
     Returns:
-        Deconvolved image stack with same shape as input
+        Deconvolved image stack with same shape as input (except for border cropping)
     """
     if not _HAVE_SCIKIT_IMAGE:
         raise RuntimeError("scikit-image is required for deconvolution. Install with: pip install scikit-image")
@@ -93,50 +116,82 @@ def RLD_HRIMC_circle(
     else:
         raise ValueError(f"Unsupported image dimensionality: {image_stack.ndim}D")
     
-    # Predefined arrays for kernel calculation
-    Passes = np.array([7,6,5,8,7,
-                       7,8,7,6,6,
-                       7,9,8,7,8,
-                       8,7,7,6,6,
-                       7,6,6,5,5,
-                       6,6,5,5,4,
-                       4,6,4,5,3,
-                       4,5,6,6,5,
-                       4,5,5,4,3,
-                       4,4,3,6,5,
-                       4,5,5,4,4,
-                       3,3,4,4,3,
-                       3,2,4,3,2,
-                       2,1,1,3,2,
-                       2,1,1,3,3,
-                       2,2,2,2,1,
-                       1,1,1,3,2,
-                       1,2,2,1,1,
-                       2,1,1,4,3,
-                       2,1])
+    # ------------------------------------------------------------------
+    # Determine PSF construction mode
+    # ------------------------------------------------------------------
+    if kernel is not None:
+        # Direct 3×3 kernel override (recommended new behavior)
+        kernel = np.asarray(kernel, dtype=np.float32)
+        if kernel.shape != (3, 3):
+            raise ValueError(f"Provided kernel must be 3×3, got {kernel.shape}")
+        if kernel.sum() <= 0:
+            raise ValueError("Provided kernel has non-positive sum")
+        kernel = kernel / kernel.sum()
+        use_direct_kernel = True
+    else:
+        use_direct_kernel = False
     
-    Contributions = np.array([0.02,0.00108,0.00108,0.0034,0.0196,
-                           0.0196,0.0034,0.0034,0.0196,0.0196,
-                           0.0034,0.00223,0.00223,0.00223,0.0034,
-                           0.0034,0.0034,0.0034,0.0034,0.0034,
-                           0.0196,0.00106,0.0196,0.00106,0.0196,
-                           0.00108,0.00106,0.00106,0.00106,0.00106,
-                           0.00108,0.0196,0.00106,0.0196,0.00106,
-                           0.0196,0.0196,0.0034,0.0034,0.0196,
-                           0.0196,0.0034,0.0034,0.0196,0.0196,
-                           0.0034,0.0034,0.0196,0.00223,0.00223,
-                           0.00223,0.0034,0.0034,0.0034,0.0034,
-                           0.0034,0.0034,0.0196,0.00108,0.0196,
-                           0.00106,0.0196,0.00108,0.00106,0.00106,
-                           0.00106,0.00106,0.00108,0.0196,0.00106,
-                           0.0196,0.00106,0.0196,0.0034,0.0034,
-                           0.0196,0.0196,0.0034,0.0034,0.0196,
-                           0.0196,0.0034,0.0034,0.00223,0.00223,
-                           0.00223,0.0034,0.0034,0.0034,0.0034,
-                           0.00108,0.00196,0.00108,0.00219,0.00219,
-                           0.00219,0.00219])
-    
-    Contributions = Contributions / Contributions.sum()
+    if not use_direct_kernel:
+        # Either custom passes+contributions or legacy hard-coded arrays
+        if passes is not None and contributions is not None:
+            passes = np.asarray(passes, dtype=float)
+            contributions = np.asarray(contributions, dtype=float)
+            if passes.shape != contributions.shape:
+                raise ValueError(
+                    f"Passes and contributions arrays must have the same shape. "
+                    f"Got passes.shape={passes.shape}, contributions.shape={contributions.shape}"
+                )
+            Contributions = contributions / contributions.sum()
+            Passes = passes
+        elif passes is not None or contributions is not None:
+            raise ValueError("Both passes and contributions must be provided together, or both must be None")
+        else:
+            # Legacy hard-coded arrays from original HR-IMC code
+            Passes = np.array([
+                7,6,5,8,7,
+                7,8,7,6,6,
+                7,9,8,7,8,
+                8,7,7,6,6,
+                7,6,6,5,5,
+                6,6,5,5,4,
+                4,6,4,5,3,
+                4,5,6,6,5,
+                4,5,5,4,3,
+                4,4,3,6,5,
+                4,5,5,4,4,
+                3,3,4,4,3,
+                3,2,4,3,2,
+                2,1,1,3,2,
+                2,1,1,3,3,
+                2,2,2,2,1,
+                1,1,1,3,2,
+                1,2,2,1,1,
+                2,1,1,4,3,
+                2,1
+            ], dtype=float)
+            Contributions = np.array([
+                0.02,0.00108,0.00108,0.0034,0.0196,
+                0.0196,0.0034,0.0034,0.0196,0.0196,
+                0.0034,0.00223,0.00223,0.00223,0.0034,
+                0.0034,0.0034,0.0034,0.0034,0.0034,
+                0.0196,0.00106,0.0196,0.00106,0.0196,
+                0.00108,0.00106,0.00106,0.00106,0.00106,
+                0.00108,0.0196,0.00106,0.0196,0.00106,
+                0.0196,0.0196,0.0034,0.0034,0.0196,
+                0.0196,0.0034,0.0034,0.0196,0.0196,
+                0.0034,0.0034,0.0196,0.00223,0.00223,
+                0.00223,0.0034,0.0034,0.0034,0.0034,
+                0.0034,0.0034,0.0196,0.00108,0.0196,
+                0.00106,0.0196,0.00108,0.00106,0.00106,
+                0.00106,0.00106,0.00108,0.0196,0.00106,
+                0.0196,0.00106,0.0196,0.0034,0.0034,
+                0.0196,0.0196,0.0034,0.0034,0.0196,
+                0.0196,0.0034,0.0034,0.00223,0.00223,
+                0.00223,0.0034,0.0034,0.0034,0.0034,
+                0.00108,0.00196,0.00108,0.00219,0.00219,
+                0.00219,0.00219
+            ], dtype=float)
+            Contributions = Contributions / Contributions.sum()
     
     # Process each channel
     processed_layers = []
@@ -158,59 +213,55 @@ def RLD_HRIMC_circle(
             print(f"Warning: Layer {layer_idx} contains NaN or Inf values, replacing with 0")
             layer_data = np.nan_to_num(layer_data, nan=0.0, posinf=0.0, neginf=0.0)
         
-        # Calculate kernel for this channel
-        I0 = float(np.max(layer_data))
-        
-        # Check if I0 is valid
-        if I0 <= 0 or np.isnan(I0) or np.isinf(I0):
-            print(f"Warning: Layer {layer_idx} has invalid I0={I0}, using default kernel")
-            # Use a default kernel if I0 is invalid
-            kernel = np.array([[0.0, 0.0, 0.0],
-                              [0.0, 1.0, 0.0],
-                              [0.0, 0.0, 0.0]])
+        # Build or reuse kernel for this channel
+        if use_direct_kernel:
+            channel_kernel = kernel
         else:
-            Passes_scaled = I0 - I0 / (1 + np.exp(-(Passes - x0)))
-            y_array = Passes_scaled * Contributions
-            total_sum = np.sum(y_array)
-            
-            if total_sum <= 0 or np.isnan(total_sum) or np.isinf(total_sum):
-                print(f"Warning: Layer {layer_idx} has invalid kernel sum={total_sum}, using default kernel")
-                kernel = np.array([[0.0, 0.0, 0.0],
-                                  [0.0, 1.0, 0.0],
-                                  [0.0, 0.0, 0.0]])
+            I0 = float(np.max(layer_data))
+            if I0 <= 0 or np.isnan(I0) or np.isinf(I0):
+                print(f"Warning: Layer {layer_idx} has invalid I0={I0}, using identity kernel")
+                channel_kernel = np.array([[0.0, 0.0, 0.0],
+                                           [0.0, 1.0, 0.0],
+                                           [0.0, 0.0, 0.0]], dtype=np.float32)
             else:
-                result = list((
-                    (y_array[3] + y_array[4] + y_array[11] + y_array[14] + y_array[15] + y_array[20]) / total_sum, 
-                    (y_array[0] + y_array[5] + y_array[6] + y_array[7] + y_array[8] + y_array[12] + y_array[16] + y_array[17] + y_array[22]) / total_sum, 
-                    (y_array[9] + y_array[10] + y_array[13] + y_array[18] + y_array[19] + y_array[24]) / total_sum,
-                    (y_array[31] + y_array[36] + y_array[37] + y_array[38] + y_array[39] + y_array[48] + y_array[51] + y_array[52] + y_array[57]) / total_sum, 
-                    (y_array[33] + y_array[40] + y_array[41] + y_array[42] + y_array[43] + y_array[49] + y_array[53] + y_array[54] + y_array[59]) / total_sum, 
-                    (y_array[35] + y_array[44] + y_array[45] + y_array[46] + y_array[47] + y_array[50] + y_array[55] + y_array[56] + y_array[61]) / total_sum, 
-                    (y_array[68] + y_array[73] + y_array[74] + y_array[75] + y_array[83] + y_array[86]) / total_sum, 
-                    (y_array[70] + y_array[76] + y_array[77] + y_array[78] + y_array[79] + y_array[84] + y_array[87] + y_array[88] + y_array[91]) / total_sum, 
-                    (y_array[72] + y_array[80] + y_array[81] + y_array[82] + y_array[85] + y_array[89]) / total_sum, 
-                ))
-                
-                kernel = np.array(result / np.sum(result))
-                kernel = kernel.reshape(3, 3)
+                Passes_scaled = I0 - I0 / (1 + np.exp(-(Passes - x0)))
+                y_array = Passes_scaled * Contributions
+                total_sum = np.sum(y_array)
+                if total_sum <= 0 or np.isnan(total_sum) or np.isinf(total_sum):
+                    print(f"Warning: Layer {layer_idx} has invalid kernel sum={total_sum}, using identity kernel")
+                    channel_kernel = np.array([[0.0, 0.0, 0.0],
+                                               [0.0, 1.0, 0.0],
+                                               [0.0, 0.0, 0.0]], dtype=np.float32)
+                else:
+                    # Original 3×3 aggregation mapping, preserving backward compatibility
+                    result = list((
+                        (y_array[3] + y_array[4] + y_array[11] + y_array[14] + y_array[15] + y_array[20]) / total_sum, 
+                        (y_array[0] + y_array[5] + y_array[6] + y_array[7] + y_array[8] + y_array[12] + y_array[16] + y_array[17] + y_array[22]) / total_sum, 
+                        (y_array[9] + y_array[10] + y_array[13] + y_array[18] + y_array[19] + y_array[24]) / total_sum,
+                        (y_array[31] + y_array[36] + y_array[37] + y_array[38] + y_array[39] + y_array[48] + y_array[51] + y_array[52] + y_array[57]) / total_sum, 
+                        (y_array[33] + y_array[40] + y_array[41] + y_array[42] + y_array[43] + y_array[49] + y_array[53] + y_array[54] + y_array[59]) / total_sum, 
+                        (y_array[35] + y_array[44] + y_array[45] + y_array[46] + y_array[47] + y_array[50] + y_array[55] + y_array[56] + y_array[61]) / total_sum, 
+                        (y_array[68] + y_array[73] + y_array[74] + y_array[75] + y_array[83] + y_array[86]) / total_sum, 
+                        (y_array[70] + y_array[76] + y_array[77] + y_array[78] + y_array[79] + y_array[84] + y_array[87] + y_array[88] + y_array[91]) / total_sum, 
+                        (y_array[72] + y_array[80] + y_array[81] + y_array[82] + y_array[85] + y_array[89]) / total_sum, 
+                    ))
+                    channel_kernel = np.array(result, dtype=np.float32)
+                    channel_kernel = channel_kernel / channel_kernel.sum()
+                    channel_kernel = channel_kernel.reshape(3, 3)
         
-        # Normalize the data
+        # Normalize layer for RL
         layer_min = layer_data.min()
         layer_max = layer_data.max()
         if layer_max > layer_min:
-            layer_data = (layer_data - layer_min) / (layer_max - layer_min)
+            layer_norm = (layer_data - layer_min) / (layer_max - layer_min)
         else:
-            layer_data = layer_data.astype(np.float32)
+            layer_norm = layer_data.astype(np.float32)
+        layer_norm = np.clip(layer_norm, 1e-4, None)
         
-        layer_data_denoise = layer_data
+        # RL deconvolution
+        deconvolved_image = richardson_lucy(layer_norm, channel_kernel, num_iter=iterations)
         
-        # Clip values to remove 0s (handled badly by RLD)
-        layer_data_denoise = np.clip(layer_data_denoise, 1e-4, None)
-        
-        # Richardson-Lucy deconvolution
-        deconvolved_image = richardson_lucy(layer_data_denoise, kernel, num_iter=iterations)
-        
-        # Denormalize
+        # Denormalize back
         if layer_max > layer_min:
             deconvolved_image = deconvolved_image * (layer_max - layer_min) + layer_min
         
@@ -317,7 +368,13 @@ def deconvolve_acquisition_from_mcd(
     channel_names: list = None,
     source_file_path: str = None,
     unique_acq_id: str = None,
-    well_name: str = None
+    well_name: str = None,
+    pixel_size_x: float = None,
+    pixel_size_y: float = None,
+    pixel_size_unit: str = "µm",
+    passes: np.ndarray = None,
+    contributions: np.ndarray = None,
+    kernel: np.ndarray = None
 ) -> str:
     """
     Deconvolve a single acquisition from an MCD file and save as OME-TIFF.
@@ -344,6 +401,10 @@ def deconvolve_acquisition_from_mcd(
     loader.open(mcd_path)
     
     try:
+        # Get channel names from loader if not provided
+        if channel_names is None:
+            channel_names = loader.get_channels(acq_id) if hasattr(loader, 'get_channels') else None
+        
         # Get all channels for this acquisition
         img_stack = loader.get_all_channels(acq_id)  # Returns (H, W, C)
         
@@ -361,6 +422,51 @@ def deconvolve_acquisition_from_mcd(
         if n_channels < 1:
             raise ValueError(f"No channels found in acquisition {acq_id}")
         
+        # If channel names not available, create default names
+        if channel_names is None or len(channel_names) != n_channels:
+            channel_names = [f"Channel_{i+1}" for i in range(n_channels)]
+        
+        # Extract pixel size from loader metadata if not provided
+        if pixel_size_x is None or pixel_size_y is None:
+            metadata = loader._acq_metadata.get(acq_id, {}) if hasattr(loader, '_acq_metadata') else {}
+            if metadata:
+                for key, value in metadata.items():
+                    key_lower = key.lower()
+                    if 'pixel' in key_lower and 'size' in key_lower:
+                        if 'x' in key_lower or 'width' in key_lower:
+                            try:
+                                pixel_size_x = float(value)
+                            except (ValueError, TypeError):
+                                pass
+                        elif 'y' in key_lower or 'height' in key_lower:
+                            try:
+                                pixel_size_y = float(value)
+                            except (ValueError, TypeError):
+                                pass
+                    elif 'resolution' in key_lower:
+                        try:
+                            pixel_size_x = pixel_size_y = float(value)
+                        except (ValueError, TypeError):
+                            pass
+                    elif key == 'PhysicalSizeX':
+                        try:
+                            pixel_size_x = float(value)
+                        except (ValueError, TypeError):
+                            pass
+                    elif key == 'PhysicalSizeY':
+                        try:
+                            pixel_size_y = float(value)
+                        except (ValueError, TypeError):
+                            pass
+                    elif key == 'PhysicalSizeXUnit' or key == 'PhysicalSizeYUnit':
+                        pixel_size_unit = str(value)
+        
+        # If only one dimension found, use it for both
+        if pixel_size_x is not None and pixel_size_y is None:
+            pixel_size_y = pixel_size_x
+        elif pixel_size_y is not None and pixel_size_x is None:
+            pixel_size_x = pixel_size_y
+        
         # Convert to (C, H, W) for processing
         img_stack = np.transpose(img_stack, (2, 0, 1))
         
@@ -370,7 +476,10 @@ def deconvolve_acquisition_from_mcd(
             img_stack,
             x0=x0,
             iterations=iterations,
-            output_format=output_format
+            output_format=output_format,
+            passes=passes,
+            contributions=contributions,
+            kernel=kernel
         )  # Returns (C, H, W)
         print(f"Deconvolution complete: output shape={deconvolved_stack.shape}, dtype={deconvolved_stack.dtype}")
         
@@ -439,6 +548,14 @@ def deconvolve_acquisition_from_mcd(
         if channel_names:
             metadata['Channel'] = {'Name': channel_names}
         
+        # Add pixel size information to metadata
+        if pixel_size_x is not None:
+            metadata['PhysicalSizeX'] = pixel_size_x
+            metadata['PhysicalSizeXUnit'] = pixel_size_unit
+        if pixel_size_y is not None:
+            metadata['PhysicalSizeY'] = pixel_size_y
+            metadata['PhysicalSizeYUnit'] = pixel_size_unit
+        
         # Save as OME-TIFF in CHW format (same as GUI export)
         try:
             tifffile.imwrite(
@@ -494,7 +611,13 @@ def deconvolve_acquisition_from_ometiff(
     channel_names: list = None,
     source_file_path: str = None,
     unique_acq_id: str = None,
-    channel_format: str = 'CHW'
+    channel_format: str = 'CHW',
+    pixel_size_x: float = None,
+    pixel_size_y: float = None,
+    pixel_size_unit: str = "µm",
+    passes: np.ndarray = None,
+    contributions: np.ndarray = None,
+    kernel: np.ndarray = None
 ) -> str:
     """
     Deconvolve a single acquisition from an OME-TIFF file and save as OME-TIFF.
@@ -515,6 +638,85 @@ def deconvolve_acquisition_from_ometiff(
         Path to the saved OME-TIFF file
     """
     import tifffile
+    import xml.etree.ElementTree as ET
+    
+    # Load the OME-TIFF file and extract metadata
+    pixel_size_x_from_file = None
+    pixel_size_y_from_file = None
+    pixel_size_unit_from_file = "µm"
+    channel_names_from_file = None
+    
+    try:
+        with tifffile.TiffFile(tiff_path) as tif:
+            # Try to extract channel names and pixel size from OME metadata
+            if hasattr(tif, 'ome_metadata') and tif.ome_metadata:
+                ome_metadata = ET.fromstring(tif.ome_metadata)
+                
+                # Extract namespace
+                root = ome_metadata
+                namespace = None
+                if root.tag.startswith('{'):
+                    namespace = root.tag.split('}')[0].strip('{')
+                    ns = {'ome': namespace}
+                else:
+                    ns = {}
+                
+                # Extract pixel size from Pixels element
+                pixels_elem = None
+                if ns:
+                    pixels_elem = root.find('.//ome:Pixels', ns)
+                if pixels_elem is None:
+                    pixels_elem = root.find('.//Pixels')
+                
+                if pixels_elem is not None:
+                    # Get PhysicalSizeX and PhysicalSizeY
+                    if pixels_elem.get('PhysicalSizeX'):
+                        try:
+                            pixel_size_x_from_file = float(pixels_elem.get('PhysicalSizeX'))
+                        except (ValueError, TypeError):
+                            pass
+                    if pixels_elem.get('PhysicalSizeY'):
+                        try:
+                            pixel_size_y_from_file = float(pixels_elem.get('PhysicalSizeY'))
+                        except (ValueError, TypeError):
+                            pass
+                    if pixels_elem.get('PhysicalSizeXUnit'):
+                        pixel_size_unit_from_file = pixels_elem.get('PhysicalSizeXUnit')
+                    elif pixels_elem.get('PhysicalSizeYUnit'):
+                        pixel_size_unit_from_file = pixels_elem.get('PhysicalSizeYUnit')
+                    
+                    # Extract channel names
+                    channel_elements = []
+                    if ns:
+                        channel_elements = pixels_elem.findall('.//ome:Channel', ns)
+                    if not channel_elements:
+                        channel_elements = pixels_elem.findall('.//Channel')
+                    
+                    channel_names_from_file = []
+                    for channel in channel_elements:
+                        channel_name = channel.get('Name', '')
+                        if not channel_name:
+                            # Try to find Name as child element
+                            if ns:
+                                name_elem = channel.find(f'.//{{{namespace}}}Name')
+                            else:
+                                name_elem = channel.find('.//Name')
+                            if name_elem is not None:
+                                channel_name = name_elem.text or ''
+                        if channel_name:
+                            channel_names_from_file.append(channel_name)
+    except Exception as e:
+        print(f"Warning: Could not extract metadata from {tiff_path}: {e}")
+    
+    # Use extracted values if not provided
+    if channel_names is None:
+        channel_names = channel_names_from_file
+    if pixel_size_x is None:
+        pixel_size_x = pixel_size_x_from_file
+    if pixel_size_y is None:
+        pixel_size_y = pixel_size_y_from_file
+    if pixel_size_unit == "µm" and pixel_size_unit_from_file != "µm":
+        pixel_size_unit = pixel_size_unit_from_file
     
     # Load the OME-TIFF file
     img_stack = tifffile.imread(tiff_path)
@@ -556,6 +758,16 @@ def deconvolve_acquisition_from_ometiff(
     if n_channels < 1:
         raise ValueError(f"No channels found in file {tiff_path}")
     
+    # If channel names not available or count doesn't match, create default names
+    if channel_names is None or len(channel_names) != n_channels:
+        channel_names = [f"Channel_{i+1}" for i in range(n_channels)]
+    
+    # If only one pixel size dimension found, use it for both
+    if pixel_size_x is not None and pixel_size_y is None:
+        pixel_size_y = pixel_size_x
+    elif pixel_size_y is not None and pixel_size_x is None:
+        pixel_size_x = pixel_size_y
+    
     # Convert to (C, H, W) for processing
     img_stack = np.transpose(img_stack, (2, 0, 1))
     
@@ -565,7 +777,10 @@ def deconvolve_acquisition_from_ometiff(
         img_stack,
         x0=x0,
         iterations=iterations,
-        output_format=output_format
+        output_format=output_format,
+        passes=passes,
+        contributions=contributions,
+        kernel=kernel
     )  # Returns (C, H, W)
     print(f"Deconvolution complete: output shape={deconvolved_stack.shape}, dtype={deconvolved_stack.dtype}")
     
@@ -607,6 +822,14 @@ def deconvolve_acquisition_from_ometiff(
     metadata = {}
     if channel_names:
         metadata['Channel'] = {'Name': channel_names}
+    
+    # Add pixel size information to metadata
+    if pixel_size_x is not None:
+        metadata['PhysicalSizeX'] = pixel_size_x
+        metadata['PhysicalSizeXUnit'] = pixel_size_unit
+    if pixel_size_y is not None:
+        metadata['PhysicalSizeY'] = pixel_size_y
+        metadata['PhysicalSizeYUnit'] = pixel_size_unit
     
     # Save as OME-TIFF in CHW format (same as GUI export)
     try:
@@ -662,7 +885,13 @@ def deconvolve_acquisition(
     unique_acq_id: str = None,
     loader_type: str = "mcd",
     channel_format: str = 'CHW',
-    well_name: str = None
+    well_name: str = None,
+    pixel_size_x: float = None,
+    pixel_size_y: float = None,
+    pixel_size_unit: str = "µm",
+    passes: np.ndarray = None,
+    contributions: np.ndarray = None,
+    kernel: np.ndarray = None
 ) -> str:
     """
     Deconvolve a single acquisition from an MCD file or OME-TIFF file and save as OME-TIFF.
@@ -695,7 +924,13 @@ def deconvolve_acquisition(
             channel_names=channel_names,
             source_file_path=source_file_path,
             unique_acq_id=unique_acq_id,
-            well_name=well_name
+            well_name=well_name,
+            pixel_size_x=pixel_size_x,
+            pixel_size_y=pixel_size_y,
+            pixel_size_unit=pixel_size_unit,
+            passes=passes,
+            contributions=contributions,
+            kernel=kernel
         )
     elif loader_type == "ometiff":
         return deconvolve_acquisition_from_ometiff(
@@ -708,7 +943,13 @@ def deconvolve_acquisition(
             channel_names=channel_names,
             source_file_path=source_file_path,
             unique_acq_id=unique_acq_id,
-            channel_format=channel_format
+            channel_format=channel_format,
+            pixel_size_x=pixel_size_x,
+            pixel_size_y=pixel_size_y,
+            pixel_size_unit=pixel_size_unit,
+            passes=passes,
+            contributions=contributions,
+            kernel=kernel
         )
     else:
         raise ValueError(f"Unknown loader type: {loader_type}")

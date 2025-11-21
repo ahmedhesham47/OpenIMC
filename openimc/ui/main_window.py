@@ -8450,6 +8450,7 @@ class MainWindow(QtWidgets.QMainWindow):
         x0 = dlg.get_x0()
         iterations = dlg.get_iterations()
         output_format = dlg.get_output_format()
+        passes, contributions, psf_kernel = dlg.get_deconv_passes_contributions()
         
         # Create and show progress dialog
         progress_dlg = ProgressDialog("High Resolution Deconvolution", self)
@@ -8458,11 +8459,11 @@ class MainWindow(QtWidgets.QMainWindow):
         try:
             if acq_type == "single":
                 success = self._deconvolve_single_acquisition(
-                    output_dir, progress_dlg, x0, iterations, output_format
+                    output_dir, progress_dlg, x0, iterations, output_format, passes, contributions, psf_kernel
                 )
             else:
                 success = self._deconvolve_whole_slide(
-                    output_dir, progress_dlg, x0, iterations, output_format
+                    output_dir, progress_dlg, x0, iterations, output_format, passes, contributions, psf_kernel
                 )
             
             progress_dlg.close()
@@ -8498,7 +8499,8 @@ class MainWindow(QtWidgets.QMainWindow):
             traceback.print_exc()
     
     def _deconvolve_single_acquisition(self, output_dir: str, progress_dlg: ProgressDialog,
-                                       x0: float, iterations: int, output_format: str) -> bool:
+                                       x0: float, iterations: int, output_format: str,
+                                       passes=None, contributions=None, kernel=None) -> bool:
         """Deconvolve the currently selected acquisition."""
         if not self.current_acq_id:
             raise ValueError("No acquisition selected")
@@ -8610,7 +8612,10 @@ class MainWindow(QtWidgets.QMainWindow):
                 output_format=output_format,
                 loader_path=data_path,
                 source_file_path=source_file_path,
-                unique_acq_id=self.current_acq_id
+                unique_acq_id=self.current_acq_id,
+                passes=passes,
+                contributions=contributions,
+                kernel=kernel
             )
             
             output_path = str(output_path)  # Convert Path to string for compatibility
@@ -8654,7 +8659,8 @@ class MainWindow(QtWidgets.QMainWindow):
             raise
     
     def _deconvolve_whole_slide(self, output_dir: str, progress_dlg: ProgressDialog,
-                                x0: float, iterations: int, output_format: str) -> bool:
+                                x0: float, iterations: int, output_format: str,
+                                passes=None, contributions=None, kernel=None) -> bool:
         """Deconvolve all acquisitions."""
         if not self.acquisitions:
             raise ValueError("No acquisitions found")
@@ -8762,7 +8768,10 @@ class MainWindow(QtWidgets.QMainWindow):
                     output_format=output_format,
                     loader_path=data_path,
                     source_file_path=source_file_path,
-                    unique_acq_id=acq.id
+                    unique_acq_id=acq.id,
+                    passes=passes,
+                    contributions=contributions,
+                    kernel=kernel
                 )
                 
                 processed += 1

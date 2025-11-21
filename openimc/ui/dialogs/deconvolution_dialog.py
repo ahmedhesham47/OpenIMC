@@ -45,7 +45,7 @@ class DeconvolutionDialog(QtWidgets.QDialog):
         if parent:
             parent_size = parent.size()
             dialog_width = int(parent_size.width() * 0.8)
-            dialog_height = int(parent_size.height() * 0.7)
+            dialog_height = parent_size.height()  # Same height as main window
             self.resize(dialog_width, dialog_height)
         else:
             self.resize(800, 700)
@@ -60,6 +60,17 @@ class DeconvolutionDialog(QtWidgets.QDialog):
         self.roi_passes = []  # List of (acq_id, pass_number) tuples
         self.intensity_data = {}  # Dict mapping pass_number to intensity value
         self.fitted_curve = None
+        self.energy_fit_params = {}  # Dict mapping energy to (I_max, k, x0) fit parameters
+        
+        # Kernel generation data
+        self.generated_passes = None
+        self.generated_contributions = None
+        self.generated_psf_kernel = None
+        
+        # Deconvolution kernel arrays (loaded from file or generated)
+        self.deconv_passes = None
+        self.deconv_contributions = None
+        self.deconv_psf_kernel = None
         
         # Create UI
         self._create_ui()
@@ -249,12 +260,17 @@ class DeconvolutionDialog(QtWidgets.QDialog):
         # Create plot tab
         plot_tab = self._create_plot_tab()
         
+        # Create kernel generation tab
+        kernel_gen_tab = self._create_kernel_generation_tab()
+        
         # Add tabs to nested tab widget
         self.exp_design_tabs.addTab(roi_selection_tab, "ROI Selection")
         self.exp_design_tabs.addTab(plot_tab, "Experimental Design Plot")
+        self.exp_design_tabs.addTab(kernel_gen_tab, "Generate Kernel Arrays")
         
-        # Disable plot tab initially
+        # Disable plot and kernel generation tabs initially
         self.exp_design_tabs.setTabEnabled(1, False)
+        self.exp_design_tabs.setTabEnabled(2, False)
         
         # Main layout for experimental design tab
         main_layout = QtWidgets.QVBoxLayout(tab)
@@ -300,6 +316,188 @@ class DeconvolutionDialog(QtWidgets.QDialog):
         layout.addLayout(export_btn_layout)
         
         return tab
+    
+    def _create_kernel_generation_tab(self):
+        """Create the kernel generation tab for generating passes and contributions arrays."""
+        tab = QtWidgets.QWidget()
+        layout = QtWidgets.QVBoxLayout(tab)
+        layout.setContentsMargins(10, 10, 10, 10)
+        layout.setSpacing(8)
+        
+        # Information note
+        info_group = QtWidgets.QGroupBox("Information")
+        info_layout = QtWidgets.QVBoxLayout(info_group)
+        info_label = QtWidgets.QLabel(
+            "Generate passes and contributions arrays for High Resolution IMC deconvolution. "
+            "First, complete ROI selection and 'Analyze Intensity Decay' in the previous tabs. "
+            "Then select an energy from your analysis to automatically populate the sigmoidal loss "
+            "function parameters. Configure instrument geometry and generate custom arrays that match "
+            "your experimental setup. These arrays can be saved and loaded for use in deconvolution.\n\n"
+            "<b>Note:</b> The generated arrays will replace the default hard-coded arrays when used in deconvolution."
+        )
+        info_label.setWordWrap(True)
+        info_label.setStyleSheet("QLabel { color: #0066cc; }")
+        info_layout.addWidget(info_label)
+        layout.addWidget(info_group)
+        
+        # Energy selection
+        energy_group = QtWidgets.QGroupBox("Energy Selection")
+        energy_layout = QtWidgets.QFormLayout(energy_group)
+        
+        self.energy_combo = QtWidgets.QComboBox()
+        self.energy_combo.setEnabled(False)
+        self.energy_combo.currentIndexChanged.connect(self._on_energy_selected)
+        energy_layout.addRow("Energy from Analysis:", self.energy_combo)
+        
+        energy_info = QtWidgets.QLabel(
+            "Select an energy from your intensity decay analysis. The sigmoidal parameters will be "
+            "automatically filled from the fitted curve."
+        )
+        energy_info.setWordWrap(True)
+        energy_info.setStyleSheet("QLabel { color: #666; font-size: 9pt; }")
+        energy_layout.addRow("", energy_info)
+        
+        layout.addWidget(energy_group)
+        
+        # Sigmoidal loss function parameters
+        sigmoid_group = QtWidgets.QGroupBox("Sigmoidal Loss Function Parameters")
+        sigmoid_layout = QtWidgets.QFormLayout(sigmoid_group)
+        
+        self.midpoint_spin = QtWidgets.QDoubleSpinBox()
+        self.midpoint_spin.setRange(0.1, 20.0)
+        self.midpoint_spin.setValue(4.0)
+        self.midpoint_spin.setDecimals(2)
+        self.midpoint_spin.setSingleStep(0.1)
+        sigmoid_layout.addRow("Midpoint:", self.midpoint_spin)
+        
+        self.slope_spin = QtWidgets.QDoubleSpinBox()
+        self.slope_spin.setRange(0.1, 10.0)
+        self.slope_spin.setValue(1.0)
+        self.slope_spin.setDecimals(2)
+        self.slope_spin.setSingleStep(0.1)
+        sigmoid_layout.addRow("Slope:", self.slope_spin)
+        
+        self.min_fraction_spin = QtWidgets.QDoubleSpinBox()
+        self.min_fraction_spin.setRange(0.0, 1.0)
+        self.min_fraction_spin.setValue(0.0)
+        self.min_fraction_spin.setDecimals(3)
+        self.min_fraction_spin.setSingleStep(0.01)
+        sigmoid_layout.addRow("Min Fraction:", self.min_fraction_spin)
+        
+        self.max_fraction_spin = QtWidgets.QDoubleSpinBox()
+        self.max_fraction_spin.setRange(0.0, 1.0)
+        self.max_fraction_spin.setValue(1.0)
+        self.max_fraction_spin.setDecimals(3)
+        self.max_fraction_spin.setSingleStep(0.01)
+        sigmoid_layout.addRow("Max Fraction:", self.max_fraction_spin)
+        
+        layout.addWidget(sigmoid_group)
+        
+        # Instrument geometry parameters
+        geometry_group = QtWidgets.QGroupBox("Instrument Geometry Parameters")
+        geometry_layout = QtWidgets.QFormLayout(geometry_group)
+        
+        self.step_size_spin = QtWidgets.QDoubleSpinBox()
+        self.step_size_spin.setRange(0.1, 2.0)
+        self.step_size_spin.setValue(0.333)
+        self.step_size_spin.setDecimals(3)
+        self.step_size_spin.setSingleStep(0.001)
+        geometry_layout.addRow("Step Size (μm):", self.step_size_spin)
+        
+        self.pixel_size_spin = QtWidgets.QDoubleSpinBox()
+        self.pixel_size_spin.setRange(0.1, 10.0)
+        self.pixel_size_spin.setValue(1.0)
+        self.pixel_size_spin.setDecimals(2)
+        self.pixel_size_spin.setSingleStep(0.1)
+        geometry_layout.addRow("Pixel Size (μm):", self.pixel_size_spin)
+        
+        self.spot_diameter_spin = QtWidgets.QDoubleSpinBox()
+        self.spot_diameter_spin.setRange(0.1, 5.0)
+        self.spot_diameter_spin.setValue(1.0)
+        self.spot_diameter_spin.setDecimals(2)
+        self.spot_diameter_spin.setSingleStep(0.1)
+        geometry_layout.addRow("Spot Diameter (μm):", self.spot_diameter_spin)
+        
+        layout.addWidget(geometry_group)
+        
+        # Generate button
+        generate_btn_layout = QtWidgets.QHBoxLayout()
+        self.generate_kernel_btn = QtWidgets.QPushButton("Generate Arrays")
+        self.generate_kernel_btn.clicked.connect(self._generate_kernel_arrays)
+        generate_btn_layout.addWidget(self.generate_kernel_btn)
+        generate_btn_layout.addStretch()
+        layout.addLayout(generate_btn_layout)
+        
+        # Status label
+        self.kernel_status_label = QtWidgets.QLabel("")
+        self.kernel_status_label.setWordWrap(True)
+        self.kernel_status_label.setStyleSheet("QLabel { color: #666; font-style: italic; }")
+        layout.addWidget(self.kernel_status_label)
+        
+        # Save button
+        file_btn_layout = QtWidgets.QHBoxLayout()
+        self.save_kernel_btn = QtWidgets.QPushButton("Save Arrays...")
+        self.save_kernel_btn.clicked.connect(self._save_kernel_arrays)
+        self.save_kernel_btn.setEnabled(False)
+        file_btn_layout.addWidget(self.save_kernel_btn)
+        file_btn_layout.addStretch()
+        layout.addLayout(file_btn_layout)
+        
+        layout.addStretch()
+        
+        return tab
+    
+    def _update_energy_dropdown(self):
+        """Update the energy dropdown with available energies from analysis."""
+        self.energy_combo.clear()
+        
+        if not self.energy_fit_params:
+            self.energy_combo.setEnabled(False)
+            return
+        
+        # Add energies sorted by value
+        energies = sorted(self.energy_fit_params.keys())
+        for energy in energies:
+            self.energy_combo.addItem(f"{energy:.2f}", energy)
+        
+        self.energy_combo.setEnabled(True)
+        
+        # Select first energy and populate parameters
+        if self.energy_combo.count() > 0:
+            self.energy_combo.setCurrentIndex(0)
+            self._on_energy_selected()
+    
+    def _on_energy_selected(self):
+        """Handle energy selection - auto-populate sigmoidal parameters."""
+        if self.energy_combo.currentIndex() < 0:
+            return
+        
+        # Get energy value from combo box (PyQt5 uses itemData)
+        energy = self.energy_combo.itemData(self.energy_combo.currentIndex())
+        if energy is None or energy not in self.energy_fit_params:
+            return
+        
+        # Get fit parameters for this energy
+        fit_params = self.energy_fit_params[energy]
+        I_max = fit_params['I_max']
+        k = fit_params['k']
+        x0 = fit_params['x0']
+        
+        # Convert fitted parameters to sigmoidal loss function parameters
+        # The fitted curve: I(x) = I_max / (1 + exp(k * (x - x0)))
+        # The loss function: fraction = 1.0 / (1.0 + exp(slope * (x - midpoint)))
+        # So: midpoint = x0, slope = k
+        # For min_fraction and max_fraction, we normalize based on the intensity range
+        # max_fraction = 1.0 (full signal), min_fraction can be set based on data or default to 0.0
+        
+        # Set parameters
+        self.midpoint_spin.setValue(float(x0))
+        self.slope_spin.setValue(float(k))
+        
+        # Set min_fraction to 0.0 (no signal remaining after many passes)
+        # and max_fraction to 1.0 (full signal at first pass)
+        self.min_fraction_spin.setValue(0.0)
+        self.max_fraction_spin.setValue(1.0)
     
     def _create_deconvolution_tab(self):
         """Create the Apply High Resolution Deconvolution tab (existing functionality)."""
@@ -373,17 +571,17 @@ class DeconvolutionDialog(QtWidgets.QDialog):
         params_group = QtWidgets.QGroupBox("Deconvolution Parameters")
         params_layout = QtWidgets.QVBoxLayout(params_group)
         
-        # x0 parameter
-        x0_layout = QtWidgets.QHBoxLayout()
-        x0_layout.addWidget(QtWidgets.QLabel("x0 parameter:"))
+        # x0 parameter (hidden when kernel is loaded)
+        self.x0_layout = QtWidgets.QHBoxLayout()
+        self.x0_layout.addWidget(QtWidgets.QLabel("x0 parameter:"))
         self.x0_spin = QtWidgets.QDoubleSpinBox()
         self.x0_spin.setRange(1.0, 20.0)
         self.x0_spin.setValue(7.0)
         self.x0_spin.setDecimals(1)
         self.x0_spin.setSingleStep(0.5)
-        x0_layout.addWidget(self.x0_spin)
-        x0_layout.addStretch()
-        params_layout.addLayout(x0_layout)
+        self.x0_layout.addWidget(self.x0_spin)
+        self.x0_layout.addStretch()
+        params_layout.addLayout(self.x0_layout)
         
         # Iterations parameter
         iter_layout = QtWidgets.QHBoxLayout()
@@ -394,6 +592,38 @@ class DeconvolutionDialog(QtWidgets.QDialog):
         iter_layout.addWidget(self.iterations_spin)
         iter_layout.addStretch()
         params_layout.addLayout(iter_layout)
+        
+        # Separator
+        separator = QtWidgets.QFrame()
+        separator.setFrameShape(QtWidgets.QFrame.HLine)
+        separator.setFrameShadow(QtWidgets.QFrame.Sunken)
+        params_layout.addWidget(separator)
+        
+        # Kernel arrays (passes and contributions) - moved into parameters section
+        kernel_info = QtWidgets.QLabel(
+            "Load custom kernel arrays generated from the Experimental Design tab. "
+            "If a PSF kernel is loaded, x0 parameter will be hidden (it's baked into the kernel)."
+        )
+        kernel_info.setWordWrap(True)
+        kernel_info.setStyleSheet("QLabel { color: #666; font-size: 9pt; }")
+        params_layout.addWidget(kernel_info)
+        
+        kernel_file_layout = QtWidgets.QHBoxLayout()
+        self.kernel_file_label = QtWidgets.QLabel("No kernel arrays loaded (using defaults)")
+        self.kernel_file_label.setStyleSheet("QLabel { color: #666; }")
+        kernel_file_layout.addWidget(self.kernel_file_label)
+        kernel_file_layout.addStretch()
+        
+        self.load_kernel_file_btn = QtWidgets.QPushButton("Load Kernel...")
+        self.load_kernel_file_btn.clicked.connect(self._load_kernel_arrays_for_deconv)
+        kernel_file_layout.addWidget(self.load_kernel_file_btn)
+        
+        self.clear_kernel_btn = QtWidgets.QPushButton("Clear")
+        self.clear_kernel_btn.clicked.connect(self._clear_kernel_arrays)
+        self.clear_kernel_btn.setEnabled(False)
+        kernel_file_layout.addWidget(self.clear_kernel_btn)
+        
+        params_layout.addLayout(kernel_file_layout)
         
         layout.addWidget(params_group)
         
@@ -910,10 +1140,14 @@ class DeconvolutionDialog(QtWidgets.QDialog):
             # Plot intensity decay with separate curves for each energy
             self._plot_intensity_decay(energy_data, channel)
             
-            # Enable plot tab and export button
+            # Enable plot tab, kernel generation tab, and export button
             self.exp_design_tabs.setTabEnabled(1, True)
+            self.exp_design_tabs.setTabEnabled(2, True)  # Enable Generate Kernel Arrays tab
             self.exp_design_tabs.setCurrentIndex(1)  # Switch to plot tab
             self.export_plot_btn.setEnabled(True)
+            
+            # Update energy dropdown in kernel generation tab
+            self._update_energy_dropdown()
             
         except Exception as e:
             QtWidgets.QMessageBox.critical(self, "Error", f"Analysis failed: {str(e)}")
@@ -957,6 +1191,9 @@ class DeconvolutionDialog(QtWidgets.QDialog):
         all_fit_params = []
         fit_text_parts = []
         
+        # Clear previous fit parameters
+        self.energy_fit_params = {}
+        
         # Plot each energy group
         for idx, energy in enumerate(energies):
             pass_nums, ints = energy_data[energy]
@@ -993,6 +1230,13 @@ class DeconvolutionDialog(QtWidgets.QDialog):
                     )
                     
                     I_max_fit, k_fit, x0_fit = popt
+                    
+                    # Store fit parameters for this energy
+                    self.energy_fit_params[energy] = {
+                        'I_max': I_max_fit,
+                        'k': k_fit,
+                        'x0': x0_fit
+                    }
                     
                     # Generate smooth curve for plotting
                     x_smooth = np.linspace(min(pass_nums), max(pass_nums), 100)
@@ -1080,10 +1324,256 @@ class DeconvolutionDialog(QtWidgets.QDialog):
             except Exception as e:
                 QtWidgets.QMessageBox.critical(self, "Error", f"Failed to export plot: {str(e)}")
     
+    def _generate_kernel_arrays(self):
+        """Generate passes and contributions arrays based on current parameters."""
+        from openimc.processing.hrimc_kernel_generator import (
+            compute_hrimc_passes_contributions,
+            example_inverse_sigmoid_loss
+        )
+        
+        try:
+            # Get parameters
+            midpoint = self.midpoint_spin.value()
+            slope = self.slope_spin.value()
+            min_fraction = self.min_fraction_spin.value()
+            max_fraction = self.max_fraction_spin.value()
+            step_size = self.step_size_spin.value()
+            pixel_size = self.pixel_size_spin.value()
+            spot_diameter = self.spot_diameter_spin.value()
+            
+            # Create loss function
+            def loss_fn(passes):
+                return example_inverse_sigmoid_loss(
+                    passes,
+                    midpoint=midpoint,
+                    slope=slope,
+                    min_fraction=min_fraction,
+                    max_fraction=max_fraction
+                )
+            
+            # Generate arrays using Shapely geometry
+            passes, contributions, psf_kernel = compute_hrimc_passes_contributions(
+                step_size_um=step_size,
+                loss_fn=loss_fn,
+                pixel_size_um=pixel_size,
+                spot_diameter_um=spot_diameter,
+                n_subpixels=15,  # Default subpixel discretization
+                circle_resolution=64  # Default circle resolution
+            )
+            
+            # Store generated arrays and PSF kernel
+            self.generated_passes = passes
+            self.generated_contributions = contributions
+            self.generated_psf_kernel = psf_kernel
+            
+            # Update status
+            status_text = f"Generated arrays successfully!\n"
+            status_text += f"Passes shape: {passes.shape}, Contributions shape: {contributions.shape}\n"
+            status_text += f"3×3 PSF kernel:\n{psf_kernel}"
+            self.kernel_status_label.setText(status_text)
+            self.kernel_status_label.setStyleSheet("QLabel { color: #006600; font-style: normal; }")
+            
+            # Enable save button
+            self.save_kernel_btn.setEnabled(True)
+            
+            QtWidgets.QMessageBox.information(
+                self,
+                "Success",
+                f"Arrays generated successfully!\n\n"
+                f"Passes: {passes.shape[0]} elements\n"
+                f"Contributions: {contributions.shape[0]} elements\n"
+                f"Sum of contributions: {contributions.sum():.6f}"
+            )
+            
+        except Exception as e:
+            error_msg = f"Failed to generate arrays: {str(e)}"
+            self.kernel_status_label.setText(error_msg)
+            self.kernel_status_label.setStyleSheet("QLabel { color: #cc0000; font-style: normal; }")
+            QtWidgets.QMessageBox.critical(self, "Error", error_msg)
+            import traceback
+            traceback.print_exc()
+    
+    def _save_kernel_arrays(self):
+        """Save generated passes and contributions arrays to a file."""
+        if self.generated_passes is None or self.generated_contributions is None:
+            QtWidgets.QMessageBox.warning(self, "No Arrays", "Please generate arrays first.")
+            return
+        
+        from openimc.processing.hrimc_kernel_generator import save_passes_contributions
+        
+        # Generate default filename based on selected energy
+        default_filename = "energy_kernels.npz"
+        if self.energy_combo.currentIndex() >= 0:
+            energy = self.energy_combo.itemData(self.energy_combo.currentIndex())
+            if energy is not None:
+                # Format energy value (remove negative sign, replace decimal point)
+                energy_str = f"{energy:.2f}".replace("-", "neg").replace(".", "_")
+                default_filename = f"energy_{energy_str}_kernels.npz"
+        
+        file_path, _ = QtWidgets.QFileDialog.getSaveFileName(
+            self,
+            "Save Kernel Arrays",
+            default_filename,
+            "NumPy Files (*.npz);;All Files (*)"
+        )
+        
+        if file_path:
+            try:
+                # Create metadata
+                metadata = {
+                    'midpoint': self.midpoint_spin.value(),
+                    'slope': self.slope_spin.value(),
+                    'min_fraction': self.min_fraction_spin.value(),
+                    'max_fraction': self.max_fraction_spin.value(),
+                    'step_size_um': self.step_size_spin.value(),
+                    'pixel_size_um': self.pixel_size_spin.value(),
+                    'spot_diameter_um': self.spot_diameter_spin.value()
+                }
+                
+                save_passes_contributions(
+                    self.generated_passes,
+                    self.generated_contributions,
+                    file_path,
+                    metadata=metadata,
+                    psf_kernel=self.generated_psf_kernel
+                )
+                
+                QtWidgets.QMessageBox.information(
+                    self,
+                    "Success",
+                    f"Arrays saved to:\n{file_path}"
+                )
+            except Exception as e:
+                QtWidgets.QMessageBox.critical(self, "Error", f"Failed to save arrays: {str(e)}")
+    
+    def _load_kernel_arrays(self):
+        """Load passes and contributions arrays from a file."""
+        from openimc.processing.hrimc_kernel_generator import load_passes_contributions
+        
+        file_path, _ = QtWidgets.QFileDialog.getOpenFileName(
+            self,
+            "Load Kernel Arrays",
+            "",
+            "NumPy Files (*.npz);;All Files (*)"
+        )
+        
+        if file_path:
+            try:
+                passes, contributions, metadata, psf_kernel = load_passes_contributions(file_path)
+                
+                # Store loaded arrays and PSF kernel
+                self.generated_passes = passes
+                self.generated_contributions = contributions
+                self.generated_psf_kernel = psf_kernel
+                
+                # Update parameters if metadata is available
+                if metadata:
+                    if 'midpoint' in metadata:
+                        self.midpoint_spin.setValue(float(metadata['midpoint']))
+                    if 'slope' in metadata:
+                        self.slope_spin.setValue(float(metadata['slope']))
+                    if 'min_fraction' in metadata:
+                        self.min_fraction_spin.setValue(float(metadata['min_fraction']))
+                    if 'max_fraction' in metadata:
+                        self.max_fraction_spin.setValue(float(metadata['max_fraction']))
+                    if 'step_size_um' in metadata:
+                        self.step_size_spin.setValue(float(metadata['step_size_um']))
+                    if 'pixel_size_um' in metadata:
+                        self.pixel_size_spin.setValue(float(metadata['pixel_size_um']))
+                    if 'spot_diameter_um' in metadata:
+                        self.spot_diameter_spin.setValue(float(metadata['spot_diameter_um']))
+                
+                # Update status
+                status_text = f"Loaded arrays from: {file_path}\n"
+                status_text += f"Passes shape: {passes.shape}, Contributions shape: {contributions.shape}\n"
+                status_text += f"Sum of contributions: {contributions.sum():.6f}"
+                if psf_kernel is not None:
+                    status_text += f"\nPSF kernel: {psf_kernel.shape} (available)"
+                self.kernel_status_label.setText(status_text)
+                self.kernel_status_label.setStyleSheet("QLabel { color: #006600; font-style: normal; }")
+                
+                # Enable save button
+                self.save_kernel_btn.setEnabled(True)
+                
+                msg = f"Arrays loaded successfully!\n\n"
+                msg += f"Passes: {passes.shape[0]} elements\n"
+                msg += f"Contributions: {contributions.shape[0]} elements"
+                if psf_kernel is not None:
+                    msg += f"\nPSF kernel: {psf_kernel.shape} (will be saved)"
+                QtWidgets.QMessageBox.information(self, "Success", msg)
+            except Exception as e:
+                QtWidgets.QMessageBox.critical(self, "Error", f"Failed to load arrays: {str(e)}")
+                import traceback
+                traceback.print_exc()
+    
     def _on_deconvolve_clicked(self):
         """Handle deconvolve button click - accept dialog to trigger deconvolution."""
         if not self.output_directory:
             QtWidgets.QMessageBox.warning(self, "No Output Directory", "Please select an output directory first.")
             return
         self.accept()
+    
+    def get_passes_contributions(self):
+        """Get the generated/loaded passes and contributions arrays."""
+        return self.generated_passes, self.generated_contributions
+    
+    def _load_kernel_arrays_for_deconv(self):
+        """Load kernel arrays for use in deconvolution."""
+        from openimc.processing.hrimc_kernel_generator import load_passes_contributions
+        
+        file_path, _ = QtWidgets.QFileDialog.getOpenFileName(
+            self,
+            "Load Kernel Arrays for Deconvolution",
+            "",
+            "NumPy Files (*.npz);;All Files (*)"
+        )
+        
+        if file_path:
+            try:
+                passes, contributions, metadata, psf_kernel = load_passes_contributions(file_path)
+                
+                # Store loaded arrays and PSF kernel
+                self.deconv_passes = passes
+                self.deconv_contributions = contributions
+                self.deconv_psf_kernel = psf_kernel
+                
+                # Update UI
+                if psf_kernel is not None:
+                    self.kernel_file_label.setText(f"Loaded: {os.path.basename(file_path)} (PSF kernel available)")
+                    # Hide x0 parameter when PSF kernel is loaded (x0 is baked into the kernel)
+                    self.x0_layout.itemAt(0).widget().hide()  # Hide label
+                    self.x0_spin.hide()
+                else:
+                    self.kernel_file_label.setText(f"Loaded: {os.path.basename(file_path)}")
+                self.kernel_file_label.setStyleSheet("QLabel { color: #006600; }")
+                self.clear_kernel_btn.setEnabled(True)
+                
+                msg = f"Kernel arrays loaded successfully!\n\n"
+                msg += f"Passes: {passes.shape[0]} elements\n"
+                msg += f"Contributions: {contributions.shape[0]} elements\n"
+                if psf_kernel is not None:
+                    msg += f"PSF kernel: {psf_kernel.shape} (will be used for direct kernel override)\n"
+                    msg += f"\nNote: x0 parameter is hidden since it's baked into the PSF kernel."
+                msg += f"\nThese arrays will be used for deconvolution."
+                QtWidgets.QMessageBox.information(self, "Success", msg)
+            except Exception as e:
+                QtWidgets.QMessageBox.critical(self, "Error", f"Failed to load arrays: {str(e)}")
+                import traceback
+                traceback.print_exc()
+    
+    def _clear_kernel_arrays(self):
+        """Clear loaded kernel arrays and use defaults."""
+        self.deconv_passes = None
+        self.deconv_contributions = None
+        self.deconv_psf_kernel = None
+        self.kernel_file_label.setText("No kernel arrays loaded (using defaults)")
+        self.kernel_file_label.setStyleSheet("QLabel { color: #666; }")
+        self.clear_kernel_btn.setEnabled(False)
+        # Show x0 parameter again when kernel is cleared
+        self.x0_layout.itemAt(0).widget().show()  # Show label
+        self.x0_spin.show()
+    
+    def get_deconv_passes_contributions(self):
+        """Get the passes, contributions arrays, and PSF kernel for deconvolution."""
+        return self.deconv_passes, self.deconv_contributions, self.deconv_psf_kernel
 

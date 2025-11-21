@@ -2190,7 +2190,10 @@ def deconvolution(
     output_format: str = "float",
     loader_path: Optional[Union[str, Path]] = None,
     source_file_path: Optional[Union[str, Path]] = None,
-    unique_acq_id: Optional[str] = None
+    unique_acq_id: Optional[str] = None,
+    passes: Optional[np.ndarray] = None,
+    contributions: Optional[np.ndarray] = None,
+    kernel: Optional[np.ndarray] = None
 ) -> Path:
     """Apply Richardson-Lucy deconvolution to high resolution IMC images.
     
@@ -2244,6 +2247,67 @@ def deconvolution(
     if unique_acq_id is None:
         unique_acq_id = acquisition.id
     
+    # Determine loader type
+    loader_type = "mcd" if isinstance(loader, MCDLoader) else "ometiff"
+    
+    # Extract channel names from acquisition
+    channel_names = acquisition.channels if acquisition.channels else None
+    
+    # Extract pixel size from metadata
+    pixel_size_x = None
+    pixel_size_y = None
+    pixel_size_unit = "µm"  # Default unit
+    
+    if acquisition.metadata:
+        # Look for common pixel size keys in metadata
+        for key, value in acquisition.metadata.items():
+            key_lower = key.lower()
+            if 'pixel' in key_lower and 'size' in key_lower:
+                if 'x' in key_lower or 'width' in key_lower:
+                    try:
+                        pixel_size_x = float(value)
+                    except (ValueError, TypeError):
+                        pass
+                elif 'y' in key_lower or 'height' in key_lower:
+                    try:
+                        pixel_size_y = float(value)
+                    except (ValueError, TypeError):
+                        pass
+            elif 'resolution' in key_lower:
+                try:
+                    # Sometimes resolution is given as a single value
+                    pixel_size_x = pixel_size_y = float(value)
+                except (ValueError, TypeError):
+                    pass
+            elif 'unit' in key_lower and 'pixel' in key_lower:
+                pixel_size_unit = str(value)
+            elif 'microns' in key_lower or 'micrometers' in key_lower:
+                # Sometimes pixel size is given as "microns per pixel"
+                try:
+                    pixel_size_x = pixel_size_y = float(value)
+                    pixel_size_unit = "µm"
+                except (ValueError, TypeError):
+                    pass
+            # Also check for OME standard keys
+            elif key == 'PhysicalSizeX':
+                try:
+                    pixel_size_x = float(value)
+                except (ValueError, TypeError):
+                    pass
+            elif key == 'PhysicalSizeY':
+                try:
+                    pixel_size_y = float(value)
+                except (ValueError, TypeError):
+                    pass
+            elif key == 'PhysicalSizeXUnit' or key == 'PhysicalSizeYUnit':
+                pixel_size_unit = str(value)
+    
+    # If only one dimension found, use it for both
+    if pixel_size_x is not None and pixel_size_y is None:
+        pixel_size_y = pixel_size_x
+    elif pixel_size_y is not None and pixel_size_x is None:
+        pixel_size_x = pixel_size_y
+    
     # Call deconvolution worker
     output_path = deconvolve_acquisition(
         loader_path,
@@ -2252,10 +2316,17 @@ def deconvolution(
         x0=x0,
         iterations=iterations,
         output_format=output_format,
-        channel_names=None,  # Will be auto-detected
+        channel_names=channel_names,
         source_file_path=source_file_path,
         unique_acq_id=unique_acq_id,
-        well_name=getattr(acquisition, 'well', None)
+        loader_type=loader_type,
+        well_name=getattr(acquisition, 'well', None),
+        pixel_size_x=pixel_size_x,
+        pixel_size_y=pixel_size_y,
+        pixel_size_unit=pixel_size_unit,
+        passes=passes,
+        contributions=contributions,
+        kernel=kernel
     )
     
     return Path(output_path)
