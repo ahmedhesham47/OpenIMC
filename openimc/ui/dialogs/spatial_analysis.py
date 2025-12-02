@@ -224,7 +224,7 @@ def dataframe_to_anndata(
         morpho_names = {
             'area_um2', 'perimeter_um', 'equivalent_diameter_um', 'eccentricity',
             'solidity', 'extent', 'circularity', 'major_axis_len_um', 'minor_axis_len_um',
-            'aspect_ratio', 'bbox_area_um2', 'touches_border', 'holes_count'
+            'aspect_ratio', 'bbox_area_um2', 'touches_border', 'touches_edge', 'holes_count'
         }
         morpho_cols = [col for col in all_feature_cols if col in morpho_names]
         feature_cols.extend(morpho_cols)

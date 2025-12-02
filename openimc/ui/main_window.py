@@ -946,6 +946,8 @@ class MainWindow(QtWidgets.QMainWindow):
         self.preprocessing_cache = PreprocessingCache()
         # Per-channel denoise config {channel: {"hot": {...}, "speckle": {...}, "background": {...}}}
         self.channel_denoise: Dict[str, Dict[str, dict]] = {}
+        # Acquisition info cache for tracking mask status
+        self._acquisition_info_cache: Dict[str, Dict] = {}
         
         # Feature extraction state
         self.feature_dataframe = None  # Store extracted features in memory
@@ -4930,12 +4932,16 @@ class MainWindow(QtWidgets.QMainWindow):
                         if hasattr(dlg, '_acquisitions_to_segment'):
                             acquisitions_to_segment = dlg._acquisitions_to_segment
                         
+                        # Get num_workers from dialog (for Cellpose)
+                        num_workers = dlg.get_num_workers() if hasattr(dlg, 'get_num_workers') else None
+                        
                         # Run segmentation on all acquisitions (or specific subset)
                         self._perform_segmentation_all_acquisitions(
                             model, diameter, flow_threshold, cellprob_threshold, 
                             show_overlay, save_masks, masks_directory, gpu_id, preprocessing_config,
                             denoise_source, custom_denoise_settings, dlg,
-                            acquisitions_to_segment=acquisitions_to_segment
+                            acquisitions_to_segment=acquisitions_to_segment,
+                            num_workers=num_workers
                         )
                     else:
                         # Run segmentation on current acquisition only
@@ -4945,10 +4951,20 @@ class MainWindow(QtWidgets.QMainWindow):
                             denoise_source, custom_denoise_settings, dlg
                         )
                 except Exception as e:
-                    QtWidgets.QMessageBox.critical(
-                        self, "Segmentation Failed", 
-                        f"Segmentation failed with error:\n{str(e)}"
-                    )
+                    # Check if this is a CUDA memory error
+                    from openimc.processing.custom_cellsam import CUDAMemoryError
+                    if isinstance(e, CUDAMemoryError):
+                        # Show user-friendly CUDA memory error message
+                        QtWidgets.QMessageBox.critical(
+                            self, "CUDA Out of Memory", 
+                            f"{str(e)}\n\n"
+                            f"Segmentation has been cancelled. Please reduce the batch size and try again."
+                        )
+                    else:
+                        QtWidgets.QMessageBox.critical(
+                            self, "Segmentation Failed", 
+                            f"Segmentation failed with error:\n{str(e)}"
+                        )
             
             # Connect to accepted signal
             self.segmentation_dialog.accepted.connect(on_segmentation_accepted)
@@ -5465,7 +5481,7 @@ class MainWindow(QtWidgets.QMainWindow):
                                              show_overlay: bool = True, save_masks: bool = False, 
                                              masks_directory: str = None, gpu_id = None, preprocessing_config = None,
                                              denoise_source: str = "Use viewer settings", custom_denoise_settings: dict = None, dlg = None,
-                                             acquisitions_to_segment: List = None):
+                                             acquisitions_to_segment: List = None, num_workers: int = None):
         """Perform efficient batch segmentation on all acquisitions or a specific subset."""
         if not self.acquisitions:
             QtWidgets.QMessageBox.warning(self, "No acquisitions", "No acquisitions available for segmentation.")
@@ -5506,10 +5522,6 @@ class MainWindow(QtWidgets.QMainWindow):
             return
         
         try:
-            # Set fixed batch size
-            batch_size = 16
-            progress_dlg.update_progress(0, "Initializing batch processing", f"Batch size: {batch_size} (0/{total_acquisitions} completed)")
-            
             # Initialize Cellpose model once
             progress_dlg.update_progress(0, "Initializing Cellpose model", f"Loading model... (0/{total_acquisitions} completed)")
             
@@ -5534,130 +5546,119 @@ class MainWindow(QtWidgets.QMainWindow):
             else:  # cyto3
                 model_obj = models.Cellpose(gpu=use_gpu, model_type='cyto3')
             
-            # Process acquisitions in batches
+            # Process acquisitions sequentially
             successful_segmentations = 0
             
-            for batch_start in range(0, total_acquisitions, batch_size):
+            for acq_idx, acq in enumerate(acquisitions_to_process):
                 if progress_dlg.is_cancelled():
                     break
                 
-                batch_end = min(batch_start + batch_size, total_acquisitions)
-                batch_acquisitions = acquisitions_to_process[batch_start:batch_end]
-                
                 progress_dlg.update_progress(
                     successful_segmentations, 
-                    f"Processing batch {batch_start//batch_size + 1}", 
-                    f"Loading {len(batch_acquisitions)} acquisitions... ({successful_segmentations}/{total_acquisitions} completed)"
+                    f"Processing acquisition {acq_idx + 1}/{total_acquisitions}", 
+                    f"Loading {acq.name}... ({successful_segmentations}/{total_acquisitions} completed)"
                 )
                 
                 try:
-                    # Load and preprocess all acquisitions in this batch
-                    batch_data = self._load_batch_acquisitions(
-                        batch_acquisitions, preprocessing_config, progress_dlg, denoise_source, custom_denoise_settings
+                    # Process single acquisition
+                    acq_id = acq.id
+                    acq_name = acq.name
+                    
+                    # Get acquisition info
+                    acq_info = self._get_acquisition_info(acq_id)
+                    if acq_info is None:
+                        raise ValueError(f"Acquisition {acq_id} not found")
+                    
+                    # Preprocess this acquisition
+                    nuclear_img, cyto_img = self._preprocess_acquisition_for_cellpose(
+                        acq_id, preprocessing_config, progress_dlg, denoise_source, custom_denoise_settings
                     )
                     
-                    if not batch_data:
-                        continue
+                    # Prepare Cellpose input
+                    nuclear_channels_list = preprocessing_config.get('nuclear_channels', []) if preprocessing_config else []
+                    cyto_channels_list = preprocessing_config.get('cyto_channels', []) if preprocessing_config else []
                     
-                    # Run segmentation on the entire batch
+                    if nuclear_channels_list and cyto_channels_list:
+                        # Combined mode: stack nuclear and cyto channels
+                        if nuclear_img is None or cyto_img is None:
+                            raise ValueError("Failed to load channels for combined mode")
+                        cellpose_input = [np.stack([nuclear_img, cyto_img], axis=0)]
+                        channels = [1, 2]
+                    elif nuclear_channels_list:
+                        if nuclear_img is None:
+                            raise ValueError("Failed to load nuclear channels")
+                        cellpose_input = [nuclear_img]
+                        channels = [0, 0]
+                    elif cyto_channels_list:
+                        if cyto_img is None:
+                            raise ValueError("Failed to load cytoplasm channels")
+                        cellpose_input = [cyto_img]
+                        channels = [0, 0]
+                    else:
+                        raise ValueError("At least one channel (nuclear or cyto) must be selected")
+                    
+                    # Run segmentation
                     progress_dlg.update_progress(
                         successful_segmentations,
-                        f"Segmenting batch {batch_start//batch_size + 1}",
-                        f"Processing {len(batch_data['images'])} images... ({successful_segmentations}/{total_acquisitions} completed)"
+                        f"Segmenting {acq_name}",
+                        f"Running Cellpose... ({successful_segmentations}/{total_acquisitions} completed)"
                     )
                     
+                    # Run Cellpose eval
+                    # Note: Cellpose eval() does not support nproc parameter
                     masks, flows, styles, diams = model_obj.eval(
-                        batch_data['images'],
+                        cellpose_input,
                         diameter=diameter,
                         flow_threshold=flow_threshold,
                         cellprob_threshold=cellprob_threshold,
-                        channels=batch_data['channels']
+                        channels=channels
                     )
                     
-                    # Store results using acquisition mapping to ensure correct order
-                    acquisition_mapping = batch_data['acquisition_mapping']  # Contains indices
-                    acquisition_info_list = batch_data.get('acquisition_info_list', [])  # List of AcquisitionInfo objects
-                    processed_acquisitions = set()
+                    mask = masks[0] if len(masks) > 0 else np.zeros((1, 1), dtype=np.int32)
                     
-                    # Set up masks directory if saving to disk
-                    if save_masks and masks_directory:
-                        save_masks_directory_preference(masks_directory)
-                        self.mask_manager.set_masks_directory(masks_directory)
-                    
-                    for i, mask in enumerate(masks):
-                        if i < len(acquisition_mapping):
-                            acq_idx = acquisition_mapping[i]  # Index in acquisition_info_list
-                            
-                            # Only process each acquisition once (use the first mask for each acquisition)
-                            if acq_idx not in processed_acquisitions and acq_idx < len(acquisition_info_list):
-                                acq_info = acquisition_info_list[acq_idx]
-                                acq_id = acq_info.id
-                                
-                                # Store mask using mask manager
-                                if isinstance(mask, np.ndarray):
-                                    mask = mask.copy()
-                                
-                                # Update acquisition info cache
-                                self.segmentation_masks.set_acq_info(acq_id, acq_info)
-                                
-                                # Store mask in memory (save to disk only if user requested)
-                                self.mask_manager.set_mask(
-                                    acq_id, mask,
-                                    save_to_disk=save_masks,
-                                    acq_info=acq_info,
-                                    masks_directory=masks_directory
-                                )
-                                
-                                # Clear colors for this acquisition so they get regenerated
-                                if acq_id in self.segmentation_colors:
-                                    del self.segmentation_colors[acq_id]
-                                if acq_id in self.cluster_colors:
-                                    del self.cluster_colors[acq_id]
-                                if acq_id in self.cluster_color_map:
-                                    del self.cluster_color_map[acq_id]
-                                successful_segmentations += 1
-                                processed_acquisitions.add(acq_idx)
-                                
-                                # mask_manager.set_mask already saves with _segmentation_masks.tif naming
-                                # No need for redundant save
-                                
-                                # Update progress after each acquisition
-                                progress_dlg.update_progress(
-                                    successful_segmentations,
-                                    f"Completed batch {batch_start//batch_size + 1}",
-                                    f"Segmented {acq_info.name} ({successful_segmentations}/{total_acquisitions} completed)"
-                                )
-                    
-                    # Explicitly release memory: delete images and other large arrays from batch_data
-                    # This is critical for large datasets to prevent memory buildup
-                    del batch_data['images']
+                    # Explicitly release memory
+                    del cellpose_input, nuclear_img, cyto_img
                     del masks, flows, styles, diams
-                    batch_data = None
                     import gc
-                    gc.collect()  # Force garbage collection to free memory immediately
+                    gc.collect()
                     if _HAVE_TORCH and use_gpu:
                         torch.cuda.empty_cache()
                     
+                    # Update acquisition info cache
+                    if acq_info:
+                        self.segmentation_masks.set_acq_info(acq_id, acq_info)
+                    
+                    # Store mask in memory (save to disk only if user requested)
+                    if isinstance(mask, np.ndarray):
+                        mask = mask.copy()
+                    self.mask_manager.set_mask(
+                        acq_id, mask,
+                        save_to_disk=save_masks,
+                        acq_info=acq_info,
+                        masks_directory=masks_directory
+                    )
+                    
+                    # Clear colors for this acquisition so they get regenerated
+                    if acq_id in self.segmentation_colors:
+                        del self.segmentation_colors[acq_id]
+                    if acq_id in self.cluster_colors:
+                        del self.cluster_colors[acq_id]
+                    if acq_id in self.cluster_color_map:
+                        del self.cluster_color_map[acq_id]
+                    
+                    successful_segmentations += 1
+                    
+                    # Update progress
+                    progress_dlg.update_progress(
+                        successful_segmentations,
+                        f"Completed {acq_name}",
+                        f"Segmented {acq_name} ({successful_segmentations}/{total_acquisitions} completed)"
+                    )
+                    
                 except Exception as e:
-                    print(f"Error processing batch {batch_start//batch_size + 1}: {e}")
-                    # Fall back to individual processing for this batch
-                    for acq in batch_acquisitions:
-                        try:
-                            self._process_single_acquisition_fallback(
-                                acq, model_obj, model, diameter, flow_threshold, 
-                                cellprob_threshold, preprocessing_config, save_masks, masks_directory
-                            )
-                            successful_segmentations += 1
-                            
-                            # Update progress after each fallback acquisition
-                            progress_dlg.update_progress(
-                                successful_segmentations,
-                                f"Fallback processing",
-                                f"Segmented {acq.name} ({successful_segmentations}/{total_acquisitions} completed)"
-                            )
-                        except Exception as e2:
-                            print(f"Error segmenting acquisition {acq.name}: {e2}")
-                            continue
+                    print(f"Error segmenting acquisition {acq.name}: {e}")
+                    # Continue with next acquisition
+                    continue
             
             progress_dlg.update_progress(total_acquisitions, "Batch segmentation complete", 
                                        f"Successfully segmented {successful_segmentations}/{total_acquisitions} acquisitions")
@@ -5756,21 +5757,15 @@ class MainWindow(QtWidgets.QMainWindow):
                         raise ValueError(f"Acquisition {acq_id} not found")
                     
                     # Preprocess this acquisition
-                    from openimc.core import _log_memory_debug
-                    _log_memory_debug(f"[GUI] Starting preprocessing for {acq_name} ({acq_id})")
                     nuclear_img, cyto_img = self._preprocess_acquisition_for_cellsam(
                         acq_id, preprocessing_config, progress_dlg, denoise_source, custom_denoise_settings
                     )
-                    _log_memory_debug(f"[GUI] Preprocessing complete for {acq_name}", nuclear_img, "nuclear_img")
-                    if cyto_img is not None:
-                        _log_memory_debug(f"[GUI] Preprocessing complete for {acq_name}", cyto_img, "cyto_img")
                     
                     # Clear loader image cache immediately after preprocessing to free memory
                     loader = self._get_loader_for_acquisition(acq_id)
                     if loader is not None and hasattr(loader, '_image_cache'):
                         cache_size_before = len(loader._image_cache)
                         loader._image_cache.clear()
-                        _log_memory_debug(f"[GUI] Cleared loader image cache after preprocessing for {acq_name} | cleared {cache_size_before} cached images")
                         import gc
                         gc.collect()
                     
@@ -5778,7 +5773,6 @@ class MainWindow(QtWidgets.QMainWindow):
                     nuclear_channels_list = preprocessing_config.get('nuclear_channels', []) if preprocessing_config else []
                     cyto_channels_list = preprocessing_config.get('cyto_channels', []) if preprocessing_config else []
                     
-                    _log_memory_debug(f"[GUI] Preparing CellSAM input for {acq_name}")
                     if nuclear_channels_list and cyto_channels_list:
                         # Combined mode: H x W x 3 array
                         if nuclear_img is None:
@@ -5789,19 +5783,16 @@ class MainWindow(QtWidgets.QMainWindow):
                         cellsam_input = np.zeros((h, w, 3), dtype=np.float32)
                         cellsam_input[:, :, 1] = nuclear_img  # Channel 1 is nuclear
                         cellsam_input[:, :, 2] = cyto_img  # Channel 2 is cyto
-                        _log_memory_debug(f"[GUI] Created combined CellSAM input", cellsam_input, "cellsam_input")
                     elif nuclear_channels_list:
                         # Nuclear only mode: H x W array
                         if nuclear_img is None:
                             raise ValueError("Failed to load nuclear channels")
                         cellsam_input = nuclear_img
-                        _log_memory_debug(f"[GUI] Using nuclear-only CellSAM input", cellsam_input, "cellsam_input")
                     elif cyto_channels_list:
                         # Cyto only mode: H x W array
                         if cyto_img is None:
                             raise ValueError("Failed to load cytoplasm channels")
                         cellsam_input = cyto_img
-                        _log_memory_debug(f"[GUI] Using cyto-only CellSAM input", cellsam_input, "cellsam_input")
                     else:
                         raise ValueError("At least one channel (nuclear or cyto) must be selected for CellSAM")
                     
@@ -5812,8 +5803,6 @@ class MainWindow(QtWidgets.QMainWindow):
                         f"Running CellSAM... ({successful_segmentations}/{total_acquisitions} completed)"
                     )
                     
-                    _log_memory_debug(f"[GUI] Running CellSAM pipeline (custom implementation) for {acq_name}")
-                    
                     mask = cellsam_pipeline(
                         cellsam_input,
                         bbox_threshold=bbox_threshold,
@@ -5822,30 +5811,20 @@ class MainWindow(QtWidgets.QMainWindow):
                         gauge_cell_size=gauge_cell_size
                     )
                     
-                    # Custom implementation handles model caching internally
-                    _log_memory_debug(f"[GUI] CellSAM pipeline complete (custom implementation)")
-                    _log_memory_debug(f"[GUI] CellSAM pipeline complete, mask created", mask, "mask")
-                    
                     # Explicitly release input images memory immediately after segmentation
-                    _log_memory_debug(f"[GUI] Deleting CellSAM input images for {acq_name}")
                     del cellsam_input
-                    _log_memory_debug(f"[GUI] Deleted cellsam_input")
                     if 'nuclear_img' in locals() and nuclear_img is not None:
                         del nuclear_img
-                        _log_memory_debug(f"[GUI] Deleted nuclear_img")
                     if 'cyto_img' in locals() and cyto_img is not None:
                         del cyto_img
-                        _log_memory_debug(f"[GUI] Deleted cyto_img")
                     import gc
                     gc.collect()
-                    _log_memory_debug(f"[GUI] After GC, mask still exists", mask, "mask_after_cleanup")
                     
                     # Update acquisition info cache
                     if acq_info:
                         self.segmentation_masks.set_acq_info(acq_id, acq_info)
                     
                     # Store mask in memory (save to disk only if user requested)
-                    _log_memory_debug(f"[GUI] Storing mask for {acq_name}, save_masks={save_masks}")
                     if isinstance(mask, np.ndarray):
                         mask = mask.copy()
                     self.mask_manager.set_mask(
@@ -5854,7 +5833,6 @@ class MainWindow(QtWidgets.QMainWindow):
                         acq_info=acq_info,
                         masks_directory=masks_directory
                     )
-                    _log_memory_debug(f"[GUI] Mask stored (in-memory) for {acq_name}")
                     # mask_manager.set_mask already saves with _segmentation_masks.tif naming
                     # No need for redundant save
                     
@@ -5894,10 +5872,20 @@ class MainWindow(QtWidgets.QMainWindow):
             )
             
         except Exception as e:
-            QtWidgets.QMessageBox.critical(
-                self, "Batch Segmentation Failed", 
-                f"Batch segmentation failed with error:\n{str(e)}"
-            )
+            # Check if this is a CUDA memory error
+            from openimc.processing.custom_cellsam import CUDAMemoryError
+            if isinstance(e, CUDAMemoryError):
+                # Show user-friendly CUDA memory error message
+                QtWidgets.QMessageBox.critical(
+                    self, "CUDA Out of Memory", 
+                    f"{str(e)}\n\n"
+                    f"Segmentation has been cancelled. Please reduce the batch size and try again."
+                )
+            else:
+                QtWidgets.QMessageBox.critical(
+                    self, "Batch Segmentation Failed", 
+                    f"Batch segmentation failed with error:\n{str(e)}"
+                )
         finally:
             progress_dlg.close()
     
@@ -6193,7 +6181,126 @@ class MainWindow(QtWidgets.QMainWindow):
         return nuclear_img, cyto_img
     
     
-    def _load_batch_acquisitions(self, acquisitions, preprocessing_config: dict, progress_dlg, denoise_source: str = "none", custom_denoise_settings: dict = None) -> dict:
+    def _preprocess_acquisition_for_cellpose(self, acq_id: str, preprocessing_config: dict, progress_dlg, 
+                                             denoise_source: str, custom_denoise_settings: dict) -> tuple:
+        """Preprocess a specific acquisition for Cellpose segmentation."""
+        if not preprocessing_config:
+            raise ValueError("Preprocessing configuration is required for segmentation")
+        
+        # Get the correct loader for this acquisition
+        loader = self._get_loader_for_acquisition(acq_id)
+        if loader is None:
+            raise ValueError(f"No loader found for acquisition {acq_id}")
+        
+        config = preprocessing_config
+        
+        # Get nuclear channels
+        nuclear_channels = config.get('nuclear_channels', [])
+        
+        # Get cytoplasm channels
+        cyto_channels = config.get('cyto_channels', [])
+        
+        # For Cellpose, at least one channel type must be selected
+        if not nuclear_channels and not cyto_channels:
+            raise ValueError("At least one channel (nuclear or cyto) must be selected for Cellpose")
+        
+        # Get original acquisition ID if this is a unique ID
+        original_acq_id = self._get_original_acq_id(acq_id)
+        
+        # Load and normalize nuclear channels
+        nuclear_img = None
+        if nuclear_channels:
+            nuclear_imgs = []
+            for channel in nuclear_channels:
+                img = loader.get_image(original_acq_id, channel)
+                if img is None:
+                    continue
+                
+                # Apply denoising
+                if denoise_source == "Use viewer settings":
+                    # Get viewer denoise settings
+                    viewer_settings = self._get_viewer_denoise_settings()
+                    if viewer_settings and channel in viewer_settings:
+                        try:
+                            img = self._apply_custom_denoise(channel, img, viewer_settings)
+                        except Exception:
+                            pass
+                elif denoise_source == "Custom" and custom_denoise_settings:
+                    try:
+                        img = self._apply_custom_denoise(channel, img, custom_denoise_settings)
+                    except Exception:
+                        pass
+                
+                # Apply normalization
+                img = self._apply_normalization(img, config, acq_id, channel)
+                # Ensure 0-1 range after denoising and normalization
+                img = self._ensure_0_1_range(img)
+                nuclear_imgs.append(img)
+            
+            if not nuclear_imgs:
+                raise ValueError(f"Failed to load nuclear channels for acquisition {acq_id}")
+            
+            # Combine nuclear channels
+            nuclear_combo_method = config.get('nuclear_combo_method', 'single')
+            nuclear_weights = config.get('nuclear_weights')
+            nuclear_img = combine_channels(nuclear_imgs, nuclear_combo_method, nuclear_weights)
+            # Ensure combined image is in 0-1 range
+            nuclear_img = self._ensure_0_1_range(nuclear_img)
+            # Release intermediate images immediately to free memory
+            del nuclear_imgs
+            import gc
+            gc.collect()
+        
+        # Load and normalize cytoplasm channels
+        cyto_img = None
+        if cyto_channels:
+            cyto_imgs = []
+            for channel in cyto_channels:
+                img = loader.get_image(original_acq_id, channel)
+                if img is None:
+                    continue
+                
+                # Apply denoising
+                if denoise_source == "Use viewer settings":
+                    # Get viewer denoise settings
+                    viewer_settings = self._get_viewer_denoise_settings()
+                    if viewer_settings and channel in viewer_settings:
+                        try:
+                            img = self._apply_custom_denoise(channel, img, viewer_settings)
+                        except Exception:
+                            pass
+                elif denoise_source == "Custom" and custom_denoise_settings:
+                    try:
+                        img = self._apply_custom_denoise(channel, img, custom_denoise_settings)
+                    except Exception:
+                        pass
+                
+                # Apply normalization
+                img = self._apply_normalization(img, config, acq_id, channel)
+                # Ensure 0-1 range after denoising and normalization
+                img = self._ensure_0_1_range(img)
+                cyto_imgs.append(img)
+            
+            if cyto_imgs:
+                # Combine cytoplasm channels
+                cyto_combo_method = config.get('cyto_combo_method', 'single')
+                cyto_weights = config.get('cyto_weights')
+                cyto_img = combine_channels(cyto_imgs, cyto_combo_method, cyto_weights)
+                # Ensure combined image is in 0-1 range
+                cyto_img = self._ensure_0_1_range(cyto_img)
+                # Release intermediate images immediately to free memory
+                del cyto_imgs
+                gc.collect()
+        
+        # Clear loader cache after preprocessing to free memory
+        if hasattr(loader, '_image_cache'):
+            loader._image_cache.clear()
+            gc.collect()
+        
+        return nuclear_img, cyto_img
+    
+    
+    def _load_batch_acquisitions(self, acquisitions, preprocessing_config: dict, progress_dlg, denoise_source: str = "none", custom_denoise_settings: dict = None, num_workers: int = None) -> dict:
         """Load and preprocess a batch of acquisitions efficiently using multiprocessing."""
         batch_images = []
         batch_channels = []
@@ -6267,7 +6374,11 @@ class MainWindow(QtWidgets.QMainWindow):
             return None
         
         # Use multiprocessing for parallel loading and preprocessing
-        max_workers = max(1, min(mp.cpu_count() - 2, len(mp_args)))
+        # Use num_workers if provided, otherwise default to cpu_count - 2
+        if num_workers is not None:
+            max_workers = max(1, min(num_workers, len(mp_args)))
+        else:
+            max_workers = max(1, min(mp.cpu_count() - 2, len(mp_args)))
         
         batch_images = []
         batch_channels = []
@@ -7500,114 +7611,82 @@ class MainWindow(QtWidgets.QMainWindow):
                 QtWidgets.QMessageBox.warning(self, "No valid acquisitions", "No valid acquisitions found for feature extraction.")
                 return
             
-            # Use multiprocessing for parallel loading and feature extraction
-            # Use 'spawn' context to avoid issues with PyQt and other libraries (like QC analysis does)
+            # Group acquisitions by file path
+            # Process files sequentially to avoid readimc file access issues, but process all acquisitions from each file in parallel
+            from collections import defaultdict
+            file_groups = defaultdict(list)
+            for args in mp_args:
+                file_path = args[6]  # file_path is at index 6
+                file_groups[file_path].append(args)
+            
+            # Use multiprocessing for parallel feature extraction within each file
+            num_unique_files = len(file_groups)
             max_workers = max(1, min(mp.cpu_count() - 2, len(mp_args)))
-            progress_dlg.update_progress(0, "Starting parallel loading and extraction", f"Using {max_workers} CPU cores")
+            progress_dlg.update_progress(0, "Starting feature extraction", f"Processing {num_unique_files} files with up to {max_workers} workers")
             
             all_features = []
+            import time
+            start_time = time.time()
+            worker_timeout = 300  # 5 minutes per worker
+            
             try:
-                # Use spawn context to avoid conflicts and hangs (same as QC analysis)
+                # Use spawn context to avoid conflicts and hangs
                 ctx = mp.get_context('spawn')
-                with ctx.Pool(processes=max_workers) as pool:
-                    # Submit all tasks - each worker loads and extracts in parallel using core function
-                    futures = []
-                    for (acq_id, mask, mask_path, selected_features, acq_info_dict, acq_label, file_path, loader_type, arcsinh_enabled, cofactor, denoise_source, custom_denoise_settings, spillover_config, source_file, excluded_channels) in mp_args:
-                        future = pool.apply_async(
-                            _extract_features_worker,
-                            (acq_id, mask, mask_path, selected_features, acq_info_dict, acq_label, file_path, loader_type, arcsinh_enabled, cofactor, denoise_source, custom_denoise_settings, spillover_config, source_file, excluded_channels)
-                        )
-                        futures.append((acq_id, future))
+                
+                # Process each file sequentially, but all acquisitions from each file in parallel
+                file_num = 0
+                for file_path, file_args_list in file_groups.items():
+                    file_num += 1
+                    file_basename = os.path.basename(file_path)
+                    print(f"[main] Processing file {file_num}/{num_unique_files}: {file_basename} ({len(file_args_list)} acquisitions)")
                     
-                    # Collect results as they complete using proper async result handling
-                    completed = 0
-                    pending = dict(futures)  # Convert to dict for easier removal
-                    total_tasks = len(futures)
-                    processed_acq_ids = set()
-                    
-                    import time
-                    start_time = time.time()
-                    worker_timeout = 300  # 5 minutes per worker (reduced from 10 minutes)
-                    last_progress_update = time.time()
-                    
-                    # Use a more efficient loop that checks ready() and processes events
-                    while completed < total_tasks:
-                        if progress_dlg.is_cancelled():
-                            # Cancel remaining tasks
-                            pool.terminate()
-                            pool.join()
-                            break
+                    with ctx.Pool(processes=min(max_workers, len(file_args_list))) as pool:
+                        # Submit all acquisitions from this file
+                        futures = []
+                        for args in file_args_list:
+                            (acq_id, mask, mask_path, selected_features, acq_info_dict, acq_label, 
+                             file_path_arg, loader_type, arcsinh_enabled, cofactor, denoise_source, 
+                             custom_denoise_settings, spillover_config, source_file, excluded_channels) = args
+                            future = pool.apply_async(
+                                _extract_features_worker,
+                                (acq_id, mask, mask_path, selected_features, acq_info_dict, acq_label, 
+                                 file_path_arg, loader_type, arcsinh_enabled, cofactor, denoise_source, 
+                                 custom_denoise_settings, spillover_config, source_file, excluded_channels)
+                            )
+                            futures.append((acq_id, future))
                         
-                        # Check elapsed time for timeout detection
-                        elapsed = time.time() - start_time
-                        if elapsed > worker_timeout * len(pending):
-                            print(f"[main] [WARNING] Feature extraction taking too long ({elapsed:.1f}s), some workers may be stuck")
-                        
-                        # Check which futures are ready (non-blocking)
-                        ready_acq_ids = []
-                        for acq_id, future in list(pending.items()):
-                            if acq_id in processed_acq_ids:
-                                continue
+                        # Collect results as they complete
+                        completed_for_file = 0
+                        total_acquisitions = len(mp_args)
+                        for acq_idx, (acq_id, future) in enumerate(futures, 1):
+                            if progress_dlg.is_cancelled():
+                                pool.terminate()
+                                pool.join()
+                                break
                             
-                            if future.ready():
-                                ready_acq_ids.append(acq_id)
-                        
-                        # Process ready futures
-                        for acq_id in ready_acq_ids:
-                            future = pending.pop(acq_id)
-                            processed_acq_ids.add(acq_id)
                             try:
-                                result = future.get(timeout=1)  # Should be immediate since ready()
+                                result = future.get(timeout=worker_timeout)
                                 if result is not None and not result.empty:
                                     all_features.append(result)
+                                    completed_for_file += 1
+                            except mp.TimeoutError:
+                                print(f"[main] [ERROR] Feature extraction timed out for {acq_id} from {file_basename} after {worker_timeout}s")
                             except Exception as e:
-                                print(f"[main] [ERROR] Feature extraction failed for acquisition {acq_id}: {e}")
+                                print(f"[main] [ERROR] Feature extraction failed for {acq_id} from {file_basename}: {e}")
                                 import traceback
                                 traceback.print_exc()
                             
-                            completed += 1
-                            
-                            # Update progress (throttle updates to avoid UI lag)
-                            current_time = time.time()
-                            if current_time - last_progress_update > 0.1:  # Update every 100ms
-                                progress_dlg.update_progress(
-                                    completed,
-                                    f"Processed acquisition {completed}/{total_tasks}",
-                                    f"Extracted features from {len(all_features)} acquisitions"
-                                )
-                                last_progress_update = current_time
-                        
-                        # Process events to keep UI responsive (but not too frequently)
-                        if time.time() - last_progress_update > 0.05:  # Process events every 50ms
+                            # Update progress: count acquisitions processed (whether successful or not)
+                            # Calculate how many acquisitions we've processed so far across all files
+                            acquisitions_processed = sum(len(file_groups[f]) for f in list(file_groups.keys())[:file_num-1]) + acq_idx
+                            progress_dlg.update_progress(
+                                acquisitions_processed,
+                                f"File {file_num}/{num_unique_files}: {completed_for_file}/{len(file_args_list)} acquisitions",
+                                f"Processed {acquisitions_processed}/{total_acquisitions} acquisitions ({len(all_features)} successful)"
+                            )
                             QtWidgets.QApplication.processEvents()
-                        
-                        # If no futures are ready, sleep briefly to avoid busy-waiting
-                        if not ready_acq_ids:
-                            time.sleep(0.05)  # 50ms sleep
                     
-                    # Collect any remaining futures (with timeout) - should be empty if loop worked correctly
-                    for acq_id, future in list(pending.items()):
-                        if progress_dlg.is_cancelled():
-                            break
-                        if acq_id in processed_acq_ids:
-                            continue
-                        try:
-                            result = future.get(timeout=worker_timeout)
-                            if result is not None and not result.empty:
-                                all_features.append(result)
-                                completed += 1
-                                progress_dlg.update_progress(
-                                    completed,
-                                    f"Processed acquisition {completed}/{total_tasks}",
-                                    f"Extracted features from {len(all_features)} acquisitions"
-                                )
-                        except mp.TimeoutError:
-                            print(f"[main] [ERROR] Feature extraction timed out for acquisition {acq_id} after {worker_timeout}s")
-                            # Mark as failed but continue
-                        except Exception as e:
-                            print(f"[main] [ERROR] Feature extraction failed for acquisition {acq_id}: {e}")
-                            import traceback
-                            traceback.print_exc()
+                    print(f"[main] Completed file {file_basename}: {completed_for_file}/{len(file_args_list)} acquisitions")
                         
             except Exception as mp_error:
                 print(f"Multiprocessing failed, falling back to sequential processing: {mp_error}")
@@ -7892,6 +7971,12 @@ class MainWindow(QtWidgets.QMainWindow):
         
         # Save masks directory to preferences
         save_masks_directory_preference(masks_dir)
+        
+        # Clear all existing masks from memory before loading new ones
+        # This ensures old masks are removed when loading a different set
+        self.mask_manager.clear_all_masks()
+        
+        # Set the new masks directory (this will also clear masks if directory changed)
         self.mask_manager.set_masks_directory(masks_dir)
         
         # Masks are always stored in memory (no force disk storage)

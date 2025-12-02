@@ -38,7 +38,7 @@ class FeatureSelectorDialog(QtWidgets.QDialog):
         self._morpho_names = {
             'area_um2', 'perimeter_um', 'equivalent_diameter_um', 'eccentricity',
             'solidity', 'extent', 'circularity', 'major_axis_len_um', 'minor_axis_len_um',
-            'aspect_ratio', 'bbox_area_um2', 'touches_border', 'holes_count'
+            'aspect_ratio', 'bbox_area_um2', 'touches_border', 'touches_edge', 'holes_count'
         }
         self._intensity_suffixes = ['_mean', '_median', '_std', '_mad', '_p10', '_p90', '_integrated', '_frac_pos']
 
@@ -130,6 +130,56 @@ class FeatureSelectorDialog(QtWidgets.QDialog):
         lists_row.addWidget(morpho_group, 1)
         lists_row.addWidget(intensity_group, 1)
         layout.addLayout(lists_row, 1)
+
+        # Cell filtering section
+        filter_group = QtWidgets.QGroupBox("Cell Filtering")
+        filter_layout = QtWidgets.QVBoxLayout(filter_group)
+        
+        # Exclude edge cells checkbox
+        self.exclude_edge_cells = QtWidgets.QCheckBox("Exclude cells touching ROI edge")
+        self.exclude_edge_cells.setToolTip("Exclude cells that touch the edge of the ROI (where background pixels are adjacent)")
+        filter_layout.addWidget(self.exclude_edge_cells)
+        
+        # Area filtering
+        area_row = QtWidgets.QHBoxLayout()
+        area_row.addWidget(QtWidgets.QLabel("Cell area range (μm²):"))
+        area_row.addWidget(QtWidgets.QLabel("Min:"))
+        self.min_area_spin = QtWidgets.QDoubleSpinBox()
+        self.min_area_spin.setRange(0, 1e6)
+        self.min_area_spin.setValue(0)
+        self.min_area_spin.setSpecialValueText("No limit")
+        self.min_area_spin.setSuffix(" μm²")
+        area_row.addWidget(self.min_area_spin)
+        
+        area_row.addWidget(QtWidgets.QLabel("Max:"))
+        self.max_area_spin = QtWidgets.QDoubleSpinBox()
+        self.max_area_spin.setRange(0, 1e6)
+        self.max_area_spin.setValue(1e6)
+        self.max_area_spin.setSpecialValueText("No limit")
+        self.max_area_spin.setSuffix(" μm²")
+        area_row.addWidget(self.max_area_spin)
+        area_row.addStretch()
+        filter_layout.addLayout(area_row)
+        
+        # Percentile censoring
+        self.enable_percentile_censoring = QtWidgets.QCheckBox("Enable percentile censoring")
+        self.enable_percentile_censoring.setToolTip("Censor data at percentiles to remove outliers (commonly used in IMC analysis)")
+        filter_layout.addWidget(self.enable_percentile_censoring)
+        
+        percentile_row = QtWidgets.QHBoxLayout()
+        percentile_row.addWidget(QtWidgets.QLabel("Censor at:"))
+        self.censor_99th_only = QtWidgets.QRadioButton("99th percentile only")
+        self.censor_99th_only.setToolTip("Censor values above the 99th percentile (recommended for t-SNE and PhenoGraph)")
+        self.censor_99th_only.setChecked(True)  # Default option
+        percentile_row.addWidget(self.censor_99th_only)
+        
+        self.censor_both = QtWidgets.QRadioButton("1st and 99th percentiles")
+        self.censor_both.setToolTip("Censor values below 1st percentile and above 99th percentile (removes outliers at both ends)")
+        percentile_row.addWidget(self.censor_both)
+        percentile_row.addStretch()
+        filter_layout.addLayout(percentile_row)
+        
+        layout.addWidget(filter_group)
 
         # Buttons
         btns = QtWidgets.QHBoxLayout()
@@ -235,6 +285,72 @@ class FeatureSelectorDialog(QtWidgets.QDialog):
         self._last_selections.update(self._checked_by_name)
         
         return sorted(cols)
+    
+    def get_filter_settings(self) -> Dict:
+        """Get cell filtering settings.
+        
+        Returns:
+            Dictionary with filter settings:
+            - exclude_edge_cells: bool
+            - min_area: float (None if no limit)
+            - max_area: float (None if no limit)
+            - enable_percentile_censoring: bool
+            - censor_both_ends: bool (True for 1st and 99th, False for 99th only)
+        """
+        min_area = self.min_area_spin.value()
+        max_area = self.max_area_spin.value()
+        
+        return {
+            'exclude_edge_cells': self.exclude_edge_cells.isChecked(),
+            'min_area': min_area if min_area > 0 else None,
+            'max_area': max_area if max_area < 1e6 else None,
+            'enable_percentile_censoring': self.enable_percentile_censoring.isChecked(),
+            'censor_both_ends': self.censor_both.isChecked()
+        }
+    
+    def set_filter_settings(self, filter_settings: Dict):
+        """Set cell filtering settings from a dictionary.
+        
+        Args:
+            filter_settings: Dictionary with filter settings:
+                - exclude_edge_cells: bool
+                - min_area: float (None if no limit)
+                - max_area: float (None if no limit)
+                - enable_percentile_censoring: bool
+                - censor_both_ends: bool (True for 1st and 99th, False for 99th only)
+        """
+        if filter_settings is None:
+            return
+        
+        # Set exclude edge cells checkbox
+        if 'exclude_edge_cells' in filter_settings:
+            self.exclude_edge_cells.setChecked(bool(filter_settings['exclude_edge_cells']))
+        
+        # Set min area
+        if 'min_area' in filter_settings:
+            min_area = filter_settings['min_area']
+            if min_area is not None:
+                self.min_area_spin.setValue(float(min_area))
+            else:
+                self.min_area_spin.setValue(0)
+        
+        # Set max area
+        if 'max_area' in filter_settings:
+            max_area = filter_settings['max_area']
+            if max_area is not None:
+                self.max_area_spin.setValue(float(max_area))
+            else:
+                self.max_area_spin.setValue(1e6)
+        
+        # Set percentile censoring
+        if 'enable_percentile_censoring' in filter_settings:
+            self.enable_percentile_censoring.setChecked(bool(filter_settings['enable_percentile_censoring']))
+        
+        if 'censor_both_ends' in filter_settings:
+            if filter_settings['censor_both_ends']:
+                self.censor_both.setChecked(True)
+            else:
+                self.censor_99th_only.setChecked(True)
 
 
 

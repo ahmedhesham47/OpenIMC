@@ -18,6 +18,9 @@
 # along with this program.  If not, see <https://www.gnu.org/licenses/>.
 
 from typing import Dict, List, Optional, Tuple
+import os
+import sys
+import time
 
 import numpy as np
 import pandas as pd
@@ -179,14 +182,10 @@ def extract_features_for_acquisition(
     Arguments MUST be picklable. Returns an empty DataFrame on error.
     """
     try:
-        print(f"[feature_worker] Start extraction acq_id={acq_id}, arcsinh={arcsinh_enabled}, cofactor={cofactor}")
-        print(f"[feature_worker] Processing image stack shape: {img_stack.shape}")
-        
         # Apply denoising per channel only when the source is explicitly "Custom".
         # This ensures we operate on original (raw) images and do not double-denoise
         # images that may already reflect viewer/segmentation preprocessing.
         if denoise_source == "custom" and custom_denoise_settings:
-            print("[feature_worker] Applying custom denoising to raw image stack")
             for idx, ch_name in enumerate(acq_info.get("channels", [])):
                 cfg = custom_denoise_settings.get(ch_name)
                 if not cfg:
@@ -224,9 +223,7 @@ def extract_features_for_acquisition(
         if selected_features.get("centroid_x", False) or selected_features.get("centroid_y", False):
             props_to_compute.append("centroid")
 
-        print(f"[feature_worker] Computing morph props: {props_to_compute}")
         morph_df = pd.DataFrame(regionprops_table(label_image, properties=tuple(props_to_compute)))
-        print(f"[feature_worker] Morph props rows: {len(morph_df)} cols: {list(morph_df.columns)}")
 
         # Normalize morphometric column names to expected schema used in UI and selectors
         rename_map = {}
@@ -263,6 +260,31 @@ def extract_features_for_acquisition(
             with np.errstate(divide="ignore", invalid="ignore"):
                 circ = 4.0 * np.pi * morph_df["area_um2"] / np.maximum(morph_df["perimeter_um"], 1e-6) ** 2
             morph_df["circularity"] = circ
+        
+        # Compute touches_edge: check if cell touches ROI edge (the boundary of the mask/image)
+        if selected_features.get("touches_edge", False):
+            touches_edge_vals = []
+            unique_labels = morph_df["label"].to_numpy()
+            
+            # Get ROI dimensions
+            height, width = label_image.shape
+            
+            # Create mask for ROI boundary pixels
+            # Boundary pixels are at row 0, row (height-1), col 0, or col (width-1)
+            roi_edge_mask = np.zeros_like(label_image, dtype=bool)
+            roi_edge_mask[0, :] = True  # Top edge
+            roi_edge_mask[height - 1, :] = True  # Bottom edge
+            roi_edge_mask[:, 0] = True  # Left edge
+            roi_edge_mask[:, width - 1] = True  # Right edge
+            
+            # For each label, check if any of its pixels are on the ROI boundary
+            for label in unique_labels:
+                label_mask = (label_image == label)
+                # Check if any pixels of this cell are on the ROI edge
+                touches = np.any(label_mask & roi_edge_mask)
+                touches_edge_vals.append(bool(touches))
+            
+            morph_df["touches_edge"] = touches_edge_vals
 
         # Intensity features per channel (subset: mean, std, p10, p90, integrated)
         channel_names: List[str] = acq_info.get("channels", [])
@@ -278,17 +300,12 @@ def extract_features_for_acquisition(
                     filtered_channels.append(ch_name)
                     channel_indices.append(idx)
             channel_names = filtered_channels
-            print(f"[feature_worker] Excluding {len(excluded_channels_set)} channels from feature extraction")
-            print(f"[feature_worker] Computing intensity features for {len(channel_names)} channels (after exclusion)")
         else:
             channel_indices = list(range(len(channel_names)))
-            print(f"[feature_worker] Computing intensity features for {len(channel_names)} channels")
         
         for filtered_idx, original_idx in enumerate(channel_indices):
             ch_name = channel_names[filtered_idx]
             ch_img = img_stack[..., original_idx]
-            if ch_img.ndim != 2:
-                print(f"[feature_worker] Warning: channel {ch_name} has invalid shape {ch_img.shape}")
             # Mean intensity - use manual computation to avoid regionprops_table hangs
             # regionprops_table can hang on large/complex images, so we compute manually
             inten_df = _compute_mean_intensity_manual(label_image, ch_img)
@@ -348,9 +365,6 @@ def extract_features_for_acquisition(
                 
                 # For statistics that require sorted data (median, percentiles, MAD),
                 # use a single-pass grouping approach for much better performance
-                if num_labels > 0:
-                    print(f"[feature_worker] Computing per-label statistics for {num_labels} labels (channel {ch_name})")
-                
                 # Much more efficient: group all pixels by label in a single pass
                 # This avoids scanning the entire array for each label
                 label_flat = label_image.ravel()
@@ -377,9 +391,6 @@ def extract_features_for_acquisition(
                         p10_vals[i] = 0.0
                         p90_vals[i] = 0.0
                         continue
-                    
-                    if i % 500 == 0 and i > 0:
-                        print(f"[feature_worker] Processed {i}/{num_labels} labels for {ch_name}")
                     
                     pix = np.array(pixels_by_label[lbl], dtype=np.float64)
                     
@@ -469,7 +480,6 @@ def extract_features_for_acquisition(
             channel_names = acq_info.get("channels", [])
             
             if spillover_matrix is not None and len(channel_names) > 0:
-                print(f"[feature_worker] Applying spillover correction to intensity features (method={spillover_method})")
                 try:
                     # Apply spillover correction to each intensity feature type separately
                     # Intensity features: mean, median, std, mad, p10, p90, integrated
@@ -505,7 +515,6 @@ def extract_features_for_acquisition(
                             if col in morph_df.columns:
                                 morph_df[col] = comp_data[col].values
                     
-                    print(f"[feature_worker] Spillover correction applied successfully to intensity features")
                 except Exception as e:
                     print(f"[feature_worker] WARNING: Spillover correction failed: {e}")
                     import traceback
@@ -561,7 +570,6 @@ def extract_features_for_acquisition(
         })
         morph_df = pd.concat([metadata_df, morph_df], axis=1)
 
-        print(f"[feature_worker] Finished extraction acq_id={acq_id}, rows={len(morph_df)}")
         return morph_df
 
     except Exception as e:
@@ -601,6 +609,44 @@ def load_and_extract_features(
         mask_path: Path to mask file on disk (None if mask array is provided)
         ... (other args)
     """
+    import os
+    import tempfile
+    import tifffile
+    from openimc.data.mcd_loader import AcquisitionInfo
+    from openimc.core import extract_features, load_mcd
+    
+    try:
+        # Load and extract features (no file locking - handled by grouping in main process)
+        return _load_and_extract_features_unlocked(
+            acq_id, mask, mask_path, selected_features, acq_info, acq_label,
+            file_path, loader_type, arcsinh_enabled, cofactor, denoise_source,
+            custom_denoise_settings, spillover_config, source_file, excluded_channels
+        )
+    except Exception as e:
+        print(f"[feature_worker] [ERROR] Exception in load_and_extract_features for acq_id={acq_id}: {e}")
+        import traceback
+        traceback.print_exc()
+        return pd.DataFrame()
+
+
+def _load_and_extract_features_unlocked(
+    acq_id: str,
+    mask: Optional[np.ndarray],
+    mask_path: Optional[str],
+    selected_features: Dict[str, bool],
+    acq_info: Dict,
+    acq_label: str,
+    file_path: str,
+    loader_type: str,
+    arcsinh_enabled: bool,
+    cofactor: float,
+    denoise_source: str,
+    custom_denoise_settings: Dict,
+    spillover_config: Optional[Dict],
+    source_file: Optional[str],
+    excluded_channels: Optional[set],
+) -> pd.DataFrame:
+    """Internal function that performs the actual loading and extraction (without file locking)."""
     import os
     import tempfile
     import tifffile

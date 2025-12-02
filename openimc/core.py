@@ -281,14 +281,10 @@ def _preprocess_channels_for_segmentation(
     # Extract original acquisition ID for loader calls (handles multi-file unique IDs)
     original_acq_id = _extract_original_acq_id(acquisition.id)
     
-    _log_memory_debug(f"Starting preprocessing for {acquisition.id} (original: {original_acq_id})")
-    
     # Load and preprocess nuclear channels
     nuclear_imgs = []
     for channel in nuclear_channels:
-        _log_memory_debug(f"Loading nuclear channel {channel} for {acquisition.id}")
         img = loader.get_image(original_acq_id, channel)
-        _log_memory_debug(f"Loaded nuclear channel {channel}", img, f"nuclear_{channel}")
         # Apply denoising if custom settings provided
         if denoise_settings and channel in denoise_settings:
             img = _apply_denoise_to_channel(img, channel, denoise_settings[channel])
@@ -305,24 +301,18 @@ def _preprocess_channels_for_segmentation(
         nuclear_imgs.append(img)
     
     # Combine nuclear channels
-    _log_memory_debug(f"Combining {len(nuclear_imgs)} nuclear channels for {acquisition.id}")
     nuclear_img = combine_channels(nuclear_imgs, nuclear_combo_method, nuclear_weights)
     nuclear_img = _ensure_0_1_range(nuclear_img)
-    _log_memory_debug(f"Combined nuclear image created", nuclear_img, "nuclear_img")
     # Release intermediate images immediately to free memory
-    _log_memory_debug(f"Deleting {len(nuclear_imgs)} nuclear channel images")
     del nuclear_imgs
     gc.collect()
-    _log_memory_debug(f"After deleting nuclear_imgs")
     
     # Load and preprocess cytoplasm channels
     cyto_img = None
     if cyto_channels:
         cyto_imgs = []
         for channel in cyto_channels:
-            _log_memory_debug(f"Loading cyto channel {channel} for {acquisition.id}")
             img = loader.get_image(original_acq_id, channel)
-            _log_memory_debug(f"Loaded cyto channel {channel}", img, f"cyto_{channel}")
             # Apply denoising if custom settings provided
             if denoise_settings and channel in denoise_settings:
                 img = _apply_denoise_to_channel(img, channel, denoise_settings[channel])
@@ -339,43 +329,15 @@ def _preprocess_channels_for_segmentation(
             cyto_imgs.append(img)
         
         # Combine cytoplasm channels
-        _log_memory_debug(f"Combining {len(cyto_imgs)} cyto channels for {acquisition.id}")
         cyto_img = combine_channels(cyto_imgs, cyto_combo_method, cyto_weights)
         cyto_img = _ensure_0_1_range(cyto_img)
-        _log_memory_debug(f"Combined cyto image created", cyto_img, "cyto_img")
         # Release intermediate images immediately to free memory
-        _log_memory_debug(f"Deleting {len(cyto_imgs)} cyto channel images")
         del cyto_imgs
         gc.collect()
-        _log_memory_debug(f"After deleting cyto_imgs")
-    
-    _log_memory_debug(f"Preprocessing complete for {acquisition.id}", nuclear_img, "final_nuclear_img")
-    if cyto_img is not None:
-        _log_memory_debug(f"Preprocessing complete for {acquisition.id}", cyto_img, "final_cyto_img")
     return nuclear_img, cyto_img
 
 
-def _get_memory_usage_mb():
-    """Get current memory usage in MB."""
-    if _HAVE_PSUTIL:
-        process = psutil.Process(os.getpid())
-        return process.memory_info().rss / 1024 / 1024
-    else:
-        # Fallback: approximate using sys.getsizeof
-        return sys.getsizeof(gc.get_objects()) / 1024 / 1024
-
-
-def _log_memory_debug(message, obj=None, obj_name=None):
-    """Log memory usage with optional object info."""
-    mem_mb = _get_memory_usage_mb()
-    if obj is not None and obj_name:
-        if isinstance(obj, np.ndarray):
-            obj_size_mb = obj.nbytes / 1024 / 1024
-            print(f"[MEM_DEBUG] {message} | Memory: {mem_mb:.1f} MB | {obj_name}: {obj.shape} {obj.dtype} ({obj_size_mb:.2f} MB)")
-        else:
-            print(f"[MEM_DEBUG] {message} | Memory: {mem_mb:.1f} MB | {obj_name}: {type(obj).__name__}")
-    else:
-        print(f"[MEM_DEBUG] {message} | Memory: {mem_mb:.1f} MB")
+# Memory debugging functions removed - no longer used
 
 
 def _extract_original_acq_id(acq_id: str) -> str:
@@ -499,10 +461,7 @@ def segment(
             raise ValueError("DeepCell API key is required for CellSAM. Set deepcell_api_key or DEEPCELL_ACCESS_TOKEN environment variable.")
         os.environ["DEEPCELL_ACCESS_TOKEN"] = api_key
         
-        _log_memory_debug(f"Using custom CellSAM implementation for {acquisition.id}")
-        
         # Preprocess channels
-        _log_memory_debug(f"Starting CellSAM segmentation for {acquisition.id}")
         nuclear_img, cyto_img = _preprocess_channels_for_segmentation(
             loader, acquisition, nuclear_channels, cyto_channels,
             denoise_settings, normalization_method, arcsinh_cofactor,
@@ -511,28 +470,22 @@ def segment(
         )
         
         # Prepare input for CellSAM (supports nuclear-only, cyto-only, or combined)
-        _log_memory_debug(f"Preparing CellSAM input for {acquisition.id}")
         if nuclear_channels and cyto_channels:
             # Combined mode: H x W x 3 array
             h, w = nuclear_img.shape
             cellsam_input = np.zeros((h, w, 3), dtype=np.float32)
             cellsam_input[:, :, 1] = nuclear_img  # Channel 1 is nuclear
             cellsam_input[:, :, 2] = cyto_img if cyto_img is not None else nuclear_img  # Channel 2 is cyto
-            _log_memory_debug(f"Created combined CellSAM input", cellsam_input, "cellsam_input")
         elif nuclear_channels:
             # Nuclear only mode: H x W array
             cellsam_input = nuclear_img
-            _log_memory_debug(f"Using nuclear-only CellSAM input", cellsam_input, "cellsam_input")
         elif cyto_channels:
             # Cyto only mode: H x W array
             cellsam_input = cyto_img if cyto_img is not None else nuclear_img
-            _log_memory_debug(f"Using cyto-only CellSAM input", cellsam_input, "cellsam_input")
         else:
             raise ValueError("At least one channel (nuclear or cyto) must be selected for CellSAM")
         
         # Run CellSAM pipeline using our custom implementation
-        _log_memory_debug(f"Running CellSAM pipeline for {acquisition.id}")
-        _log_memory_debug(f"Before cellsam_pipeline_custom call for {acquisition.id}")
         mask = cellsam_pipeline_custom(
             cellsam_input,
             bbox_threshold=bbox_threshold,
@@ -540,20 +493,13 @@ def segment(
             low_contrast_enhancement=low_contrast_enhancement,
             gauge_cell_size=gauge_cell_size
         )
-        _log_memory_debug(f"After cellsam_pipeline_custom call for {acquisition.id}")
-        _log_memory_debug(f"CellSAM pipeline complete, mask created", mask, "mask")
         
         # Immediately release input images to free memory
-        _log_memory_debug(f"Deleting CellSAM input images for {acquisition.id}")
         del cellsam_input
-        _log_memory_debug(f"Deleted cellsam_input")
         del nuclear_img
-        _log_memory_debug(f"Deleted nuclear_img")
         if cyto_img is not None:
             del cyto_img
-            _log_memory_debug(f"Deleted cyto_img")
         gc.collect()
-        _log_memory_debug(f"After GC, mask still exists", mask, "mask_after_cleanup")
         
         # Use mask directly without modifications
         if isinstance(mask, np.ndarray):
@@ -593,8 +539,10 @@ def segment(
             channels_cp = [0, 1]  # [cytoplasm, nucleus]
         
         # Initialize Cellpose model
+        # Note: Cellpose only accepts 'gpu' (boolean), not 'device' parameter
+        # Device selection is handled internally by Cellpose when gpu=True
         use_gpu = gpu_id is not None
-        model = models.Cellpose(model_type=cellpose_model, gpu=use_gpu, device=gpu_id)
+        model = models.Cellpose(model_type=cellpose_model, gpu=use_gpu)
         
         # Run Cellpose
         masks, flows, styles, diams = model.eval(
@@ -728,6 +676,7 @@ def _build_feature_selection_dict(
             'aspect_ratio': True,
             'bbox_area_um2': True,
             'touches_border': True,
+            'touches_edge': True,
             'holes_count': True,
             'centroid_x': True,
             'centroid_y': True
@@ -871,6 +820,7 @@ def cluster(
     seed: int = 42,
     n_neighbors: int = 15,  # Number of neighbors for k-NN graph
     metric: str = "euclidean",  # Distance metric for k-NN graph
+    use_jaccard: bool = False,  # Use Jaccard similarity for edge weights (PhenoGraph-like)
     # K-means parameters
     n_init: int = 10,  # Number of initializations for K-means
     # HDBSCAN parameters
@@ -895,6 +845,7 @@ def cluster(
         seed: Random seed for reproducibility
         n_neighbors: Number of neighbors for k-NN graph construction (Leiden/Louvain only, default: 15)
         metric: Distance metric for k-NN graph (Leiden/Louvain only, default: "euclidean")
+        use_jaccard: Use Jaccard similarity for edge weights instead of inverse distance (PhenoGraph-like, default: False)
         n_init: Number of initializations for K-means (default: 10)
         min_cluster_size: Minimum cluster size for HDBSCAN (default: 10)
         min_samples: Minimum samples for HDBSCAN (default: 5)
@@ -1055,13 +1006,30 @@ def cluster(
         edges = []
         weights = []
         
-        for i in range(n):
-            for j_idx, neighbor_idx in enumerate(indices_knn[i]):
-                if neighbor_idx != i:  # Don't add self-loops
-                    edges.append((i, neighbor_idx))
-                    # Convert distance to similarity (inverse, normalized) - matching old GUI
-                    weight = 1.0 / (1.0 + distances_knn[i][j_idx])
-                    weights.append(weight)
+        if use_jaccard:
+            # Compute neighbor sets for Jaccard similarity (PhenoGraph-like)
+            # Each node's neighbor set includes itself and its k-nearest neighbors
+            neighbor_sets = [set(indices_knn[i]) | {i} for i in range(n)]
+            print(f"[CORE.CLUSTER] Leiden: Computed neighbor sets for Jaccard weighting")
+            
+            for i in range(n):
+                for j_idx, neighbor_idx in enumerate(indices_knn[i]):
+                    if neighbor_idx != i:  # Don't add self-loops
+                        edges.append((i, neighbor_idx))
+                        # Compute Jaccard similarity: |N(i) ∩ N(j)| / |N(i) ∪ N(j)|
+                        intersection = len(neighbor_sets[i] & neighbor_sets[neighbor_idx])
+                        union = len(neighbor_sets[i] | neighbor_sets[neighbor_idx])
+                        jaccard = intersection / union if union > 0 else 0.0
+                        weights.append(jaccard)
+        else:
+            # Use inverse distance weighting (default)
+            for i in range(n):
+                for j_idx, neighbor_idx in enumerate(indices_knn[i]):
+                    if neighbor_idx != i:  # Don't add self-loops
+                        edges.append((i, neighbor_idx))
+                        # Convert distance to similarity (inverse, normalized) - matching old GUI
+                        weight = 1.0 / (1.0 + distances_knn[i][j_idx])
+                        weights.append(weight)
         
         print(f"[CORE.CLUSTER] Leiden: Edge list creation took {time.time() - t0:.3f}s")
         print(f"[CORE.CLUSTER] Leiden: Created {len(edges)} edges from k-NN")
@@ -1125,13 +1093,30 @@ def cluster(
         edges = []
         weights = []
         
-        for i in range(n):
-            for j_idx, neighbor_idx in enumerate(indices_knn[i]):
-                if neighbor_idx != i:  # Don't add self-loops
-                    edges.append((i, neighbor_idx))
-                    # Convert distance to similarity (inverse, normalized)
-                    weight = 1.0 / (1.0 + distances_knn[i][j_idx])
-                    weights.append(weight)
+        if use_jaccard:
+            # Compute neighbor sets for Jaccard similarity (PhenoGraph-like)
+            # Each node's neighbor set includes itself and its k-nearest neighbors
+            neighbor_sets = [set(indices_knn[i]) | {i} for i in range(n)]
+            print(f"[CORE.CLUSTER] Louvain: Computed neighbor sets for Jaccard weighting")
+            
+            for i in range(n):
+                for j_idx, neighbor_idx in enumerate(indices_knn[i]):
+                    if neighbor_idx != i:  # Don't add self-loops
+                        edges.append((i, neighbor_idx))
+                        # Compute Jaccard similarity: |N(i) ∩ N(j)| / |N(i) ∪ N(j)|
+                        intersection = len(neighbor_sets[i] & neighbor_sets[neighbor_idx])
+                        union = len(neighbor_sets[i] | neighbor_sets[neighbor_idx])
+                        jaccard = intersection / union if union > 0 else 0.0
+                        weights.append(jaccard)
+        else:
+            # Use inverse distance weighting (default)
+            for i in range(n):
+                for j_idx, neighbor_idx in enumerate(indices_knn[i]):
+                    if neighbor_idx != i:  # Don't add self-loops
+                        edges.append((i, neighbor_idx))
+                        # Convert distance to similarity (inverse, normalized)
+                        weight = 1.0 / (1.0 + distances_knn[i][j_idx])
+                        weights.append(weight)
         
         print(f"[CORE.CLUSTER] Louvain: Edge list creation took {time.time() - t0:.3f}s")
         print(f"[CORE.CLUSTER] Louvain: Created {len(edges)} edges from k-NN")
@@ -1934,27 +1919,57 @@ def qc_analysis(
             if img is None:
                 continue
             
-            img_flat = img.flatten()
-            img_min = float(np.min(img_flat))
-            img_max = float(np.max(img_flat))
-            img_mean = float(np.mean(img_flat))
-            img_std = float(np.std(img_flat))
-            img_median = float(np.median(img_flat))
+            # Optimize: compute statistics more efficiently without flattening
+            # Use np.nanmin/nanmax for better performance on large arrays
+            img_min = float(np.min(img))
+            img_max = float(np.max(img))
+            img_mean = float(np.mean(img))
+            img_std = float(np.std(img))
+            # Median is expensive, compute only if needed
+            img_median = float(np.median(img))
             
             if mode == "pixel":
                 # Pixel-level QC using Otsu threshold
                 if _HAVE_SCIKIT_IMAGE:
                     try:
-                        threshold = threshold_otsu(img)
-                        signal_mask = img > threshold
-                        background_mask = img <= threshold
+                        # For very large images, consider downsampling for Otsu threshold
+                        # Otsu thresholding is O(n) but can be slow on huge images
+                        img_for_otsu = img
+                        downsample_factor = 1
+                        if img.size > 50_000_000:  # > ~7000x7000 pixels
+                            # Downsample by 2x for Otsu threshold calculation
+                            downsample_factor = 2
+                            from scipy import ndimage
+                            img_for_otsu = img[::downsample_factor, ::downsample_factor]
                         
-                        signal_mean = float(np.mean(img[signal_mask])) if np.any(signal_mask) else img_mean
-                        background_mean = float(np.mean(img[background_mask])) if np.any(background_mask) else img_mean
-                        background_std = float(np.std(img[background_mask])) if np.any(background_mask) else img_std
+                        threshold = threshold_otsu(img_for_otsu)
+                        # Scale threshold back if downsampled
+                        if downsample_factor > 1:
+                            # Threshold should be similar, but adjust if needed
+                            pass  # Otsu threshold is intensity-based, not position-based
+                        
+                        signal_mask = img > threshold
+                        # Optimize: only compute background_mask if needed, otherwise use ~signal_mask
+                        background_mask = ~signal_mask
+                        
+                        # Vectorized operations - faster than conditional indexing
+                        signal_pixels = img[signal_mask]
+                        background_pixels = img[background_mask]
+                        
+                        if len(signal_pixels) > 0:
+                            signal_mean = float(np.mean(signal_pixels))
+                        else:
+                            signal_mean = img_mean
+                        
+                        if len(background_pixels) > 0:
+                            background_mean = float(np.mean(background_pixels))
+                            background_std = float(np.std(background_pixels))
+                        else:
+                            background_mean = img_mean
+                            background_std = img_std
                         
                         snr = _calculate_snr(signal_mean, background_mean, background_std, img_min, img_max)
-                        coverage = float(np.sum(signal_mask) / signal_mask.size) if signal_mask.size > 0 else 0.0
+                        coverage = float(len(signal_pixels) / img.size) if img.size > 0 else 0.0
                     except Exception:
                         # Fallback if Otsu fails
                         signal_mean = img_mean
@@ -1995,40 +2010,82 @@ def qc_analysis(
                 if mask.shape != img.shape:
                     continue
                 
-                # Calculate metrics per cell
+                # Get unique cell IDs first (needed for both paths)
                 cell_ids = np.unique(mask[mask > 0])
                 if len(cell_ids) == 0:
                     continue
                 
-                cell_intensities = []
-                for cell_id in cell_ids:
-                    cell_mask = mask == cell_id
-                    cell_intensity = np.mean(img[cell_mask])
-                    cell_intensities.append(cell_intensity)
+                # Optimize: vectorized cell intensity calculation using scipy.ndimage
+                # This is much faster than looping through each cell
+                try:
+                    from scipy import ndimage as ndi
+                    
+                    # Vectorized calculation: use labeled_comprehension to compute mean intensity per cell
+                    # This computes mean intensity per cell in one pass (much faster than per-cell loops)
+                    cell_counts = ndi.labeled_comprehension(
+                        np.ones_like(img, dtype=np.float64),
+                        mask, cell_ids, np.sum, float, 0.0
+                    )
+                    cell_sums = ndi.labeled_comprehension(
+                        img.astype(np.float64),
+                        mask, cell_ids, np.sum, float, 0.0
+                    )
+                    
+                    # Avoid division by zero
+                    valid_cells = cell_counts > 0
+                    if np.any(valid_cells):
+                        cell_intensities = np.divide(
+                            cell_sums[valid_cells],
+                            cell_counts[valid_cells],
+                            out=np.zeros_like(cell_sums[valid_cells], dtype=np.float64),
+                            where=(cell_counts[valid_cells] > 0)
+                        )
+                        signal_mean = float(np.mean(cell_intensities))
+                        signal_std = float(np.std(cell_intensities))
+                    else:
+                        signal_mean = img_mean
+                        signal_std = img_std
+                    
+                except ImportError:
+                    # Fallback to optimized loop if scipy not available
+                    # Optimized: use boolean indexing more efficiently
+                    cell_mask = mask > 0
+                    cell_pixels = img[cell_mask]
+                    cell_mask_values = mask[cell_mask]
+                    
+                    # Group by cell_id using numpy operations
+                    cell_intensities = []
+                    for cell_id in cell_ids:
+                        # More efficient: use boolean indexing on already-masked arrays
+                        cell_intensity = np.mean(cell_pixels[cell_mask_values == cell_id])
+                        cell_intensities.append(cell_intensity)
+                    
+                    if len(cell_intensities) == 0:
+                        continue
+                    
+                    cell_intensities = np.array(cell_intensities)
+                    signal_mean = float(np.mean(cell_intensities))
+                    signal_std = float(np.std(cell_intensities))
                 
-                if len(cell_intensities) == 0:
-                    continue
-                
-                cell_intensities = np.array(cell_intensities)
-                signal_mean = float(np.mean(cell_intensities))
-                signal_std = float(np.std(cell_intensities))
-                
-                # Background is pixels outside cells
+                # Background is pixels outside cells - vectorized
                 background_mask = mask == 0
                 if np.any(background_mask):
-                    background_mean = float(np.mean(img[background_mask]))
-                    background_std = float(np.std(img[background_mask]))
+                    background_pixels = img[background_mask]
+                    background_mean = float(np.mean(background_pixels))
+                    background_std = float(np.std(background_pixels))
                 else:
                     background_mean = img_mean
                     background_std = img_std
                 
                 snr = _calculate_snr(signal_mean, background_mean, background_std, img_min, img_max)
                 
-                # Coverage: fraction of pixels covered by cells
-                coverage = float(np.sum(mask > 0) / mask.size) if mask.size > 0 else 0.0
+                # Coverage: fraction of pixels covered by cells - optimized
+                n_cell_pixels = np.sum(mask > 0)
+                coverage = float(n_cell_pixels / mask.size) if mask.size > 0 else 0.0
                 
                 # Cell density: cells per unit area (assuming pixels)
-                cell_density = float(len(cell_ids) / mask.size) if mask.size > 0 else 0.0
+                n_cells = len(cell_ids)
+                cell_density = float(n_cells / mask.size) if mask.size > 0 else 0.0
                 
                 results.append({
                     'acquisition_id': acquisition.id,
@@ -2047,7 +2104,7 @@ def qc_analysis(
                     'intensity_max': img_max,
                     'coverage': coverage,
                     'cell_density': cell_density,
-                    'n_cells': len(cell_ids)
+                    'n_cells': n_cells
                 })
         
         except Exception:
@@ -2641,7 +2698,7 @@ def dataframe_to_anndata(
         morpho_names = {
             'area_um2', 'perimeter_um', 'equivalent_diameter_um', 'eccentricity',
             'solidity', 'extent', 'circularity', 'major_axis_len_um', 'minor_axis_len_um',
-            'aspect_ratio', 'bbox_area_um2', 'touches_border', 'holes_count'
+            'aspect_ratio', 'bbox_area_um2', 'touches_border', 'touches_edge', 'holes_count'
         }
         morpho_cols = [col for col in all_feature_cols if col in morpho_names]
         feature_cols.extend(morpho_cols)

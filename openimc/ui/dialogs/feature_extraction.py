@@ -354,6 +354,7 @@ class FeatureExtractionDialog(QtWidgets.QDialog):
             'aspect_ratio': QtWidgets.QCheckBox("Aspect ratio (major/minor)"),
             'bbox_area_um2': QtWidgets.QCheckBox("Bounding box area (μm²)"),
             'touches_border': QtWidgets.QCheckBox("Touches border (boolean)"),
+            'touches_edge': QtWidgets.QCheckBox("Touches ROI edge (boolean)"),
             'holes_count': QtWidgets.QCheckBox("Number of holes"),
             'centroid_x': QtWidgets.QCheckBox("Centroid X coordinate (pixels)"),
             'centroid_y': QtWidgets.QCheckBox("Centroid Y coordinate (pixels)")

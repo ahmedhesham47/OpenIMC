@@ -748,6 +748,24 @@ class SegmentationDialog(QtWidgets.QDialog):
         self.gpu_info_label.setWordWrap(True)
         gpu_layout.addWidget(self.gpu_info_label)
         
+        # Number of workers for multiprocessing (Cellpose-specific)
+        import multiprocessing as mp
+        cpu_count = mp.cpu_count() if hasattr(mp, 'cpu_count') else 4
+        max_workers = max(1, cpu_count - 2)
+        
+        workers_row = QtWidgets.QHBoxLayout()
+        workers_row.addWidget(QtWidgets.QLabel("Number of workers:"))
+        self.num_workers_spin = QtWidgets.QSpinBox()
+        self.num_workers_spin.setRange(1, cpu_count)
+        self.num_workers_spin.setValue(max_workers)
+        self.num_workers_spin.setSuffix(" workers")
+        workers_row.addWidget(self.num_workers_spin)
+        workers_info = QtWidgets.QLabel("(For multiprocessing during loading/preprocessing)")
+        workers_info.setStyleSheet("QLabel { color: #666; font-size: 9pt; }")
+        workers_row.addWidget(workers_info)
+        workers_row.addStretch()
+        gpu_layout.addLayout(workers_row)
+        
         layout.addWidget(self.gpu_group)
         
         # Options
@@ -796,12 +814,6 @@ class SegmentationDialog(QtWidgets.QDialog):
         self.segment_missing_btn.setVisible(False)  # Only visible when masks directory is set
         options_layout.addWidget(self.segment_missing_btn)
         
-        # Warning for batch segmentation
-        self.batch_warning = QtWidgets.QLabel("⚠️ For batch segmentation, consider enabling 'Save segmentation masks' to preserve results")
-        self.batch_warning.setStyleSheet("QLabel { color: #d97706; font-size: 9pt; font-weight: bold; }")
-        self.batch_warning.setWordWrap(True)
-        self.batch_warning.setVisible(False)
-        options_layout.addWidget(self.batch_warning)
         
         # Info label for segment all
         self.segment_all_info = QtWidgets.QLabel("")
@@ -930,6 +942,11 @@ class SegmentationDialog(QtWidgets.QDialog):
     def get_save_masks(self):
         """Get whether to save masks."""
         return self.save_masks_chk.isChecked()
+    
+    
+    def get_num_workers(self):
+        """Get number of workers for Cellpose multiprocessing."""
+        return self.num_workers_spin.value()
     
     def _detect_and_populate_gpus(self):
         """Detect available GPUs and populate the combo box."""
@@ -1098,11 +1115,8 @@ class SegmentationDialog(QtWidgets.QDialog):
             else:
                 self.segment_all_info.setText("Will segment all acquisitions in the .mcd file. This may take a while.")
             
-            # Show warning about saving masks
-            self.batch_warning.setVisible(True)
         else:
             self.segment_all_info.setText("")
-            self.batch_warning.setVisible(False)
     
     def get_segment_all(self):
         """Get whether to segment all acquisitions."""
@@ -1496,6 +1510,7 @@ class SegmentationDialog(QtWidgets.QDialog):
     def get_cellsam_low_contrast_enhancement(self):
         """Get low_contrast_enhancement flag for CellSAM."""
         return self.low_contrast_enhancement_chk.isChecked()
+    
     
     def get_cellsam_gauge_cell_size(self):
         """Get gauge_cell_size flag for CellSAM."""

@@ -72,7 +72,7 @@ import yaml
 from openimc.data.mcd_loader import MCDLoader
 from openimc.data.ometiff_loader import OMETIFFLoader
 from openimc.processing.export_worker import process_channel_for_export
-from openimc.processing.feature_worker import extract_features_for_acquisition, _apply_denoise_to_channel
+from openimc.processing.feature_worker import extract_features_for_acquisition, _apply_denoise_to_channel, load_and_extract_features
 from openimc.processing.watershed_worker import watershed_segmentation
 from openimc.processing.batch_correction import apply_combat_correction, apply_harmony_correction, detect_batch_variable
 from openimc.processing.spillover_correction import load_spillover
@@ -358,44 +358,45 @@ def segment_command(args):
             except ValueError:
                 raise ValueError(f"Invalid cyto weights format: {args.cyto_weights}")
         
+        # Process individually
         for acq in acquisitions:
-            print(f"\nProcessing acquisition: {acq.name} (ID: {acq.id})")
+                print(f"\nProcessing acquisition: {acq.name} (ID: {acq.id})")
+                    
+                # Use core segment function
+                mask = segment(
+                    loader=loader,
+                    acquisition=acq,
+                    method=args.method,
+                    nuclear_channels=nuclear_channels,
+                    cyto_channels=cyto_channels if cyto_channels else None,
+                    output_dir=output_dir,
+                    denoise_settings=denoise_settings,
+                    normalization_method='arcsinh' if args.arcsinh else 'None',
+                    arcsinh_cofactor=args.arcsinh_cofactor if args.arcsinh else 1.0,
+                    percentile_params=(1.0, 99.0),
+                    nuclear_combo_method=args.nuclear_fusion_method,
+                    cyto_combo_method=args.cyto_fusion_method,
+                    nuclear_weights=nuclear_weights,
+                    cyto_weights=cyto_weights,
+                    # Cellpose parameters
+                    cellpose_model=args.model,
+                    diameter=args.diameter,
+                    flow_threshold=args.flow_threshold,
+                    cellprob_threshold=args.cellprob_threshold,
+                    gpu_id=args.gpu_id,
+                    # CellSAM parameters
+                    deepcell_api_key=args.deepcell_api_key,
+                    bbox_threshold=args.bbox_threshold,
+                    use_wsi=args.use_wsi,
+                    low_contrast_enhancement=args.low_contrast_enhancement,
+                    gauge_cell_size=args.gauge_cell_size,
+                    # Watershed parameters
+                    min_cell_area=args.min_cell_area,
+                    max_cell_area=args.max_cell_area,
+                    compactness=args.compactness
+                )
                 
-            # Use core segment function
-            mask = segment(
-                loader=loader,
-                acquisition=acq,
-                method=args.method,
-                nuclear_channels=nuclear_channels,
-                cyto_channels=cyto_channels if cyto_channels else None,
-                output_dir=output_dir,
-                denoise_settings=denoise_settings,
-                normalization_method='arcsinh' if args.arcsinh else 'None',
-                arcsinh_cofactor=args.arcsinh_cofactor if args.arcsinh else 1.0,
-                percentile_params=(1.0, 99.0),
-                nuclear_combo_method=args.nuclear_fusion_method,
-                cyto_combo_method=args.cyto_fusion_method,
-                nuclear_weights=nuclear_weights,
-                cyto_weights=cyto_weights,
-                # Cellpose parameters
-                cellpose_model=args.model,
-                diameter=args.diameter,
-                flow_threshold=args.flow_threshold,
-                cellprob_threshold=args.cellprob_threshold,
-                gpu_id=args.gpu_id,
-                # CellSAM parameters
-                deepcell_api_key=args.deepcell_api_key,
-                bbox_threshold=args.bbox_threshold,
-                use_wsi=args.use_wsi,
-                low_contrast_enhancement=args.low_contrast_enhancement,
-                gauge_cell_size=args.gauge_cell_size,
-                # Watershed parameters
-                min_cell_area=args.min_cell_area,
-                max_cell_area=args.max_cell_area,
-                compactness=args.compactness
-            )
-            
-            print(f"  ✓ Segmentation complete: {np.max(mask)} cells detected")
+                print(f"  ✓ Segmentation complete: {np.max(mask)} cells detected")
         
         print(f"\n✓ Segmentation complete! Output saved to: {output_dir}")
         
@@ -423,6 +424,7 @@ def extract_features_command(args):
             - denoise: Optional flag to apply denoising to all channels
             - denoise_method: Denoising method
             - denoise_settings: JSON file or string with per-channel denoise settings
+            - workers: Number of parallel workers (default: auto)
     
     Returns:
         CSV file containing extracted features with one row per cell.
@@ -437,6 +439,11 @@ def extract_features_command(args):
         
             openimc extract-features input.mcd features.csv \\
                 --mask output/masks/ --denoise all --denoise-method median3
+        
+        Extract with multiple workers::
+        
+            openimc extract-features input.mcd features.csv \\
+                --mask output/masks/ --workers 4
     """
     print(f"Loading data from: {args.input}")
     loader, loader_type = load_mcd(args.input, channel_format=getattr(args, 'channel_format', 'CHW'))
@@ -471,25 +478,123 @@ def extract_features_command(args):
         morphological = args.morphological if args.morphological or args.intensity else True
         intensity = args.intensity if args.morphological or args.intensity else True
         
-        # Use core extract_features function
-        combined_features = extract_features(
-            loader=loader,
-            acquisitions=acquisitions,
-            mask_path=args.mask,
-            output_path=args.output,
-            morphological=morphological,
-            intensity=intensity,
-            denoise_settings=denoise_settings,
-            arcsinh=args.arcsinh,
-            arcsinh_cofactor=args.arcsinh_cofactor if args.arcsinh else 1.0,
-            spillover_config=None,  # CLI doesn't support spillover correction yet
-            excluded_channels=None  # CLI doesn't support channel exclusion yet
-        )
+        # Build feature selection dict
+        from openimc.core import _build_feature_selection_dict
+        selected_features = _build_feature_selection_dict(morphological, intensity)
+        
+        # Determine number of workers
+        num_workers = normalize_workers(getattr(args, 'workers', None))
+        
+        # Close loader (will be reloaded in workers if using multiprocessing)
+        loader.close()
+        
+        # Use multiprocessing if multiple workers and multiple acquisitions
+        if num_workers > 1 and len(acquisitions) > 1:
+            print(f"Using {num_workers} parallel workers for {len(acquisitions)} acquisitions")
+            
+            # Prepare arguments for multiprocessing (same format as GUI)
+            # The core function will handle mask path resolution (directory vs single file)
+            mp_args = []
+            for acq in acquisitions:
+                # Prepare acquisition info dict
+                acq_info_dict = {
+                    'channels': acq.channels,
+                    'name': acq.name,
+                    'well': acq.well,
+                    'id': acq.id,
+                    'channel_metals': acq.channel_metals,
+                    'channel_labels': acq.channel_labels,
+                }
+                
+                mp_args.append((
+                    acq.id,
+                    None,  # mask array (None, using mask_path instead)
+                    args.mask,  # mask path (core function will handle directory vs file)
+                    selected_features,
+                    acq_info_dict,
+                    acq.well if acq.well else acq.name,  # acq_label
+                    args.input,  # file_path
+                    loader_type,
+                    args.arcsinh,  # arcsinh_enabled
+                    args.arcsinh_cofactor if args.arcsinh else 1.0,  # cofactor
+                    "custom" if denoise_settings else "None",  # denoise_source
+                    denoise_settings if denoise_settings else None,  # custom_denoise_settings
+                    None,  # spillover_config
+                    acq.source_file if hasattr(acq, 'source_file') else None,  # source_file
+                    None  # excluded_channels
+                ))
+            
+            # Use multiprocessing (same approach as GUI)
+            ctx = mp.get_context('spawn')
+            with ctx.Pool(processes=num_workers) as pool:
+                futures = []
+                for worker_args in mp_args:
+                    future = pool.apply_async(load_and_extract_features, worker_args)
+                    futures.append(future)
+                
+                # Collect results
+                all_features = []
+                for i, future in enumerate(futures):
+                    try:
+                        result = future.get(timeout=600)  # 10 minute timeout per task
+                        if not result.empty:
+                            all_features.append(result)
+                            print(f"  Processed acquisition {i+1}/{len(futures)}")
+                    except Exception as e:
+                        print(f"  Error processing acquisition {i+1}: {e}")
+                        import traceback
+                        traceback.print_exc()
+            
+            # Combine all features
+            if len(all_features) > 1:
+                combined_features = pd.concat(all_features, ignore_index=True)
+            elif len(all_features) == 1:
+                combined_features = all_features[0]
+            else:
+                combined_features = pd.DataFrame()
+            
+            # Apply arcsinh transformation if requested (after combining all acquisitions)
+            if args.arcsinh:
+                from openimc.ui.utils import arcsinh_normalize
+                # Apply arcsinh to intensity features
+                intensity_cols = [col for col in combined_features.columns 
+                                 if any(col.endswith(f'_{ft}') for ft in ['mean', 'median', 'std', 'mad', 'p10', 'p90', 'integrated'])]
+                if intensity_cols:
+                    combined_features[intensity_cols] = arcsinh_normalize(
+                        combined_features[intensity_cols], 
+                        cofactor=args.arcsinh_cofactor
+                    )
+        else:
+            # Single-threaded execution (use core function directly)
+            print(f"Processing {len(acquisitions)} acquisition(s) sequentially")
+            loader, loader_type = load_mcd(args.input, channel_format=getattr(args, 'channel_format', 'CHW'))
+            try:
+                combined_features = extract_features(
+                    loader=loader,
+                    acquisitions=acquisitions,
+                    mask_path=args.mask,
+                    output_path=None,  # We'll save manually
+                    morphological=morphological,
+                    intensity=intensity,
+                    denoise_settings=denoise_settings,
+                    arcsinh=args.arcsinh,
+                    arcsinh_cofactor=args.arcsinh_cofactor if args.arcsinh else 1.0,
+                    spillover_config=None,  # CLI doesn't support spillover correction yet
+                    excluded_channels=None  # CLI doesn't support channel exclusion yet
+                )
+            finally:
+                loader.close()
+        
+        # Save to output file
+        if args.output:
+            combined_features.to_csv(args.output, index=False)
         
         print(f"✓ Feature extraction complete! Extracted {len(combined_features)} cells")
         
-    finally:
-        loader.close()
+    except Exception as e:
+        if hasattr(loader, 'close'):
+            loader.close()
+        raise
 
 
 def cluster_command(args):
@@ -548,6 +653,7 @@ def cluster_command(args):
         seed=args.seed,
         n_neighbors=args.n_neighbors,
         metric=args.metric,
+        use_jaccard=getattr(args, 'use_jaccard', False),
         # K-means parameters
         n_init=args.n_init,
         # HDBSCAN parameters
@@ -2249,6 +2355,7 @@ Examples:
     cluster_parser.add_argument('--resolution', type=float, default=1.0, help='Resolution parameter for Leiden clustering (default: 1.0)')
     cluster_parser.add_argument('--n-neighbors', type=int, default=15, help='Number of neighbors for k-NN graph (Leiden/Louvain only, default: 15)')
     cluster_parser.add_argument('--metric', choices=['euclidean', 'manhattan', 'cosine'], default='euclidean', help='Distance metric for k-NN graph (Leiden/Louvain only, default: euclidean)')
+    cluster_parser.add_argument('--use-jaccard', action='store_true', help='Use Jaccard similarity for edge weights (PhenoGraph-like implementation, Leiden/Louvain only)')
     cluster_parser.add_argument('--n-init', type=int, default=10, help='Number of initializations for K-means (default: 10)')
     cluster_parser.add_argument('--min-cluster-size', type=int, default=10, help='Minimum cluster size (hdbscan, default: 10)')
     cluster_parser.add_argument('--min-samples', type=int, default=5, help='Minimum samples (hdbscan, default: 5)')

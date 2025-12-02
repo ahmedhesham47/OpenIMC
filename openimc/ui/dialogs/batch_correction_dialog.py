@@ -61,7 +61,15 @@ class BatchCorrectionDialog(QtWidgets.QDialog):
         super().__init__(parent)
         self.setWindowTitle("Batch Correction")
         self.setModal(True)
-        self.resize(900, 700)
+        
+        # Set dialog size to match parent window height
+        if parent:
+            parent_size = parent.size()
+            dialog_width = int(parent_size.width() * 0.8)
+            dialog_height = parent_size.height()  # Same height as main window
+            self.resize(dialog_width, dialog_height)
+        else:
+            self.resize(900, 700)
         
         self.feature_dataframe = feature_dataframe
         self.corrected_dataframe: Optional[pd.DataFrame] = None

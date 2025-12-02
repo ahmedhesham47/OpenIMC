@@ -175,8 +175,8 @@ class PlotConfigDialog(QtWidgets.QDialog):
         self.heatmap_scaling_label = QtWidgets.QLabel("Scaling:")
         heatmap_options_layout.addWidget(self.heatmap_scaling_label)
         self.heatmap_scaling_combo = QtWidgets.QComboBox()
-        self.heatmap_scaling_combo.addItems(["Z-score", "MAD (Median Absolute Deviation)", "None (no scaling)"])
-        self.heatmap_scaling_combo.setCurrentText("Z-score")
+        self.heatmap_scaling_combo.addItems(["None (no scaling)", "Z-score", "MAD (Median Absolute Deviation)"])
+        self.heatmap_scaling_combo.setCurrentText("None (no scaling)")
         heatmap_options_layout.addWidget(self.heatmap_scaling_combo)
         heatmap_options_layout.addStretch()
         heatmap_layout.addLayout(heatmap_options_layout)
@@ -470,7 +470,9 @@ class PlotConfigDialog(QtWidgets.QDialog):
         # Manually update enabled state without triggering signals
         self.patient_annotation_column_label.setEnabled(is_checked)
         self.patient_annotation_column_combo.setEnabled(is_checked)
-        self.patient_annotate_btn.setEnabled(is_checked)
+        # Enable button only if checked and a patient column is available
+        has_patient_col = self.patient_annotation_column_combo.count() > 0
+        self.patient_annotate_btn.setEnabled(is_checked and has_patient_col)
         self.legend_label_edit.setEnabled(is_checked)
         
         # Populate legend label
@@ -527,7 +529,23 @@ class PlotConfigDialog(QtWidgets.QDialog):
         is_checked = (state == 2)
         self.patient_annotation_column_label.setEnabled(is_checked)
         self.patient_annotation_column_combo.setEnabled(is_checked)
-        self.patient_annotate_btn.setEnabled(is_checked)
+        # Enable button only if checked and a patient column is available
+        has_patient_col = False
+        if self.patient_annotation_column_combo.count() > 0:
+            has_patient_col = True
+        else:
+            # Check if parent dialog has patient annotation columns
+            if hasattr(self.parent_dialog, 'feature_dataframe') and self.parent_dialog.feature_dataframe is not None:
+                # Check for standard columns
+                for col in ['source_file', 'batch_group', 'source_well']:
+                    if col in self.parent_dialog.feature_dataframe.columns:
+                        has_patient_col = True
+                        break
+                # Check metadata columns if no standard columns found
+                if not has_patient_col and hasattr(self.parent_dialog, '_get_metadata_columns'):
+                    metadata_cols = self.parent_dialog._get_metadata_columns(self.parent_dialog.feature_dataframe)
+                    has_patient_col = len(metadata_cols) > 0
+        self.patient_annotate_btn.setEnabled(is_checked and has_patient_col)
     
     def _open_patient_annotation_dialog(self):
         """Open patient annotation dialog."""
@@ -594,6 +612,13 @@ class PlotConfigDialog(QtWidgets.QDialog):
             selected_column = self.patient_annotation_column_combo.currentData()
             if selected_column:
                 self.parent_dialog.patient_annotation_column = selected_column
+                # Also update group_by_combo in stacked bars if the column is available
+                if hasattr(self.parent_dialog, 'group_by_combo'):
+                    # Check if the selected column exists in group_by_combo
+                    for i in range(self.parent_dialog.group_by_combo.count()):
+                        if self.parent_dialog.group_by_combo.itemText(i) == selected_column:
+                            self.parent_dialog.group_by_combo.setCurrentIndex(i)
+                            break
         
         # Legend label
         if hasattr(self.parent_dialog, 'patient_legend_label'):

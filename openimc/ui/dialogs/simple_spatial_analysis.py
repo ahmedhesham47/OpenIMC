@@ -404,14 +404,67 @@ class SimpleSpatialAnalysisDialog(QtWidgets.QDialog):
         
     
     def _get_filtered_dataframe(self):
-        """Get the filtered dataframe based on selected source files."""
+        """Get the filtered dataframe based on selected source files and cell filters."""
         df = self.feature_dataframe.copy()
+        
+        # Apply source file filtering
         if ('source_file' in df.columns and 
             hasattr(self, 'selected_source_files') and 
             self.selected_source_files and 
             len(self.selected_source_files) > 0):
             df = df[df['source_file'].isin(self.selected_source_files)]
+        
+        # Apply cell filters from clustering dialog if available
+        filter_settings = self._get_filter_settings_from_parent()
+        if filter_settings:
+            df = self._apply_cell_filters(df, filter_settings)
+        
         return df
+    
+    def _get_filter_settings_from_parent(self):
+        """Get filter settings from parent's clustering dialog if available."""
+        parent = self.parent()
+        if parent is not None and hasattr(parent, 'clustering_dialog'):
+            clustering_dialog = parent.clustering_dialog
+            if clustering_dialog is not None and hasattr(clustering_dialog, 'filter_settings'):
+                return clustering_dialog.filter_settings
+        return None
+    
+    def _apply_cell_filters(self, df, filter_settings):
+        """Apply cell filtering based on filter settings.
+        
+        Args:
+            df: DataFrame to filter
+            filter_settings: Dictionary with filter settings
+        
+        Returns:
+            Filtered DataFrame
+        """
+        if filter_settings is None:
+            return df
+        
+        filtered_df = df.copy()
+        
+        # Exclude cells touching edge
+        if filter_settings.get('exclude_edge_cells', False):
+            if 'touches_edge' in filtered_df.columns:
+                # Use .eq(False) instead of ~ to avoid numpy boolean subtraction issues
+                filtered_df = filtered_df[filtered_df['touches_edge'].astype(bool).eq(False)]
+            elif 'touches_border' in filtered_df.columns:
+                # Fallback to touches_border if touches_edge not available
+                filtered_df = filtered_df[filtered_df['touches_border'].astype(bool).eq(False)]
+        
+        # Filter by area
+        if 'area_um2' in filtered_df.columns:
+            min_area = filter_settings.get('min_area')
+            max_area = filter_settings.get('max_area')
+            
+            if min_area is not None:
+                filtered_df = filtered_df[filtered_df['area_um2'] >= min_area]
+            if max_area is not None:
+                filtered_df = filtered_df[filtered_df['area_um2'] <= max_area]
+        
+        return filtered_df
     
     def _get_source_files_for_logging(self):
         """Get source file names from the filtered dataframe for logging."""

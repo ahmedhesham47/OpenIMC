@@ -32,6 +32,34 @@ import sys
 import time
 from typing import Optional
 
+
+class CUDAMemoryError(Exception):
+    """Custom exception for CUDA out-of-memory errors during segmentation.
+    
+    This exception is raised when CUDA runs out of memory during segmentation.
+    It includes a helpful message recommending batch size reduction.
+    """
+    def __init__(self, message: str, batch_size: int = None):
+        super().__init__(message)
+        self.batch_size = batch_size
+        self.recommended_batch_size = max(1, (batch_size // 2) if batch_size else 1)
+    
+    def __str__(self):
+        base_msg = super().__str__()
+        if self.batch_size is not None:
+            return (
+                f"{base_msg}\n\n"
+                f"CUDA out of memory error occurred during segmentation.\n"
+                f"Current batch size: {self.batch_size}\n"
+                f"Recommendation: Reduce the batch size to {self.recommended_batch_size} or lower.\n"
+                f"You can adjust the batch size in the segmentation dialog."
+            )
+        return (
+            f"{base_msg}\n\n"
+            f"CUDA out of memory error occurred during segmentation.\n"
+            f"Recommendation: Reduce the batch size in the segmentation dialog."
+        )
+
 # CRITICAL: Configure dask BEFORE any dask imports
 # This ensures compatibility with squidpy/spatialdata
 os.environ.setdefault('DASK_DATAFRAME__QUERY_PLANNING', 'False')
@@ -52,31 +80,7 @@ try:
 except ImportError:
     _HAVE_PSUTIL = False
 
-# Import memory debugging function from core if available
-try:
-    from openimc.core import _log_memory_debug
-except ImportError:
-    # Fallback: define our own memory debugging function
-    def _get_memory_usage_mb():
-        """Get current memory usage in MB."""
-        if _HAVE_PSUTIL:
-            process = psutil.Process(os.getpid())
-            return process.memory_info().rss / 1024 / 1024
-        else:
-            # Fallback: approximate using sys.getsizeof
-            return sys.getsizeof(gc.get_objects()) / 1024 / 1024
-    
-    def _log_memory_debug(message, obj=None, obj_name=None):
-        """Log memory usage with optional object info."""
-        mem_mb = _get_memory_usage_mb()
-        if obj is not None and obj_name:
-            if isinstance(obj, np.ndarray):
-                obj_size_mb = obj.nbytes / 1024 / 1024
-                print(f"[CUSTOM_CELLSAM] {message} | Memory: {mem_mb:.1f} MB | {obj_name}: {obj.shape} {obj.dtype} ({obj_size_mb:.2f} MB)")
-            else:
-                print(f"[CUSTOM_CELLSAM] {message} | Memory: {mem_mb:.1f} MB | {obj_name}: {type(obj).__name__}")
-        else:
-            print(f"[CUSTOM_CELLSAM] {message} | Memory: {mem_mb:.1f} MB")
+# Memory debugging removed - no longer used
 
 try:
     import dask.array as da
@@ -87,12 +91,20 @@ except ImportError:
 # Import necessary functions from cellSAM
 try:
     from cellSAM import get_model, get_local_model, segment_cellular_image
+    from cellSAM.utils import (
+        format_image_shape,
+        fill_holes_and_remove_small_masks,
+        subtract_boundaries,
+    )
     _HAVE_CELLSAM = True
 except (ImportError, OSError):
     _HAVE_CELLSAM = False
     get_model = None
     get_local_model = None
     segment_cellular_image = None
+    format_image_shape = None
+    fill_holes_and_remove_small_masks = None
+    subtract_boundaries = None
 
 # Import dask_image and skimage helpers
 try:
@@ -165,6 +177,45 @@ def segment_chunk(chunk, model=None, **kwargs):
         mask = np.zeros(chunk.shape[:-1], dtype=np.int64)
     
     return (mask.astype(np.int32), mask.max())
+
+
+def _postprocess_predictions(all_masks: np.ndarray):
+    """Postprocess segmentation predictions using morphological operations.
+    
+    This is a reimplementation of the postprocess_predictions function from CellSAM.
+    """
+    from skimage.morphology import (
+        disk,
+        binary_opening,
+        binary_closing,
+        binary_erosion,
+        binary_dilation,
+    )
+    from scipy.ndimage import gaussian_filter
+    from segment_anything.utils.amg import remove_small_regions
+    
+    mask_values = np.unique(all_masks)
+    new_masks = []
+    selem = disk(2)
+    for mask_value in mask_values[1:]:  # Skip background (0)
+        mask = all_masks == mask_value
+        mask, _ = remove_small_regions(mask, 20, mode="holes")
+        mask, _ = remove_small_regions(mask, 20, mode="islands")
+        opened_mask = binary_opening(mask, selem)
+        closed_mask = binary_closing(opened_mask, selem)
+        mask = closed_mask
+        selem = disk(10)
+        mask = binary_dilation(mask, selem)
+        mask = binary_erosion(mask, selem)
+        mask = gaussian_filter(mask.astype(np.float32), sigma=3)
+        mask = mask > 0.5
+        mask = mask.astype(np.uint8) * mask_value
+        new_masks.append(mask)
+    
+    if len(new_masks) == 0:
+        return np.zeros_like(all_masks, dtype=np.uint8)
+    
+    return np.max(new_masks, axis=0)
 
 
 def is_low_contrast_clahe(image, lower_threshold=0.04, upper_threshold=0.05, kernel_size=256):
@@ -463,7 +514,6 @@ def _get_cached_model(model_path: Optional[str] = None, bbox_threshold: float = 
     
     # Check if we need to create or update the cached model
     if _CACHED_MODEL is None:
-        _log_memory_debug(f"Creating new CellSAM model instance")
         # Create new model
         if model_path is not None:
             if get_local_model is None:
@@ -478,9 +528,7 @@ def _get_cached_model(model_path: Optional[str] = None, bbox_threshold: float = 
         _CACHED_MODEL.eval()
         _CACHED_MODEL_DEVICE = device
         _CACHED_MODEL_BBOX_THRESHOLD = bbox_threshold
-        _log_memory_debug(f"Model cached | model_id={id(_CACHED_MODEL)}")
     else:
-        _log_memory_debug(f"Reusing cached model | model_id={id(_CACHED_MODEL)}")
         # Reuse existing model, but update bbox_threshold if needed
         if _CACHED_MODEL_BBOX_THRESHOLD != bbox_threshold:
             _CACHED_MODEL.bbox_threshold = bbox_threshold
@@ -591,7 +639,6 @@ def segment_wsi_custom(
         block_labeled, iou_depth, boundary=boundary
     )
     result = block_labeled.compute()
-    _log_memory_debug(f"WSI segmentation complete", result, "wsi_labels")
     return result
 
 
@@ -725,7 +772,6 @@ def cellsam_pipeline_custom(
             raise ImportError("CellSAM not installed. segment_cellular_image not available.")
         labels = segment_cellular_image(inp, model=model, normalize=True, device=device)[0]
     
-    _log_memory_debug(f"CellSAM segmentation complete", labels, "labels")
     return labels
 
 

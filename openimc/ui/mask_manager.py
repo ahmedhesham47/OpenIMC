@@ -65,6 +65,9 @@ class DynamicMaskManager:
     
     def set_masks_directory(self, directory: str):
         """Set the directory where masks are stored."""
+        # If directory is changing, clear all existing masks from memory
+        if self.masks_directory and self.masks_directory != directory:
+            self.clear_all_masks()
         self.masks_directory = directory
         if directory and not os.path.exists(directory):
             os.makedirs(directory, exist_ok=True)
@@ -139,33 +142,19 @@ class DynamicMaskManager:
             acq_info: Optional AcquisitionInfo for generating filename
             masks_directory: Optional directory to save masks (overrides self.masks_directory)
         """
-        try:
-            from openimc.core import _log_memory_debug
-        except ImportError:
-            def _log_memory_debug(msg, obj=None, obj_name=None):
-                if obj is not None and obj_name and isinstance(obj, np.ndarray):
-                    obj_size_mb = obj.nbytes / 1024 / 1024
-                    print(f"[MASK_MGR] {msg} | {obj_name}: {obj.shape} {obj.dtype} ({obj_size_mb:.2f} MB)")
-                else:
-                    print(f"[MASK_MGR] {msg}")
-        
-        _log_memory_debug(f"[MASK_MGR] set_mask called for {acq_id}, save_to_disk={save_to_disk}, force_disk_storage={self.force_disk_storage}", mask, "input_mask")
         save_dir = masks_directory or self.masks_directory
         
         # If we're forcing disk storage or explicitly requested, save to disk
         if self.force_disk_storage or save_to_disk:
             if save_dir:
-                _log_memory_debug(f"[MASK_MGR] Saving mask to disk for {acq_id}")
                 mask_path = self._save_mask_to_disk(acq_id, mask, save_dir, acq_info)
                 if mask_path:
                     self._mask_file_paths[acq_id] = mask_path
-                    _log_memory_debug(f"[MASK_MGR] Mask saved to {mask_path} for {acq_id}")
                     # Don't keep in memory if we're forcing disk storage
                     if self.force_disk_storage:
                         # Explicitly clear any existing in-memory references
                         self._in_memory_masks.pop(acq_id, None)
                         self._memory_cache.pop(acq_id, None)
-                        _log_memory_debug(f"[MASK_MGR] Mask NOT kept in memory (force_disk_storage=True) for {acq_id}")
                         return
             else:
                 # Can't save to disk without directory
@@ -176,13 +165,18 @@ class DynamicMaskManager:
         if not self.force_disk_storage:
             self._in_memory_masks[acq_id] = mask
             self._add_to_cache(acq_id, mask)
-            _log_memory_debug(f"[MASK_MGR] Mask kept in memory for {acq_id}", mask, "stored_mask")
     
     def remove_mask(self, acq_id: str):
         """Remove mask from memory and cache (does not delete disk files)."""
         self._in_memory_masks.pop(acq_id, None)
         self._memory_cache.pop(acq_id, None)
         # Keep file path in case we need to reload
+    
+    def clear_all_masks(self):
+        """Clear all masks from memory, cache, and file paths (does not delete disk files)."""
+        self._in_memory_masks.clear()
+        self._memory_cache.clear()
+        self._mask_file_paths.clear()
     
     def clear_memory_cache(self):
         """Clear the memory cache (keeps file paths)."""
@@ -278,17 +272,6 @@ class DynamicMaskManager:
                           acq_info=None) -> Optional[str]:
         """Save mask to disk and return the file path."""
         try:
-            from openimc.core import _log_memory_debug
-        except ImportError:
-            def _log_memory_debug(msg, obj=None, obj_name=None):
-                if obj is not None and obj_name and isinstance(obj, np.ndarray):
-                    obj_size_mb = obj.nbytes / 1024 / 1024
-                    print(f"[MASK_MGR] {msg} | {obj_name}: {obj.shape} {obj.dtype} ({obj_size_mb:.2f} MB)")
-                else:
-                    print(f"[MASK_MGR] {msg}")
-        
-        _log_memory_debug(f"[MASK_MGR] _save_mask_to_disk called for {acq_id}", mask, "mask_to_save")
-        try:
             if not os.path.exists(masks_directory):
                 os.makedirs(masks_directory, exist_ok=True)
             
@@ -317,13 +300,11 @@ class DynamicMaskManager:
             filepath = os.path.join(masks_directory, filename)
             
             # Save mask
-            _log_memory_debug(f"[MASK_MGR] Writing mask to {filepath} for {acq_id}")
             if _HAVE_TIFFFILE:
                 tifffile.imwrite(filepath, mask.astype(np.uint16), compression='lzw')
             else:
                 from PIL import Image
                 Image.fromarray(mask.astype(np.uint16)).save(filepath)
-            _log_memory_debug(f"[MASK_MGR] Mask written to disk successfully for {acq_id}")
             
             return filepath
         except Exception as e:
