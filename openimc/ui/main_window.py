@@ -1807,14 +1807,29 @@ class MainWindow(QtWidgets.QMainWindow):
             # Restore previous assignment if valid, otherwise use default
             prev_color = prev_assignments.get(ch, default_color)
             if prev_color in self.available_colors:
-                color_combo.setCurrentText(prev_color)
+                initial_color = prev_color
             else:
-                color_combo.setCurrentIndex(0)
-            color_combo.currentTextChanged.connect(lambda text, ch_name=ch: self._on_channel_color_changed(ch_name, text))
+                # Previous color not valid in current mode, use default
+                initial_color = self.available_colors[0]
+            
+            # Block signals on combo box during setup to avoid triggering during initialization
+            color_combo.blockSignals(True)
+            # Set the current text
+            color_combo.setCurrentText(initial_color)
+            color_combo.blockSignals(False)
+            
+            # Connect signal after setting initial value and unblocking signals
+            # Use a closure to properly capture the channel name
+            def make_color_changed_handler(channel_name):
+                def handler(text):
+                    self._on_channel_color_changed(channel_name, text)
+                return handler
+            
+            color_combo.currentTextChanged.connect(make_color_changed_handler(ch))
             self.channel_color_table.setCellWidget(row, 1, color_combo)
             
-            # Store assignment
-            self.channel_color_assignments[ch] = color_combo.currentText()
+            # Store assignment with the actual current value
+            self.channel_color_assignments[ch] = initial_color
         
         self.channel_color_table.blockSignals(False)
         
@@ -1883,7 +1898,37 @@ class MainWindow(QtWidgets.QMainWindow):
     
     def _on_channel_color_changed(self, channel_name: str, color_name: str):
         """Handle color assignment change for a channel."""
+        # Update the assignment
         self.channel_color_assignments[channel_name] = color_name
+        
+        # Also update the legacy RGB lists for backward compatibility
+        is_multicolor = self.multicolor_mode_chk.isChecked()
+        if not is_multicolor:
+            # In RGB mode, update the legacy lists based on color assignment
+            # Clear the channel from all lists first
+            for lst in [self.red_list, self.green_list, self.blue_list]:
+                for i in range(lst.count()):
+                    item = lst.item(i)
+                    if item.text() == channel_name:
+                        lst.takeItem(i)
+                        break
+            
+            # Add to the appropriate list based on color
+            if color_name == 'Red':
+                target_list = self.red_list
+            elif color_name == 'Green':
+                target_list = self.green_list
+            elif color_name == 'Blue':
+                target_list = self.blue_list
+            else:
+                target_list = self.red_list  # Default
+            
+            # Add to target list
+            it = QtWidgets.QListWidgetItem(channel_name)
+            it.setFlags(it.flags() | Qt.ItemIsUserCheckable | Qt.ItemIsEnabled)
+            it.setCheckState(Qt.Checked)
+            target_list.addItem(it)
+        
         # Update view if not in grid mode
         if not self.grid_view_chk.isChecked():
             if not self.preserve_zoom:
@@ -1892,6 +1937,21 @@ class MainWindow(QtWidgets.QMainWindow):
     
     def _on_multicolor_mode_toggled(self):
         """Handle toggle between RGB mode and multicolor mode."""
+        # Clear invalid color assignments when switching modes
+        is_multicolor = self.multicolor_mode_chk.isChecked()
+        if is_multicolor:
+            valid_colors = set(self.available_colors_multicolor)
+        else:
+            valid_colors = set(self.available_colors_rgb)
+        
+        # Remove assignments that aren't valid in the new mode
+        invalid_channels = []
+        for ch, color in list(self.channel_color_assignments.items()):
+            if color not in valid_colors:
+                invalid_channels.append(ch)
+        for ch in invalid_channels:
+            del self.channel_color_assignments[ch]
+        
         # Repopulate the color assignment table with the correct colors
         selected_channels = self._selected_channels()
         if selected_channels:
