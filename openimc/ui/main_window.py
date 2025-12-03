@@ -120,6 +120,7 @@ from openimc.ui.utils import (
     channelwise_minmax_normalize,
     stack_to_rgb,
     combine_channels,
+    additive_blend_channels,
 )
 from openimc.ui.dialogs.progress_dialog import ProgressDialog
 from openimc.ui.dialogs.gpu_selection_dialog import GPUSelectionDialog
@@ -917,7 +918,7 @@ class MainWindow(QtWidgets.QMainWindow):
         self.channel_scaling = {}  # {channel_name: {'min': value, 'max': value}}
         
         # Store RGB color scaling values (for RGB mode)
-        self.rgb_color_scaling = {}  # {'Red': {'min': value, 'max': value}, 'Green': {...}, 'Blue': {...}}
+        self.rgb_color_scaling = {}  # {'Red': {'min': value, 'max': value}, 'Teal': {...}, 'Blue': {...}}
         
         # Arcsinh normalization state
         self.arcsinh_enabled = False
@@ -958,50 +959,44 @@ class MainWindow(QtWidgets.QMainWindow):
         self.spatial_dialog = None  # Store spatial analysis dialog instance
         self.segmentation_dialog = None  # Store segmentation dialog instance
         
-        # Color assignment for RGB composite
+        # Color assignment for multi-channel composite (additive blending)
         self.color_assignment_frame = QtWidgets.QFrame()
         self.color_assignment_frame.setFrameStyle(QtWidgets.QFrame.Box)
         color_layout = QtWidgets.QVBoxLayout(self.color_assignment_frame)
-        color_layout.addWidget(QtWidgets.QLabel("Color Assignment (for RGB composite):"))
+        color_layout.addWidget(QtWidgets.QLabel("Channel Color Assignment (for multi-channel composite):"))
         
-        # Red channel selection with search
-        red_block = QtWidgets.QVBoxLayout()
-        red_block.addWidget(QtWidgets.QLabel("Red:"))
-        self.red_search = QtWidgets.QLineEdit()
-        self.red_search.setPlaceholderText("Search red channels...")
-        self.red_search.textChanged.connect(self._filter_red_channels)
-        red_block.addWidget(self.red_search)
+        # Search box for filtering channels
+        self.channel_color_search = QtWidgets.QLineEdit()
+        self.channel_color_search.setPlaceholderText("Search channels...")
+        self.channel_color_search.textChanged.connect(self._filter_channel_color_table)
+        color_layout.addWidget(self.channel_color_search)
+        
+        # Create table for channel-to-color mapping
+        self.channel_color_table = QtWidgets.QTableWidget()
+        self.channel_color_table.setColumnCount(2)
+        self.channel_color_table.setHorizontalHeaderLabels(["Channel", "Color"])
+        self.channel_color_table.horizontalHeader().setStretchLastSection(True)
+        # Set height to show at least 3 rows (header ~30px + 3 rows ~75px = ~105px, add padding)
+        self.channel_color_table.setMinimumHeight(120)
+        self.channel_color_table.setMaximumHeight(400)
+        self.channel_color_table.setSelectionBehavior(QtWidgets.QAbstractItemView.SelectRows)
+        self.channel_color_table.verticalHeader().setVisible(False)
+        color_layout.addWidget(self.channel_color_table)
+        
+        # Store channel color assignments (channel_name -> color_name)
+        self.channel_color_assignments = {}
+        
+        # Available colors for assignment
+        self.available_colors = ['Blue', 'Teal', 'Yellow', 'Magenta', 'Red', 'White']
+        
+        # Legacy support: keep old lists for backward compatibility during transition
+        # These will be populated from the table when needed
         self.red_list = QtWidgets.QListWidget()
-        self.red_list.setMaximumHeight(80)
-        self.red_list.itemChanged.connect(lambda _i: self._on_rgb_list_changed())
-        red_block.addWidget(self.red_list)
-        color_layout.addLayout(red_block)
-        
-        # Green channel selection with search
-        green_block = QtWidgets.QVBoxLayout()
-        green_block.addWidget(QtWidgets.QLabel("Green:"))
-        self.green_search = QtWidgets.QLineEdit()
-        self.green_search.setPlaceholderText("Search green channels...")
-        self.green_search.textChanged.connect(self._filter_green_channels)
-        green_block.addWidget(self.green_search)
         self.green_list = QtWidgets.QListWidget()
-        self.green_list.setMaximumHeight(80)
-        self.green_list.itemChanged.connect(lambda _i: self._on_rgb_list_changed())
-        green_block.addWidget(self.green_list)
-        color_layout.addLayout(green_block)
-        
-        # Blue channel selection with search
-        blue_block = QtWidgets.QVBoxLayout()
-        blue_block.addWidget(QtWidgets.QLabel("Blue:"))
-        self.blue_search = QtWidgets.QLineEdit()
-        self.blue_search.setPlaceholderText("Search blue channels...")
-        self.blue_search.textChanged.connect(self._filter_blue_channels)
-        blue_block.addWidget(self.blue_search)
         self.blue_list = QtWidgets.QListWidget()
-        self.blue_list.setMaximumHeight(80)
-        self.blue_list.itemChanged.connect(lambda _i: self._on_rgb_list_changed())
-        blue_block.addWidget(self.blue_list)
-        color_layout.addLayout(blue_block)
+        self.red_search = QtWidgets.QLineEdit()
+        self.green_search = QtWidgets.QLineEdit()
+        self.blue_search = QtWidgets.QLineEdit()
 
         # Metadata display (more compact for smaller screens)
         self.metadata_text = QtWidgets.QTextEdit()
@@ -1765,28 +1760,115 @@ class MainWindow(QtWidgets.QMainWindow):
             self.reset_zoom_btn.click()
 
     def _populate_color_assignments(self, channels: List[str]):
-        """Populate the color assignment dropdowns with selected channels only."""
-        # Clear existing items
-        # Preserve current checks
-        prev_red = {self.red_list.item(i).text(): self.red_list.item(i).checkState() == Qt.Checked for i in range(self.red_list.count())}
-        prev_green = {self.green_list.item(i).text(): self.green_list.item(i).checkState() == Qt.Checked for i in range(self.green_list.count())}
-        prev_blue = {self.blue_list.item(i).text(): self.blue_list.item(i).checkState() == Qt.Checked for i in range(self.blue_list.count())}
-
+        """Populate the channel color assignment table with selected channels."""
+        # Block signals to avoid triggering updates during population
+        self.channel_color_table.blockSignals(True)
+        
+        # Preserve current color assignments
+        prev_assignments = self.channel_color_assignments.copy()
+        
+        # Clear table
+        self.channel_color_table.setRowCount(0)
+        self.channel_color_assignments = {}
+        
+        # Populate table with selected channels
+        for ch in channels:
+            row = self.channel_color_table.rowCount()
+            self.channel_color_table.insertRow(row)
+            
+            # Channel name (read-only)
+            channel_item = QtWidgets.QTableWidgetItem(ch)
+            channel_item.setFlags(channel_item.flags() & ~Qt.ItemIsEditable)
+            self.channel_color_table.setItem(row, 0, channel_item)
+            
+            # Color selection combo box
+            color_combo = QtWidgets.QComboBox()
+            color_combo.addItems(self.available_colors)
+            # Restore previous assignment or default to first color (Blue)
+            prev_color = prev_assignments.get(ch, 'Blue')
+            if prev_color in self.available_colors:
+                color_combo.setCurrentText(prev_color)
+            else:
+                color_combo.setCurrentIndex(0)
+            color_combo.currentTextChanged.connect(lambda text, ch_name=ch: self._on_channel_color_changed(ch_name, text))
+            self.channel_color_table.setCellWidget(row, 1, color_combo)
+            
+            # Store assignment
+            self.channel_color_assignments[ch] = color_combo.currentText()
+        
+        self.channel_color_table.blockSignals(False)
+        
+        # Legacy: also populate old lists for backward compatibility
+        # Map colors to old RGB lists
+        prev_red = {}
+        prev_green = {}
+        prev_blue = {}
+        if self.red_list.count() > 0:
+            prev_red = {self.red_list.item(i).text(): self.red_list.item(i).checkState() == Qt.Checked for i in range(self.red_list.count())}
+        if self.green_list.count() > 0:
+            prev_green = {self.green_list.item(i).text(): self.green_list.item(i).checkState() == Qt.Checked for i in range(self.green_list.count())}
+        if self.blue_list.count() > 0:
+            prev_blue = {self.blue_list.item(i).text(): self.blue_list.item(i).checkState() == Qt.Checked for i in range(self.blue_list.count())}
+        
         self.red_list.clear()
         self.green_list.clear()
         self.blue_list.clear()
         
-        # Only add selected channels; if none, keep lists empty
+        # Map new color assignments to old RGB lists
         for ch in channels:
-            for lst, prev in [(self.red_list, prev_red), (self.green_list, prev_green), (self.blue_list, prev_blue)]:
-                it = QtWidgets.QListWidgetItem(ch)
-                it.setFlags(it.flags() | Qt.ItemIsUserCheckable | Qt.ItemIsEnabled)
-                # Restore previous check state if present
-                checked = prev.get(ch, False)
-                it.setCheckState(Qt.Checked if checked else Qt.Unchecked)
-                lst.addItem(it)
-
-        # Do not auto-select by default; leave empty if no channels are selected
+            color = self.channel_color_assignments.get(ch, 'Blue')
+            # Map colors to RGB: Red->red_list, Green->green_list, Blue->blue_list
+            # Yellow->red+green, Magenta->red+blue, White->all
+            if color == 'Red':
+                lst = self.red_list
+            elif color == 'Teal':
+                lst = self.green_list  # Legacy: green_list is used for teal
+            elif color == 'Blue':
+                lst = self.blue_list
+            elif color == 'Yellow':
+                # Add to both red and green
+                for lst in [self.red_list, self.green_list]:
+                    it = QtWidgets.QListWidgetItem(ch)
+                    it.setFlags(it.flags() | Qt.ItemIsUserCheckable | Qt.ItemIsEnabled)
+                    checked = prev_red.get(ch, False) or prev_green.get(ch, False)
+                    it.setCheckState(Qt.Checked if checked else Qt.Unchecked)
+                    lst.addItem(it)
+                continue
+            elif color == 'Magenta':
+                # Add to both red and blue
+                for lst in [self.red_list, self.blue_list]:
+                    it = QtWidgets.QListWidgetItem(ch)
+                    it.setFlags(it.flags() | Qt.ItemIsUserCheckable | Qt.ItemIsEnabled)
+                    checked = prev_red.get(ch, False) or prev_blue.get(ch, False)
+                    it.setCheckState(Qt.Checked if checked else Qt.Unchecked)
+                    lst.addItem(it)
+                continue
+            elif color == 'White':
+                # Add to all three
+                for lst in [self.red_list, self.green_list, self.blue_list]:
+                    it = QtWidgets.QListWidgetItem(ch)
+                    it.setFlags(it.flags() | Qt.ItemIsUserCheckable | Qt.ItemIsEnabled)
+                    checked = prev_red.get(ch, False) or prev_green.get(ch, False) or prev_blue.get(ch, False)
+                    it.setCheckState(Qt.Checked if checked else Qt.Unchecked)
+                    lst.addItem(it)
+                continue
+            else:
+                lst = self.blue_list  # Default
+            
+            it = QtWidgets.QListWidgetItem(ch)
+            it.setFlags(it.flags() | Qt.ItemIsUserCheckable | Qt.ItemIsEnabled)
+            checked = prev_red.get(ch, False) if lst == self.red_list else (prev_green.get(ch, False) if lst == self.green_list else prev_blue.get(ch, False))
+            it.setCheckState(Qt.Checked if checked else Qt.Unchecked)
+            lst.addItem(it)
+    
+    def _on_channel_color_changed(self, channel_name: str, color_name: str):
+        """Handle color assignment change for a channel."""
+        self.channel_color_assignments[channel_name] = color_name
+        # Update view if not in grid mode
+        if not self.grid_view_chk.isChecked():
+            if not self.preserve_zoom:
+                self.preserve_zoom = True
+                self._view_selected()
 
     def _populate_denoise_channel_list(self, channels: List[str]):
         """Populate the denoise channel combo with currently selected channels."""
@@ -1827,6 +1909,18 @@ class MainWindow(QtWidgets.QMainWindow):
         for i in range(self.blue_list.count()):
             item = self.blue_list.item(i)
             item.setHidden(text not in item.text().lower())
+    
+    def _filter_channel_color_table(self):
+        """Filter channel color table based on search text."""
+        if not hasattr(self, 'channel_color_search') or not hasattr(self, 'channel_color_table'):
+            return
+        text = self.channel_color_search.text().lower()
+        for i in range(self.channel_color_table.rowCount()):
+            channel_item = self.channel_color_table.item(i, 0)
+            if channel_item:
+                channel_name = channel_item.text().lower()
+                # Show row if search text matches channel name
+                self.channel_color_table.setRowHidden(i, text not in channel_name)
     
     def _on_rgb_list_changed(self):
         # Ensure lists only keep checks for currently selected channels
@@ -2001,10 +2095,45 @@ class MainWindow(QtWidgets.QMainWindow):
         is_rgb_mode = hasattr(self, 'grid_view_chk') and not self.grid_view_chk.isChecked()
         
         if is_rgb_mode:
-            # In RGB mode, show color names instead of individual channels
-            self.scaling_channel_combo.addItem("Red")
-            self.scaling_channel_combo.addItem("Green")
-            self.scaling_channel_combo.addItem("Blue")
+            # In RGB mode, show all available color names
+            # Only show colors that are actually assigned to channels
+            selected_channels = self._selected_channels()
+            assigned_colors = set()
+            for ch in selected_channels:
+                if ch in self.channel_color_assignments:
+                    assigned_colors.add(self.channel_color_assignments[ch])
+                else:
+                    # Fallback: check legacy RGB lists
+                    def _is_checked(lst: QtWidgets.QListWidget, channel: str) -> bool:
+                        for i in range(lst.count()):
+                            item = lst.item(i)
+                            if item.text() == channel and item.checkState() == Qt.Checked:
+                                return True
+                        return False
+                    in_red = _is_checked(self.red_list, ch)
+                    in_green = _is_checked(self.green_list, ch)
+                    in_blue = _is_checked(self.blue_list, ch)
+                    if in_red and in_green and in_blue:
+                        assigned_colors.add('White')
+                    elif in_red and in_green:
+                        assigned_colors.add('Yellow')
+                    elif in_red and in_blue:
+                        assigned_colors.add('Magenta')
+                    elif in_green and in_blue:
+                        assigned_colors.add('Cyan')
+                        assigned_colors.add('Teal')  # Use Teal instead
+                    elif in_red:
+                        assigned_colors.add('Red')
+                    elif in_green:
+                        assigned_colors.add('Teal')
+                    elif in_blue:
+                        assigned_colors.add('Blue')
+            
+            # Add all available colors, but prioritize assigned ones
+            all_colors = ['Blue', 'Teal', 'Yellow', 'Magenta', 'Red', 'White']
+            for color in all_colors:
+                if color in assigned_colors or not assigned_colors:  # Show all if none assigned
+                    self.scaling_channel_combo.addItem(color)
         else:
             # Only show currently selected channels
             selected_channels = self._selected_channels()
@@ -2931,7 +3060,7 @@ class MainWindow(QtWidgets.QMainWindow):
             return
         
         # Check if we're in RGB mode (selection is a color name)
-        is_rgb_color = current_selection in ['Red', 'Green', 'Blue']
+        is_rgb_color = current_selection in ['Red', 'Teal', 'Blue', 'Yellow', 'Magenta', 'White']
         
         if is_rgb_color:
             # Load RGB color scaling
@@ -2940,25 +3069,46 @@ class MainWindow(QtWidgets.QMainWindow):
                 min_val = self.rgb_color_scaling[current_selection]['min']
                 max_val = self.rgb_color_scaling[current_selection]['max']
             else:
-                # Use default range - compute from actual RGB composite
+                # Use default range - compute from actual channels assigned to this color
                 if self.current_acq_id is None:
                     return
                 try:
-                    # Get the actual RGB channel values to compute default range
-                    def _checked(lst: QtWidgets.QListWidget) -> List[str]:
-                        vals: List[str] = []
-                        for i in range(lst.count()):
-                            item = lst.item(i)
-                            if item.checkState() == Qt.Checked:
-                                vals.append(item.text())
-                        return vals
+                    # Get channels assigned to this color from the new color assignment system
+                    selected_channels = []
+                    for ch_name, assigned_color in self.channel_color_assignments.items():
+                        if assigned_color == current_selection:
+                            selected_channels.append(ch_name)
                     
-                    red_selection = _checked(self.red_list)
-                    green_selection = _checked(self.green_list)
-                    blue_selection = _checked(self.blue_list)
-                    
-                    color_selections = {'Red': red_selection, 'Green': green_selection, 'Blue': blue_selection}
-                    selected_channels = color_selections.get(current_selection, [])
+                    # Fallback: check legacy RGB lists if no assignments found
+                    if not selected_channels:
+                        def _checked(lst: QtWidgets.QListWidget) -> List[str]:
+                            vals: List[str] = []
+                            for i in range(lst.count()):
+                                item = lst.item(i)
+                                if item.checkState() == Qt.Checked:
+                                    vals.append(item.text())
+                            return vals
+                        
+                        red_selection = _checked(self.red_list)
+                        teal_selection = _checked(self.green_list)  # Legacy: green_list is teal
+                        blue_selection = _checked(self.blue_list)
+                        
+                        # Map legacy selections to new colors
+                        if current_selection == 'Red':
+                            selected_channels = red_selection
+                        elif current_selection == 'Teal':
+                            selected_channels = teal_selection
+                        elif current_selection == 'Blue':
+                            selected_channels = blue_selection
+                        elif current_selection == 'Yellow':
+                            # Yellow uses both red and green (teal)
+                            selected_channels = list(set(red_selection + teal_selection))
+                        elif current_selection == 'Magenta':
+                            # Magenta uses both red and blue
+                            selected_channels = list(set(red_selection + blue_selection))
+                        elif current_selection == 'White':
+                            # White uses all three
+                            selected_channels = list(set(red_selection + teal_selection + blue_selection))
                     
                     if selected_channels:
                         # Compute combined channel to get range
@@ -3025,7 +3175,7 @@ class MainWindow(QtWidgets.QMainWindow):
         max_val = self.max_spinbox.value()
         
         # Check if we're in RGB mode (selection is a color name)
-        is_rgb_color = current_selection in ['Red', 'Green', 'Blue']
+        is_rgb_color = current_selection in ['Red', 'Teal', 'Blue', 'Yellow', 'Magenta', 'White']
         
         if is_rgb_color:
             # Save RGB color scaling
@@ -3697,136 +3847,153 @@ class MainWindow(QtWidgets.QMainWindow):
         return combined.astype(first_img.dtype)
 
     def _show_rgb_composite(self, selected_channels: List[str], grayscale: bool):
-        """Show RGB composite using user-selected color assignments."""
-        # Get user-selected color assignments
-        # Read multi-selections for each color
-        def _checked(lst: QtWidgets.QListWidget) -> List[str]:
-            vals: List[str] = []
-            for i in range(lst.count()):
-                item = lst.item(i)
-                if item.checkState() == Qt.Checked:
-                    vals.append(item.text())
-            return vals
-        red_selection = _checked(self.red_list)
-        green_selection = _checked(self.green_list)
-        blue_selection = _checked(self.blue_list)
+        """Show multi-channel composite using additive blending with color assignments."""
+        if not selected_channels:
+            QtWidgets.QMessageBox.information(self, "No channels", "Please select at least one channel for composite.")
+            return
         
-        # If only one channel is selected and no RGB assignments are made, assign it to red
-        if (len(selected_channels) == 1 and 
-            not red_selection and not green_selection and not blue_selection):
-            red_selection = selected_channels.copy()
+        # Get color assignments for selected channels
+        # Use channel_color_assignments if available, otherwise fall back to legacy RGB lists
+        channel_colors = []
+        channels_to_blend = []
         
-        # Create RGB stack based on user selections
-        rgb_channels = []
-        rgb_titles = []
-        raw_channels = []  # Store raw images for colorbar
+        for ch in selected_channels:
+            # Get color assignment from new system
+            if ch in self.channel_color_assignments:
+                color = self.channel_color_assignments[ch]
+                channels_to_blend.append(ch)
+                channel_colors.append(color)
+            else:
+                # Fallback: check legacy RGB lists
+                def _is_checked(lst: QtWidgets.QListWidget, channel: str) -> bool:
+                    for i in range(lst.count()):
+                        item = lst.item(i)
+                        if item.text() == channel and item.checkState() == Qt.Checked:
+                            return True
+                    return False
+                
+                # Determine color from legacy lists
+                in_red = _is_checked(self.red_list, ch)
+                in_green = _is_checked(self.green_list, ch)
+                in_blue = _is_checked(self.blue_list, ch)
+                
+                if in_red and in_green and in_blue:
+                    color = 'White'
+                elif in_red and in_green:
+                    color = 'Yellow'
+                elif in_red and in_blue:
+                    color = 'Magenta'
+                elif in_green and in_blue:
+                    # Green+Blue = Cyan, but we use Teal instead
+                    color = 'Teal'
+                elif in_red:
+                    color = 'Red'
+                elif in_green:
+                    color = 'Teal'
+                elif in_blue:
+                    color = 'Blue'
+                else:
+                    # Default to Blue if no assignment
+                    color = 'Blue'
+                
+                channels_to_blend.append(ch)
+                channel_colors.append(color)
         
-        # Collect all channels that will be used in RGB composite
-        all_rgb_channels = list(set(red_selection + green_selection + blue_selection))
+        # If no channels have color assignments, assign first channel to Blue
+        if not channels_to_blend and selected_channels:
+            channels_to_blend = [selected_channels[0]]
+            channel_colors = ['Blue']
         
-        # Apply spillover correction if enabled (to all channels used in RGB)
-        if self.spillover_correction_enabled and self.spillover_matrix is not None and all_rgb_channels:
-            corrected_images = self._apply_spillover_correction_to_channels(self.current_acq_id, all_rgb_channels)
+        if not channels_to_blend:
+            QtWidgets.QMessageBox.information(self, "No channels", "Please select at least one channel for composite.")
+            return
+        
+        # Collect all channels that will be used
+        all_channels = list(set(channels_to_blend))
+        
+        # Apply spillover correction if enabled
+        if self.spillover_correction_enabled and self.spillover_matrix is not None and all_channels:
+            corrected_images = self._apply_spillover_correction_to_channels(self.current_acq_id, all_channels)
         else:
             corrected_images = {}
         
-        # Get the first selected channel to determine image size
-        first_img = None
-        if selected_channels:
-            if selected_channels[0] in corrected_images:
-                first_img = corrected_images[selected_channels[0]]
-            else:
-                first_img = self._load_image_with_normalization(self.current_acq_id, selected_channels[0])
+        # Get the first channel to determine image size
+        first_ch = channels_to_blend[0]
+        if first_ch in corrected_images:
+            first_img = corrected_images[first_ch]
+        else:
+            first_img = self._load_image_with_normalization(self.current_acq_id, first_ch)
         
         if first_img is None:
-            QtWidgets.QMessageBox.information(self, "No RGB channels", "Please select at least one channel for RGB composite.")
+            QtWidgets.QMessageBox.information(self, "No channels", "Could not load channel images.")
             return
         
-        # Build R, G, B channels using the selected combination method
-        r_img = self._combine_channels_for_rgb(red_selection, first_img, corrected_images)
-        g_img = self._combine_channels_for_rgb(green_selection, first_img, corrected_images)
-        b_img = self._combine_channels_for_rgb(blue_selection, first_img, corrected_images)
-
-        rgb_channels.append(r_img)
-        raw_channels.append(r_img)
-        rgb_titles.append(f"{'+'.join(red_selection) if red_selection else 'None'} (Red)")
-
-        rgb_channels.append(g_img)
-        raw_channels.append(g_img)
-        rgb_titles.append(f"{'+'.join(green_selection) if green_selection else 'None'} (Green)")
-
-        rgb_channels.append(b_img)
-        raw_channels.append(b_img)
-        rgb_titles.append(f"{'+'.join(blue_selection) if blue_selection else 'None'} (Blue)")
-        
-        # Ensure we have exactly 3 channels
-        while len(rgb_channels) < 3:
-            rgb_channels.append(np.zeros_like(first_img))
-            raw_channels.append(np.zeros_like(first_img))
-            rgb_titles.append(f"None ({['Red', 'Green', 'Blue'][len(rgb_channels)-1]})")
-        
-        # Apply RGB color custom scaling before stacking (for RGB display)
-        if self.custom_scaling_chk.isChecked():
-            scaled_channels = []
-            color_names = ['Red', 'Green', 'Blue']
-            
-            for i, ch_img in enumerate(rgb_channels):
-                # Skip empty channels (all zeros)
-                if np.all(ch_img == 0):
-                    scaled_channels.append(ch_img)
-                    continue
-                
-                # Get the color name for this RGB channel
-                color_name = color_names[i] if i < len(color_names) else None
-                
-                # Use RGB color scaling if available
-                if color_name and color_name in self.rgb_color_scaling:
-                    vmin = self.rgb_color_scaling[color_name]['min']
-                    vmax = self.rgb_color_scaling[color_name]['max']
-                    if vmax <= vmin:
-                        vmax = vmin + 1e-6
-                    
-                    # Apply scaling to the whole color (combined channels)
-                    ch_img = np.clip((ch_img.astype(np.float32) - vmin) / (vmax - vmin), 0.0, 1.0)
+        # Load all channel images
+        channel_images = []
+        for ch_name in channels_to_blend:
+            try:
+                if ch_name in corrected_images:
+                    img = corrected_images[ch_name]
                 else:
-                    # No custom scaling for this color, normalize to 0-1 based on actual range
-                    actual_min = float(np.min(ch_img))
-                    actual_max = float(np.max(ch_img))
-                    if actual_max > actual_min:
-                        ch_img = (ch_img.astype(np.float32) - actual_min) / (actual_max - actual_min)
+                    img = self._load_image_with_normalization(self.current_acq_id, ch_name)
+                channel_images.append(img.astype(np.float32))
+            except Exception:
+                channel_images.append(np.zeros_like(first_img, dtype=np.float32))
+        
+        # Apply custom scaling per color group if enabled
+        if self.custom_scaling_chk.isChecked():
+            scaled_images = []
+            for i, (img, ch_name, color) in enumerate(zip(channel_images, channels_to_blend, channel_colors)):
+                # First check if there's color-specific scaling
+                if color in self.rgb_color_scaling:
+                    vmin = self.rgb_color_scaling[color]['min']
+                    vmax = self.rgb_color_scaling[color]['max']
+                    if vmax > vmin:
+                        img = np.clip((img.astype(np.float32) - vmin) / (vmax - vmin), 0.0, 1.0)
                     else:
-                        ch_img = np.zeros_like(ch_img)
-                
-                scaled_channels.append(ch_img)
-            rgb_channels = scaled_channels
-
-        # Stack channels
-        stack = np.dstack(rgb_channels)
-        raw_stack = np.dstack(raw_channels)
+                        img = np.zeros_like(img)
+                # Fallback to per-channel scaling if no color scaling is set
+                elif ch_name in self.channel_scaling:
+                    vmin = self.channel_scaling[ch_name]['min']
+                    vmax = self.channel_scaling[ch_name]['max']
+                    if vmax > vmin:
+                        img = np.clip((img.astype(np.float32) - vmin) / (vmax - vmin), 0.0, 1.0)
+                    else:
+                        img = np.zeros_like(img)
+                scaled_images.append(img)
+            channel_images = scaled_images
         
-        # Note: Do NOT apply overlay per-channel (will be 3-channel) — apply to final RGB image below
+        # Use additive blending to create RGB composite
+        # Alpha is set to 1.0 (hidden from users as requested)
+        rgb_img = additive_blend_channels(channel_images, channel_colors, alpha=1.0, normalize_per_channel=True)
         
-        # Get acquisition subtitle
+        # Create title showing channel assignments
+        color_groups = {}
+        for ch, color in zip(channels_to_blend, channel_colors):
+            if color not in color_groups:
+                color_groups[color] = []
+            color_groups[color].append(ch)
+        
+        title_parts = []
+        for color in ['Red', 'Teal', 'Blue', 'Yellow', 'Magenta', 'White']:
+            if color in color_groups:
+                ch_list = '+'.join(color_groups[color])
+                title_parts.append(f"{ch_list} ({color})")
+        
         acq_subtitle = self._get_acquisition_subtitle(self.current_acq_id)
-        title = " + ".join(rgb_titles) + f"\n{acq_subtitle}"
+        title = " + ".join(title_parts) if title_parts else "Composite"
+        title += f"\n{acq_subtitle}"
         if self.segmentation_overlay:
             title += " (segmented)"
         
-        # Clear canvas and show RGB composite with individual colorbars
+        # Clear canvas and show composite
         self.canvas.fig.clear()
         
         if grayscale:
-            # Grayscale background from assigned channels (mean of non-empty channels)
+            # Convert RGB to grayscale
             ax = self.canvas.fig.add_subplot(111)
-
-            nonzero_channels = [ch for ch in rgb_channels if not np.all(ch == 0)]
-            if len(nonzero_channels) == 0:
-                gray_base = stack[..., 0]
-            elif len(nonzero_channels) == 1:
-                gray_base = nonzero_channels[0]
-            else:
-                gray_base = np.mean(np.dstack(nonzero_channels), axis=2)
-
+            gray_base = np.mean(rgb_img, axis=2)  # Mean across RGB channels
+            
             if self.segmentation_overlay:
                 # Apply colored overlay on top of grayscale background
                 blended = self._get_segmentation_overlay(gray_base)
@@ -3850,15 +4017,12 @@ class MainWindow(QtWidgets.QMainWindow):
                     scale_bar_length_um = self.scale_bar_length_spin.value()
                     self.canvas._draw_scale_bar_on_axes(gray_base.shape, scale_bar_length_um, pixel_size_um, ax)
         else:
-            # RGB composite with slimmer individual channel colorbars
-            # Create a grid with a much shorter bottom row
-            gs = self.canvas.fig.add_gridspec(2, 3, height_ratios=[10, 1], hspace=0.12, wspace=0.2)
+            # RGB composite display
+            ax_main = self.canvas.fig.add_subplot(111)
             
-            # Main RGB composite image (spans top row)
-            ax_main = self.canvas.fig.add_subplot(gs[0, :])
-            rgb_img = stack_to_rgb(stack)
             if self.segmentation_overlay:
                 rgb_img = self._get_segmentation_overlay(rgb_img)
+            
             im = ax_main.imshow(rgb_img, interpolation="nearest")
             ax_main.set_title(title)
             ax_main.axis("off")
@@ -3868,45 +4032,8 @@ class MainWindow(QtWidgets.QMainWindow):
                 pixel_size_um = self._get_pixel_size_um(self.current_acq_id)
                 if pixel_size_um > 0:
                     scale_bar_length_um = self.scale_bar_length_spin.value()
-                    # Get image shape from the RGB stack
-                    img_shape = stack.shape[:2]  # (height, width)
+                    img_shape = rgb_img.shape[:2]  # (height, width)
                     self.canvas._draw_scale_bar_on_axes(img_shape, scale_bar_length_um, pixel_size_um, ax_main)
-            
-            # Individual channel colorbars (bottom row)
-            for i, (channel_name, color_name) in enumerate(zip(rgb_titles, ['Red', 'Green', 'Blue'])):
-                ax_cbar = self.canvas.fig.add_subplot(gs[1, i])
-                
-                # Create a colorbar for this channel
-                if i < len(raw_channels) and raw_channels[i] is not None and not np.all(raw_channels[i] == 0):
-                    # This channel has data
-                    raw_min, raw_max = np.min(raw_channels[i]), np.max(raw_channels[i])
-                    
-                    # Check for RGB color scaling (in RGB mode)
-                    if self.custom_scaling_chk.isChecked() and color_name in self.rgb_color_scaling:
-                        raw_min = self.rgb_color_scaling[color_name]['min']
-                        raw_max = self.rgb_color_scaling[color_name]['max']
-                    
-                    if raw_max > raw_min:  # Valid data range
-                        # Create a gradient for the colorbar
-                        gradient = np.linspace(0, 1, 256).reshape(1, -1)
-                        ax_cbar.imshow(gradient, aspect='auto', cmap='gray' if grayscale else ['Reds', 'Greens', 'Blues'][i])
-                        ax_cbar.set_xticks([0, 255])
-                        ax_cbar.set_xticklabels([f'{raw_min:.1f}', f'{raw_max:.1f}'])
-                        ax_cbar.tick_params(axis='x', labelsize=8, pad=1)
-                        ax_cbar.set_yticks([])
-                        ax_cbar.set_title(f"{channel_name}", fontsize=8, pad=2)
-                    else:
-                        # No data
-                        ax_cbar.text(0.5, 0.5, "No data", ha="center", va="center", transform=ax_cbar.transAxes, fontsize=8)
-                        ax_cbar.set_title(f"{channel_name}", fontsize=8, pad=2)
-                else:
-                    # No data for this channel
-                    ax_cbar.text(0.5, 0.5, "No data", ha="center", va="center", transform=ax_cbar.transAxes, fontsize=8)
-                    ax_cbar.set_title(f"{channel_name}", fontsize=8, pad=2)
-                
-                ax_cbar.set_xlim(0, 255)
-                for spine in ax_cbar.spines.values():
-                    spine.set_visible(False)
         
         self.canvas.draw()
         

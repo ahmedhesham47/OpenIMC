@@ -140,6 +140,85 @@ class PreprocessingCache:
         self.cache.clear()
 
 
+# Color definitions for multi-channel blending
+COLOR_DEFINITIONS = {
+    'Blue': (0.0, 0.0, 1.0),
+    'Teal': (0.0, 0.7, 0.7),  # Teal is safer than green for multiplexed images
+    'Yellow': (1.0, 1.0, 0.0),
+    'Magenta': (1.0, 0.0, 1.0),
+    'Red': (1.0, 0.0, 0.0),
+    'White': (1.0, 1.0, 1.0),
+}
+
+
+def additive_blend_channels(
+    channel_images: List[np.ndarray],
+    channel_colors: List[str],
+    alpha: float = 1.0,
+    normalize_per_channel: bool = True
+) -> np.ndarray:
+    """Blend multiple channels using additive blending with color assignment.
+    
+    This implements napari-style additive blending where each channel is assigned
+    a color and blended additively with a given alpha value.
+    
+    Args:
+        channel_images: List of 2D channel images to blend
+        channel_colors: List of color names for each channel (must match length of channel_images)
+        alpha: Alpha value for blending (default 1.0, hidden from users)
+        normalize_per_channel: If True, normalize each channel to [0, 1] before blending
+        
+    Returns:
+        RGB image array of shape (H, W, 3) with values in [0, 1]
+    """
+    if not channel_images:
+        raise ValueError("No channel images provided")
+    
+    if len(channel_images) != len(channel_colors):
+        raise ValueError(f"Number of channel images ({len(channel_images)}) must match "
+                        f"number of colors ({len(channel_colors)})")
+    
+    # Get image shape from first channel
+    H, W = channel_images[0].shape
+    
+    # Initialize RGB output
+    rgb_output = np.zeros((H, W, 3), dtype=np.float32)
+    
+    # Process each channel
+    for img, color_name in zip(channel_images, channel_colors):
+        if color_name not in COLOR_DEFINITIONS:
+            raise ValueError(f"Unknown color: {color_name}. Must be one of {list(COLOR_DEFINITIONS.keys())}")
+        
+        # Get RGB color components
+        color_rgb = COLOR_DEFINITIONS[color_name]
+        
+        # Normalize channel to [0, 1] if requested
+        if normalize_per_channel:
+            img_min = np.min(img)
+            img_max = np.max(img)
+            if img_max > img_min:
+                img_normalized = (img.astype(np.float32) - img_min) / (img_max - img_min)
+            else:
+                img_normalized = np.zeros_like(img, dtype=np.float32)
+        else:
+            # Just ensure it's float32, but don't normalize
+            img_normalized = img.astype(np.float32)
+        
+        # Additively blend: add channel intensity * color * alpha to each RGB component
+        for c in range(3):
+            rgb_output[..., c] += img_normalized * color_rgb[c] * alpha
+    
+    # Normalize final output to [0, 1] range to prevent overflow
+    rgb_max = np.max(rgb_output)
+    if rgb_max > 1.0:
+        rgb_output = rgb_output / rgb_max
+    
+    # Clip to ensure values are in [0, 1]
+    rgb_output = np.clip(rgb_output, 0.0, 1.0)
+    
+    return rgb_output
+
+
 def stack_to_rgb(stack: np.ndarray) -> np.ndarray:
     H, W, C = stack.shape
     if C == 1:
