@@ -29,7 +29,11 @@ matplotlib.use('Qt5Agg')
 import matplotlib.cm as cm
 from matplotlib.backends.backend_qt5agg import FigureCanvasQTAgg as FigureCanvas
 from matplotlib.figure import Figure
+from matplotlib.patches import Circle, PathPatch
 from scipy.optimize import curve_fit
+import numpy as np
+from skimage.measure import label, regionprops
+from scipy.ndimage import distance_transform_edt
 
 from openimc.data.mcd_loader import AcquisitionInfo, MCDLoader
 from openimc.data.ometiff_loader import OMETIFFLoader
@@ -320,7 +324,20 @@ class DeconvolutionDialog(QtWidgets.QDialog):
     def _create_kernel_generation_tab(self):
         """Create the kernel generation tab for generating passes and contributions arrays."""
         tab = QtWidgets.QWidget()
-        layout = QtWidgets.QVBoxLayout(tab)
+        main_layout = QtWidgets.QVBoxLayout(tab)
+        main_layout.setContentsMargins(0, 0, 0, 0)
+        main_layout.setSpacing(0)
+        
+        # Create scroll area
+        scroll_area = QtWidgets.QScrollArea()
+        scroll_area.setWidgetResizable(True)
+        scroll_area.setFrameShape(QtWidgets.QFrame.NoFrame)
+        scroll_area.setHorizontalScrollBarPolicy(Qt.ScrollBarAsNeeded)
+        scroll_area.setVerticalScrollBarPolicy(Qt.ScrollBarAsNeeded)
+        
+        # Create scrollable content widget
+        scroll_content = QtWidgets.QWidget()
+        layout = QtWidgets.QVBoxLayout(scroll_content)
         layout.setContentsMargins(10, 10, 10, 10)
         layout.setSpacing(8)
         
@@ -405,18 +422,30 @@ class DeconvolutionDialog(QtWidgets.QDialog):
         geometry_layout.addRow("Step Size (μm):", self.step_size_spin)
         
         self.pixel_size_spin = QtWidgets.QDoubleSpinBox()
-        self.pixel_size_spin.setRange(0.1, 10.0)
+        self.pixel_size_spin.setRange(1.0, 1.0)  # Fixed at 1.0
         self.pixel_size_spin.setValue(1.0)
         self.pixel_size_spin.setDecimals(2)
         self.pixel_size_spin.setSingleStep(0.1)
+        self.pixel_size_spin.setEnabled(False)  # Disable editing
+        self.pixel_size_spin.setStyleSheet("QDoubleSpinBox:disabled { background-color: #f0f0f0; color: #666; }")
         geometry_layout.addRow("Pixel Size (μm):", self.pixel_size_spin)
         
+        pixel_size_info = QtWidgets.QLabel("Fixed at 1.0 μm for High Resolution IMC")
+        pixel_size_info.setStyleSheet("QLabel { color: #666; font-size: 9pt; }")
+        geometry_layout.addRow("", pixel_size_info)
+        
         self.spot_diameter_spin = QtWidgets.QDoubleSpinBox()
-        self.spot_diameter_spin.setRange(0.1, 5.0)
+        self.spot_diameter_spin.setRange(1.0, 1.0)  # Fixed at 1.0
         self.spot_diameter_spin.setValue(1.0)
         self.spot_diameter_spin.setDecimals(2)
         self.spot_diameter_spin.setSingleStep(0.1)
+        self.spot_diameter_spin.setEnabled(False)  # Disable editing
+        self.spot_diameter_spin.setStyleSheet("QDoubleSpinBox:disabled { background-color: #f0f0f0; color: #666; }")
         geometry_layout.addRow("Spot Diameter (μm):", self.spot_diameter_spin)
+        
+        spot_diameter_info = QtWidgets.QLabel("Fixed at 1.0 μm for High Resolution IMC")
+        spot_diameter_info.setStyleSheet("QLabel { color: #666; font-size: 9pt; }")
+        geometry_layout.addRow("", spot_diameter_info)
         
         layout.addWidget(geometry_group)
         
@@ -443,7 +472,51 @@ class DeconvolutionDialog(QtWidgets.QDialog):
         file_btn_layout.addStretch()
         layout.addLayout(file_btn_layout)
         
+        # Separator
+        separator = QtWidgets.QFrame()
+        separator.setFrameShape(QtWidgets.QFrame.HLine)
+        separator.setFrameShadow(QtWidgets.QFrame.Sunken)
+        layout.addWidget(separator)
+        
+        # Plot section
+        plot_group = QtWidgets.QGroupBox("Pass Map Visualization")
+        plot_layout = QtWidgets.QVBoxLayout(plot_group)
+        
+        # Display mode selection
+        display_mode_layout = QtWidgets.QHBoxLayout()
+        display_mode_layout.addWidget(QtWidgets.QLabel("Display:"))
+        self.plot_display_passes_radio = QtWidgets.QRadioButton("Passes")
+        self.plot_display_passes_radio.setChecked(True)
+        self.plot_display_passes_radio.toggled.connect(self._update_kernel_plot)
+        self.plot_display_contributions_radio = QtWidgets.QRadioButton("Contributions")
+        self.plot_display_contributions_radio.toggled.connect(self._update_kernel_plot)
+        display_mode_layout.addWidget(self.plot_display_passes_radio)
+        display_mode_layout.addWidget(self.plot_display_contributions_radio)
+        display_mode_layout.addStretch()
+        plot_layout.addLayout(display_mode_layout)
+        
+        # Plot widget
+        self.kernel_plot_figure = Figure(figsize=(8, 8))
+        self.kernel_plot_canvas = FigureCanvas(self.kernel_plot_figure)
+        self.kernel_plot_canvas.setMinimumHeight(500)
+        plot_layout.addWidget(self.kernel_plot_canvas)
+        
+        layout.addWidget(plot_group)
+        
+        # Store region data for plotting
+        self.kernel_region_data = None
+        self.kernel_rel_shots = None
+        self.kernel_crater_radius = None
+        self.kernel_central_center = None
+        
+        # Initialize plot with placeholder
+        self._update_kernel_plot()
+        
         layout.addStretch()
+        
+        # Set scroll content and add to main layout
+        scroll_area.setWidget(scroll_content)
+        main_layout.addWidget(scroll_area)
         
         return tab
     
@@ -1376,6 +1449,12 @@ class DeconvolutionDialog(QtWidgets.QDialog):
             # Enable save button
             self.save_kernel_btn.setEnabled(True)
             
+            # Compute region data for plotting
+            self._compute_region_data_for_plotting(step_size, spot_diameter)
+            
+            # Update plot
+            self._update_kernel_plot()
+            
             QtWidgets.QMessageBox.information(
                 self,
                 "Success",
@@ -1392,6 +1471,216 @@ class DeconvolutionDialog(QtWidgets.QDialog):
             QtWidgets.QMessageBox.critical(self, "Error", error_msg)
             import traceback
             traceback.print_exc()
+    
+    def _compute_region_data_for_plotting(self, step_size: float, spot_diameter: float, grid_resolution: int = 800):
+        """
+        Compute region data for plotting the pass map visualization.
+        This replicates the logic from deconovlution_circle_modeling.py.
+        """
+        crater_radius = spot_diameter / 2.0
+        step = step_size
+        
+        # Determine grid size to cover enough shots
+        max_distance = 2.1 * crater_radius
+        num_rows = int(np.ceil(max_distance / step) * 2) + 1
+        num_cols = num_rows
+        
+        # Raster Setup
+        central_row = num_rows // 2
+        central_col = num_cols // 2
+
+        shot_centers = []
+        for r in range(num_rows):
+            for c in range(num_cols):
+                x = c * step
+                y = -r * step
+                shot_centers.append((x, y))
+        shot_centers = np.array(shot_centers, dtype=float)
+
+        central_idx = central_row * num_cols + central_col
+        central_center = shot_centers[central_idx]
+        effective_shots = shot_centers[:central_idx + 1].copy()
+
+        # High-Res Subpixel Grid
+        grid_res = grid_resolution
+        xs_rel = np.linspace(-crater_radius, crater_radius, grid_res)
+        ys_rel = np.linspace(-crater_radius, crater_radius, grid_res)
+        XX_rel, YY_rel = np.meshgrid(xs_rel, ys_rel)
+
+        XX = XX_rel + central_center[0]
+        YY = YY_rel + central_center[1]
+        points = np.c_[XX.ravel(), YY.ravel()]
+
+        # Mask: Only care about pixels inside the main crater
+        inside_mask = np.hypot(XX_rel, YY_rel) <= crater_radius
+        inside_indices = np.where(inside_mask.ravel())[0]
+        points_inside = points[inside_indices]
+
+        # Signature-Based Region Segmentation
+        dists_from_center = np.hypot(effective_shots[:, 0] - central_center[0],
+                                     effective_shots[:, 1] - central_center[1])
+        rel_shots = effective_shots[dists_from_center <= (2.1 * crater_radius)]
+
+        # Assign random unique float ID to each shot
+        rng = np.random.default_rng(42)
+        shot_signatures = rng.uniform(100, 1000000, size=len(rel_shots))
+
+        # Compute overlaps
+        dists_matrix = np.sqrt(((rel_shots[None, :, :] - points_inside[:, None, :]) ** 2).sum(axis=2))
+        boolean_overlaps = dists_matrix <= crater_radius
+
+        # Pass Map (Integer count)
+        pass_values_inside = np.sum(boolean_overlaps, axis=1)
+
+        # Signature Map (Unique float per region)
+        signature_values_inside = boolean_overlaps @ shot_signatures
+
+        # Reconstruct 2D images
+        pass_map = np.zeros(grid_res * grid_res, dtype=int)
+        pass_map[inside_indices] = pass_values_inside
+        pass_map = pass_map.reshape(grid_res, grid_res)
+
+        sig_map = np.zeros(grid_res * grid_res, dtype=float)
+        sig_map[inside_indices] = signature_values_inside
+        sig_map = sig_map.reshape(grid_res, grid_res)
+
+        # Labeling via Pole of Inaccessibility
+        region_data = []
+        min_pixel_area = 0
+
+        unique_sigs = np.unique(sig_map[inside_mask.reshape(grid_res, grid_res)])
+
+        for sig in unique_sigs:
+            if sig == 0:
+                continue
+
+            # Create binary mask for this specific region
+            binary = (sig_map == sig).astype(np.uint8)
+
+            # Label components (handles cases where a region is split)
+            labeled = label(binary, connectivity=2)
+            props = regionprops(labeled)
+
+            # Determine pass count (grab first valid pixel)
+            representative_val = pass_map[binary == 1][0]
+
+            for rp in props:
+                if rp.area < min_pixel_area:
+                    continue
+
+                # Pole of inaccessibility
+                min_row, min_col, max_row, max_col = rp.bbox
+                sub_mask = binary[min_row:max_row, min_col:max_col]
+
+                dist_transform = distance_transform_edt(sub_mask)
+                max_idx = np.argmax(dist_transform)
+                max_pos = np.unravel_index(max_idx, dist_transform.shape)
+
+                cy = max_pos[0] + min_row
+                cx = max_pos[1] + min_col
+
+                x_coord = np.interp(cx, np.arange(grid_res), xs_rel)
+                y_coord = np.interp(cy, np.arange(grid_res), ys_rel)
+
+                region_data.append({
+                    'val': representative_val,
+                    'x': x_coord,
+                    'y': y_coord,
+                    'area': float(rp.area)
+                })
+
+        # Store for plotting
+        self.kernel_region_data = region_data
+        self.kernel_rel_shots = rel_shots
+        self.kernel_crater_radius = crater_radius
+        self.kernel_central_center = central_center
+        
+        # Verify region data matches generated arrays if they exist
+        if self.generated_passes is not None:
+            if len(region_data) != len(self.generated_passes):
+                print(f"Warning: Region data count ({len(region_data)}) doesn't match passes count ({len(self.generated_passes)})")
+            else:
+                # Check if pass values match (they should be in the same order)
+                region_passes = np.array([rd['val'] for rd in region_data])
+                if not np.array_equal(region_passes, self.generated_passes):
+                    print("Warning: Region pass values don't match generated passes array. Plot may show incorrect data.")
+    
+    def _update_kernel_plot(self):
+        """Update the kernel plot with region data."""
+        if self.kernel_region_data is None:
+            # Clear plot if no data
+            self.kernel_plot_figure.clear()
+            ax = self.kernel_plot_figure.add_subplot(111)
+            ax.text(0.5, 0.5, 'Generate kernel arrays to see visualization', 
+                   ha='center', va='center', transform=ax.transAxes, fontsize=12)
+            ax.axis('off')
+            self.kernel_plot_canvas.draw()
+            return
+        
+        # Clear previous plot
+        self.kernel_plot_figure.clear()
+        ax = self.kernel_plot_figure.add_subplot(111)
+        
+        crater_radius = self.kernel_crater_radius
+        central_center = self.kernel_central_center
+        rel_shots = self.kernel_rel_shots
+        region_data = self.kernel_region_data
+        
+        # Main pixel circle
+        main_circle = Circle((0, 0), crater_radius, fill=False, linewidth=2.0, color='black', zorder=20)
+        ax.add_patch(main_circle)
+        
+        # Clipping path
+        clip_path = PathPatch(main_circle.get_path().transformed(main_circle.get_transform()), visible=False)
+        ax.add_patch(clip_path)
+        
+        # Draw shot circles
+        for x_s, y_s in rel_shots:
+            xr = x_s - central_center[0]
+            yr = y_s - central_center[1]
+            circ = Circle((xr, yr), crater_radius, fill=False, linewidth=0.8, alpha=0.6, color='#444444')
+            circ.set_clip_path(clip_path)
+            ax.add_patch(circ)
+        
+        # Determine display mode
+        show_passes = self.plot_display_passes_radio.isChecked()
+        
+        # Draw labels
+        if show_passes:
+            # Show pass numbers
+            for item in region_data:
+                ax.text(item['x'], item['y'], str(item['val']),
+                       fontsize=6, ha='center', va='center',
+                       color='white', fontweight='bold', zorder=30,
+                       bbox=dict(boxstyle="circle,pad=0.05", fc="red", ec="none", alpha=0.8))
+            title = "Pass Map (Pole of Inaccessibility)"
+        else:
+            # Show contributions
+            if self.generated_contributions is not None and len(self.generated_contributions) == len(region_data):
+                for i, item in enumerate(region_data):
+                    contrib_val = self.generated_contributions[i]
+                    # Format as percentage with 2-3 decimal places depending on value
+                    if contrib_val >= 0.01:
+                        label_text = f"{contrib_val*100:.2f}%"
+                    else:
+                        label_text = f"{contrib_val*100:.3f}%"
+                    ax.text(item['x'], item['y'], label_text,
+                           fontsize=5, ha='center', va='center',
+                           color='white', fontweight='bold', zorder=30,
+                           bbox=dict(boxstyle="circle,pad=0.05", fc="blue", ec="none", alpha=0.8))
+                title = "Contribution Map (Pole of Inaccessibility)"
+            else:
+                ax.text(0.5, 0.5, 'Contributions not available. Generate kernel arrays first.', 
+                       ha='center', va='center', transform=ax.transAxes, fontsize=12)
+                title = "Contribution Map"
+        
+        ax.set_aspect('equal')
+        ax.set_xlim(-crater_radius * 1.05, crater_radius * 1.05)
+        ax.set_ylim(-crater_radius * 1.05, crater_radius * 1.05)
+        ax.axis('off')
+        ax.set_title(title, fontsize=12)
+        
+        self.kernel_plot_canvas.draw()
     
     def _save_kernel_arrays(self):
         """Save generated passes and contributions arrays to a file."""

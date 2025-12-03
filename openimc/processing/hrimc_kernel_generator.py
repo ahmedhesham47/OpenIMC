@@ -19,20 +19,15 @@
 """
 Module for generating passes and contributions arrays for High Resolution IMC deconvolution.
 
-This module uses Shapely for geometry calculations to compute passes and contributions
-given instrument geometry and an inverse sigmoidal loss function.
+This module uses signature-based region segmentation with pole of inaccessibility
+labeling to compute passes and contributions given instrument geometry and an
+inverse sigmoidal loss function.
 """
 
 import numpy as np
 from typing import Callable, Tuple, Optional
-
-try:
-    from shapely.geometry import Point, Polygon
-    _HAVE_SHAPELY = True
-    _SHAPELY_ERROR = None
-except (ImportError, AttributeError, Exception) as e:
-    _HAVE_SHAPELY = False
-    _SHAPELY_ERROR = str(e)
+from skimage.measure import label, regionprops
+from scipy.ndimage import distance_transform_edt
 
 
 def example_inverse_sigmoid_loss(
@@ -115,11 +110,15 @@ def compute_hrimc_passes_contributions(
     spot_diameter_um: float = 1.0,
     n_subpixels: int = 15,
     circle_resolution: int = 64,
+    grid_resolution: int = 800,
 ) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
     """
-    Compute subpixel Passes and Contributions for HR-IMC using Shapely, with
-    a more exact raster-scan geometry that can yield up to ~9 passes for
-    333 nm step size.
+    Compute Passes and Contributions for HR-IMC using signature-based region
+    segmentation with pole of inaccessibility labeling.
+
+    This method uses a high-resolution subpixel grid to identify distinct
+    regions within the central crater, labels them using pole of inaccessibility,
+    and computes passes and contributions per region.
 
     Parameters
     ----------
@@ -129,195 +128,210 @@ def compute_hrimc_passes_contributions(
         Inverse sigmoidal loss function mapping pass numbers -> fraction of
         signal remaining after repeated ablations.
     pixel_size_um : float, default 1.0
-        Coarse IMC pixel size (1 µm).
+        Coarse IMC pixel size (1 µm). Not used in computation but kept for
+        interface compatibility.
     spot_diameter_um : float, default 1.0
-        Laser spot diameter (1 µm for HR-IMC).
+        Laser spot diameter (1 µm for HR-IMC). Used as crater radius.
     n_subpixels : int, default 15
-        Number of subpixels per side inside one coarse pixel. Must be divisible
-        by 3 to aggregate cleanly into a 3×3 PSF.
+        Not used in this implementation but kept for interface compatibility.
     circle_resolution : int, default 64
-        Resolution used to approximate circles with polygons in Shapely.
+        Not used in this implementation but kept for interface compatibility.
+    grid_resolution : int, default 800
+        Resolution of the high-resolution subpixel grid used for region
+        segmentation. Higher values provide more accurate region identification
+        but increase computation time.
 
     Returns
     -------
-    passes_flat : np.ndarray, shape (n_subpixels * n_subpixels,)
-        Pass count per subpixel for the pixel-of-interest. Subpixels outside
-        the central beam have 0. Subpixels inside have pass >= 1.
-    contributions_flat : np.ndarray, shape (n_subpixels * n_subpixels,)
-        Normalized contribution weight per subpixel (sums to 1).
+    passes_flat : np.ndarray, shape (n_regions,)
+        Pass count per region. Each region represents a distinct area within
+        the central crater with a unique pass count.
+    contributions_flat : np.ndarray, shape (n_regions,)
+        Normalized contribution weight per region (sums to 1).
     psf_kernel_3x3 : np.ndarray, shape (3, 3)
         Skewed 3×3 PSF suitable for Richardson–Lucy deconvolution.
     """
-    if not _HAVE_SHAPELY:
-        error_msg = "shapely is required for exact geometry calculations. Install with: pip install shapely"
-        if _SHAPELY_ERROR:
-            error_msg += f"\nImport error: {_SHAPELY_ERROR}"
-        raise RuntimeError(error_msg)
+    crater_radius = spot_diameter_um / 2.0
+    step = step_size_um
     
-    # Ensure imports are available
-    from shapely.geometry import Point, Polygon
+    # Determine grid size to cover enough shots
+    # We need enough rows/cols to include all shots that could intersect
+    max_distance = 2.1 * crater_radius
+    num_rows = int(np.ceil(max_distance / step) * 2) + 1
+    num_cols = num_rows
     
-    if n_subpixels < 3:
-        raise ValueError("n_subpixels must be at least 3.")
-    if n_subpixels % 3 != 0:
-        raise ValueError("n_subpixels should be divisible by 3 for clean 3×3 binning (e.g., 15, 21, 30).")
+    # ============================================
+    # 1. Raster Setup
+    # ============================================
+    central_row = num_rows // 2
+    central_col = num_cols // 2
 
-    spot_radius = spot_diameter_um / 2.0
-    pixel_half = pixel_size_um / 2.0
-    subpixel_width = pixel_size_um / n_subpixels
-    subpixel_area = subpixel_width ** 2
+    shot_centers = []
+    for r in range(num_rows):
+        for c in range(num_cols):
+            x = c * step
+            y = -r * step
+            shot_centers.append((x, y))
+    shot_centers = np.array(shot_centers, dtype=float)
 
-    # ------------------------------------------------------------------
-    # 1. Build subpixel grid inside the pixel-of-interest
-    #    Pixel spans [-0.5, +0.5] × [-0.5, +0.5], centered at (0,0).
-    # ------------------------------------------------------------------
-    xs = np.linspace(-pixel_half + subpixel_width / 2.0,
-                     pixel_half - subpixel_width / 2.0,
-                     n_subpixels)
-    ys = np.linspace(-pixel_half + subpixel_width / 2.0,
-                     pixel_half - subpixel_width / 2.0,
-                     n_subpixels)
-    xx, yy = np.meshgrid(xs, ys)  # (n_subpixels, n_subpixels)
+    central_idx = central_row * num_cols + central_col
+    central_center = shot_centers[central_idx]
+    effective_shots = shot_centers[:central_idx + 1].copy()
 
-    subpixel_polys = []
-    for j in range(n_subpixels):
-        for i in range(n_subpixels):
-            x_center = xs[i]
-            y_center = ys[j]
-            x0 = x_center - subpixel_width / 2.0
-            x1 = x_center + subpixel_width / 2.0
-            y0 = y_center - subpixel_width / 2.0
-            y1 = y_center + subpixel_width / 2.0
-            poly = Polygon([(x0, y0), (x1, y0), (x1, y1), (x0, y1)])
-            subpixel_polys.append(poly)
+    # ============================================
+    # 2. High-Res Subpixel Grid
+    # ============================================
+    grid_res = grid_resolution
+    xs_rel = np.linspace(-crater_radius, crater_radius, grid_res)
+    ys_rel = np.linspace(-crater_radius, crater_radius, grid_res)
+    XX_rel, YY_rel = np.meshgrid(xs_rel, ys_rel)
 
-    n_subpix = len(subpixel_polys)
+    XX = XX_rel + central_center[0]
+    YY = YY_rel + central_center[1]
+    points = np.c_[XX.ravel(), YY.ravel()]
 
-    # ------------------------------------------------------------------
-    # 2. Enumerate beam centers on the HR grid.
-    #
-    # Condition for a beam at (i*step, j*step) to possibly intersect the
-    # central pixel [-0.5, 0.5]^2 with a circle of radius R:
-    #
-    #   minimal distance from (i*step, j*step) to pixel <= R
-    #
-    # A conservative bound is |i| * step <= pixel_half + spot_radius.
-    # For 1 µm pixel, 1 µm spot, that's |i| * step <= 1.0.
-    # ------------------------------------------------------------------
-    max_index = int(np.floor((pixel_half + spot_radius) / step_size_um))
-    if max_index < 0:
-        raise RuntimeError("max_index < 0; check step_size_um / geometry.")
+    # Mask: Only care about pixels inside the main crater
+    inside_mask = np.hypot(XX_rel, YY_rel) <= crater_radius
+    inside_indices = np.where(inside_mask.ravel())[0]
+    points_inside = points[inside_indices]
 
-    # Raster order: rows from top to bottom (higher y to lower y),
-    # columns left to right (lower x to higher x).
-    beam_centers = []
-    for j_idx in range(max_index, -max_index - 1, -1):  # e.g. 3,2,1,0,-1,-2,-3
-        for i_idx in range(-max_index, max_index + 1):  # e.g. -3,-2,-1,0,1,2,3
-            x = i_idx * step_size_um
-            y = j_idx * step_size_um
-            beam_centers.append((x, y))
-    beam_centers = np.array(beam_centers)  # shape (N_beams, 2)
+    # ============================================
+    # 3. Signature-Based Region Segmentation
+    # ============================================
+    # Filter shots close to center
+    dists_from_center = np.hypot(effective_shots[:, 0] - central_center[0],
+                                 effective_shots[:, 1] - central_center[1])
+    rel_shots = effective_shots[dists_from_center <= (2.1 * crater_radius)]
 
-    # Build Shapely circles for each beam
-    beam_disks = [
-        Point(bx, by).buffer(spot_radius, resolution=circle_resolution)
-        for (bx, by) in beam_centers
-    ]
+    # Assign random unique float ID to each shot
+    rng = np.random.default_rng(42)
+    shot_signatures = rng.uniform(100, 1000000, size=len(rel_shots))
 
-    # Identify the central shot at (0,0); this is the acquisition that produces
-    # the pixel-of-interest. All beams with index < central_idx in the raster
-    # are "previous passes" for regions they overlap.
-    central_idx = None
-    for idx, (bx, by) in enumerate(beam_centers):
-        if np.isclose(bx, 0.0) and np.isclose(by, 0.0):
-            central_idx = idx
-            break
-    if central_idx is None:
-        raise RuntimeError("Central beam (0,0) not found in beam_centers.")
+    # Compute overlaps
+    dists_matrix = np.sqrt(((rel_shots[None, :, :] - points_inside[:, None, :]) ** 2).sum(axis=2))
+    boolean_overlaps = dists_matrix <= crater_radius
 
-    # ------------------------------------------------------------------
-    # 3. For each subpixel:
-    #    - count how many earlier beams (index < central_idx) overlap it
-    #    - compute overlap area with the central beam only
-    #
-    # passes = (# of overlapping beams before central) + 1, only where the
-    # central beam hits. Subpixels outside the central beam get passes = 0.
-    # ------------------------------------------------------------------
-    previous_passes = np.zeros(n_subpix, dtype=int)
-    central_overlap_area = np.zeros(n_subpix, dtype=float)
+    # Pass Map (Integer count)
+    pass_values_inside = np.sum(boolean_overlaps, axis=1)
 
-    central_disk = beam_disks[central_idx]
+    # Signature Map (Unique float per region)
+    signature_values_inside = boolean_overlaps @ shot_signatures
 
-    for sub_idx, subpoly in enumerate(subpixel_polys):
-        # Overlap with central beam
-        inter_central = subpoly.intersection(central_disk).area
-        central_overlap_area[sub_idx] = inter_central
+    # Reconstruct 2D images
+    pass_map = np.zeros(grid_res * grid_res, dtype=int)
+    pass_map[inside_indices] = pass_values_inside
+    pass_map = pass_map.reshape(grid_res, grid_res)
 
-        if inter_central <= 0.0:
-            # This subpixel is not part of the pixel-of-interest footprint,
-            # so it cannot contribute to the current shot.
+    sig_map = np.zeros(grid_res * grid_res, dtype=float)
+    sig_map[inside_indices] = signature_values_inside
+    sig_map = sig_map.reshape(grid_res, grid_res)
+
+    # ============================================
+    # 4. Labeling via Pole of Inaccessibility
+    # ============================================
+    region_data = []
+    min_pixel_area = 0  # Filter dust
+
+    unique_sigs = np.unique(sig_map[inside_mask.reshape(grid_res, grid_res)])
+
+    for sig in unique_sigs:
+        if sig == 0:
             continue
 
-        # Count previous passes (beams before central that also overlap this subpixel)
-        n_prev = 0
-        for b_idx in range(central_idx):
-            inter_area = subpoly.intersection(beam_disks[b_idx]).area
-            if inter_area > 0.0:
-                n_prev += 1
+        # 1. Create binary mask for this specific region
+        binary = (sig_map == sig).astype(np.uint8)
 
-        previous_passes[sub_idx] = n_prev
+        # 2. Label components (handles cases where a region is split)
+        labeled = label(binary, connectivity=2)
+        props = regionprops(labeled)
 
-    passes_flat = np.zeros(n_subpix, dtype=int)
-    mask_central = central_overlap_area > 0.0
-    passes_flat[mask_central] = previous_passes[mask_central] + 1  # include current shot
+        # Determine pass count (grab first valid pixel)
+        representative_val = pass_map[binary == 1][0]
 
-    # ------------------------------------------------------------------
-    # 4. Convert central overlap area to area fraction and apply loss_fn
-    # ------------------------------------------------------------------
-    area_fraction = central_overlap_area / subpixel_area
+        for rp in props:
+            if rp.area < min_pixel_area:
+                continue
 
-    # Only subpixels inside central beam can contribute
-    passes_nonzero = passes_flat[mask_central]
-    if passes_nonzero.size == 0:
-        raise RuntimeError("Central beam does not intersect any subpixels. Check geometry.")
+            # --- Pole of inaccessibility ---
+            min_row, min_col, max_row, max_col = rp.bbox
+            sub_mask = binary[min_row:max_row, min_col:max_col]
 
-    frac_remaining = loss_fn(passes_nonzero)
+            dist_transform = distance_transform_edt(sub_mask)
+            max_idx = np.argmax(dist_transform)
+            max_pos = np.unravel_index(max_idx, dist_transform.shape)
 
-    raw_contrib = np.zeros(n_subpix, dtype=float)
-    raw_contrib[mask_central] = area_fraction[mask_central] * frac_remaining
+            cy = max_pos[0] + min_row
+            cx = max_pos[1] + min_col
 
-    total_raw = raw_contrib.sum()
-    if total_raw <= 0.0:
-        raise RuntimeError(
-            "Total raw contribution is zero after loss function. "
-            "Check step_size_um, spot_diameter_um, and loss_fn."
-        )
+            x_coord = np.interp(cx, np.arange(grid_res), xs_rel)
+            y_coord = np.interp(cy, np.arange(grid_res), ys_rel)
 
-    contributions_flat = raw_contrib / total_raw  # normalize to sum to 1
+            region_data.append({
+                'val': representative_val,
+                'x': x_coord,
+                'y': y_coord,
+                'area': float(rp.area)  # subpixel count
+            })
 
-    # ------------------------------------------------------------------
-    # 5. Aggregate into skewed 3×3 PSF by binning the n_subpixels×n_subpixels grid
-    #    Note: In compute_hrimc_passes_contributions, ys goes from -pixel_half to +pixel_half,
-    #    so j=0 is bottom and j=n-1 is top. We need to flip vertically.
-    # ------------------------------------------------------------------
-    psf_kernel = np.zeros((3, 3), dtype=float)
-    bin_size = n_subpixels // 3
+    if len(region_data) == 0:
+        raise RuntimeError("No regions found. Check step_size_um, spot_diameter_um, and geometry.")
 
-    contrib_2d = contributions_flat.reshape(n_subpixels, n_subpixels)
-    # Flip vertically: contrib_2d[0, :] (bottom in image coords) should map to PSF row 2 (bottom)
-    # After flip, flipped[0, :] corresponds to the top row of subpixels
-    contrib_2d_flipped = np.flipud(contrib_2d)  # Flip vertically
-    for j in range(n_subpixels):
-        for i in range(n_subpixels):
-            by = min(j // bin_size, 2)  # 0 = top, 2 = bottom
-            bx = min(i // bin_size, 2)  # 0 = left, 2 = right
-            psf_kernel[by, bx] += contrib_2d_flipped[j, i]
+    # ============================================
+    # 5. Compute Passes, Contributions, PSF kernel
+    # ============================================
+    # 5.1 Passes array (one per region, in region_data order)
+    passes_array = np.array([rd['val'] for rd in region_data], dtype=int)
 
-    psf_sum = psf_kernel.sum()
-    if psf_sum > 0.0:
-        psf_kernel /= psf_sum
+    # 5.2 Contributions array (area-weighted, normalized)
+    subpixel_area = (2 * crater_radius / grid_res) ** 2
+    areas_pixels = np.array([rd['area'] for rd in region_data], dtype=float)
+    raw_contributions = areas_pixels * subpixel_area
+    contributions_array = raw_contributions / raw_contributions.sum()
 
-    return passes_flat, contributions_flat, psf_kernel
+    # 5.3 PSF kernel construction
+    passes = np.array([rd['val'] for rd in region_data], dtype=float)
+
+    if loss_fn is None:
+        attenuation = np.ones_like(passes, dtype=float)
+    else:
+        attenuation = np.asarray(loss_fn(passes), dtype=float)
+
+    weights = contributions_array * attenuation
+
+    kernel = np.zeros((3, 3), dtype=float)
+
+    # Partition central pixel into 3x3 bins in normalized coordinates
+    # Normalize x,y into [-1, 1] by dividing by crater_radius
+    for rd, w in zip(region_data, weights):
+        x = rd['x'] / crater_radius
+        y = rd['y'] / crater_radius
+
+        # Columns: left, center, right
+        if x < -1.0 / 3.0:
+            col = 0
+        elif x > 1.0 / 3.0:
+            col = 2
+        else:
+            col = 1
+
+        # Rows: top, middle, bottom (y>0 is 'up')
+        if y > 1.0 / 3.0:
+            row = 0
+        elif y < -1.0 / 3.0:
+            row = 2
+        else:
+            row = 1
+
+        kernel[row, col] += w
+
+    # Normalize PSF
+    s = kernel.sum()
+    if s > 0:
+        kernel /= s
+    else:
+        raise RuntimeError("PSF kernel sum is zero. Check loss function and geometry.")
+
+    return passes_array, contributions_array, kernel
 
 
 def compute_hrimc_psf(
@@ -332,24 +346,9 @@ def compute_hrimc_psf(
 ) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
     """
     Compute passes, contributions, and a 3×3 PSF kernel for HR-IMC.
-
-    Geometry:
-    - Pixel-of-interest: a 1 µm × 1 µm square centered at (0, 0).
-    - Laser spot: circle with diameter spot_diameter_um (default 1 µm).
-    - HR grid: beams at (i * step_size_um, j * step_size_um) in a raster
-      ordered top-to-bottom, left-to-right.
-    - Only beams whose circles can intersect the pixel-of-interest are considered.
-    - The beam at (0,0) is treated as the current shot; all beams with
-      earlier raster indices are "previous passes".
-
-    The pixel is discretized into n_subpixels × n_subpixels equal squares,
-    each treated as a subpixel. For each subpixel:
-      - passes = (# of overlapping beams before current) + 1
-      - central_overlap_area = area overlapped by the current beam's disk
-      - contribution ∝ central_overlap_area * loss_fn(passes, x0, slope, ...)
-
-    Contributions are normalized to sum to 1, then aggregated into a 3×3 PSF
-    by binning the n_subpixels × n_subpixels grid.
+    
+    This is a convenience wrapper around compute_hrimc_passes_contributions
+    that accepts x0, slope parameters directly instead of a loss function.
 
     Parameters
     ----------
@@ -360,190 +359,44 @@ def compute_hrimc_psf(
     slope : float, default 1.0
         Slope of the inverse sigmoidal loss curve.
     pixel_size_um : float, default 1.0
-        Size of a coarse IMC pixel (1 µm for HR-IMC).
+        Size of a coarse IMC pixel (1 µm for HR-IMC). Not used in computation
+        but kept for interface compatibility.
     spot_diameter_um : float, default 1.0
         Laser spot diameter (1 µm).
     n_subpixels : int, default 15
-        Number of subpixels along each side. Must be divisible by 3 to
-        aggregate cleanly into a 3×3 PSF.
+        Not used in this implementation but kept for interface compatibility.
     circle_resolution : int, default 64
-        Number of segments used to approximate the circular beam footprint.
+        Not used in this implementation but kept for interface compatibility.
     loss_fn : callable, optional
         Function with signature loss_fn(passes, x0, slope, min_fraction, max_fraction)
         returning fraction of signal remaining. If None, uses hr_inverse_sigmoid_loss.
 
     Returns
     -------
-    passes_flat : np.ndarray, shape (n_subpixels * n_subpixels,)
-        Pass count per subpixel for the pixel-of-interest. Subpixels outside
-        the current beam footprint have 0.
-    contributions_flat : np.ndarray, shape (n_subpixels * n_subpixels,)
-        Normalized contribution per subpixel (sums to 1).
+    passes_flat : np.ndarray, shape (n_regions,)
+        Pass count per region. Each region represents a distinct area within
+        the central crater with a unique pass count.
+    contributions_flat : np.ndarray, shape (n_regions,)
+        Normalized contribution per region (sums to 1).
     psf_kernel_3x3 : np.ndarray, shape (3, 3)
         3×3 PSF kernel suitable for RL deconvolution. Row 0 corresponds to
         the "top" of the pixel, row 2 to the "bottom".
     """
     if loss_fn is None:
-        loss_fn = hr_inverse_sigmoid_loss
+        def loss_fn_wrapper(passes):
+            return hr_inverse_sigmoid_loss(passes, x0=x0, slope=slope, min_fraction=0.0, max_fraction=1.0)
+    else:
+        def loss_fn_wrapper(passes):
+            return loss_fn(passes, x0=x0, slope=slope, min_fraction=0.0, max_fraction=1.0)
     
-    if not _HAVE_SHAPELY:
-        error_msg = "shapely is required for exact geometry calculations. Install with: pip install shapely"
-        if _SHAPELY_ERROR:
-            error_msg += f"\nImport error: {_SHAPELY_ERROR}"
-        raise RuntimeError(error_msg)
-    
-    # Ensure imports are available
-    from shapely.geometry import Point, Polygon
-    
-    if n_subpixels < 3:
-        raise ValueError("n_subpixels must be at least 3.")
-    if n_subpixels % 3 != 0:
-        raise ValueError("n_subpixels should be divisible by 3 for clean 3×3 binning (e.g., 15, 21, 30).")
-
-    spot_radius = spot_diameter_um / 2.0
-    pixel_half = pixel_size_um / 2.0
-    subpixel_width = pixel_size_um / n_subpixels
-    subpixel_area = subpixel_width ** 2
-
-    # ------------------------------------------------------------------
-    # 1. Subpixel grid inside the pixel-of-interest
-    #
-    # We want: row index 0 = "top" of the pixel, row index n_subpixels-1 = "bottom".
-    # So we define ys from +pixel_half down to -pixel_half.
-    # ------------------------------------------------------------------
-    xs = np.linspace(-pixel_half + subpixel_width / 2.0,
-                     pixel_half - subpixel_width / 2.0,
-                     n_subpixels)
-    ys = np.linspace(pixel_half - subpixel_width / 2.0,
-                     -pixel_half + subpixel_width / 2.0,
-                     n_subpixels)
-    xx, yy = np.meshgrid(xs, ys)  # (n_subpixels, n_subpixels)
-
-    subpixel_polys = []
-    for j in range(n_subpixels):
-        for i in range(n_subpixels):
-            x_center = xx[j, i]
-            y_center = yy[j, i]
-            x0_coord = x_center - subpixel_width / 2.0
-            x1_coord = x_center + subpixel_width / 2.0
-            y0_coord = y_center - subpixel_width / 2.0
-            y1_coord = y_center + subpixel_width / 2.0
-            poly = Polygon([(x0_coord, y0_coord), (x1_coord, y0_coord), (x1_coord, y1_coord), (x0_coord, y1_coord)])
-            subpixel_polys.append(poly)
-
-    n_subpix = len(subpixel_polys)
-
-    # ------------------------------------------------------------------
-    # 2. Enumerate beam centers in a raster grid around the pixel-of-interest.
-    #
-    # Condition: beams with centers (i*step, j*step) where |i|*step or |j|*step
-    # is small enough that a 1 µm disk can intersect the pixel [-0.5,0.5]^2.
-    # Conservative bound: |i|*step <= pixel_half + spot_radius.
-    # ------------------------------------------------------------------
-    max_index = int(np.floor((pixel_half + spot_radius) / step_size_um))
-    if max_index < 0:
-        raise RuntimeError("max_index < 0; check step_size_um / geometry.")
-
-    beam_centers = []
-    # Raster order: top row (highest y) to bottom row (lowest y),
-    # left to right within each row.
-    for j_idx in range(max_index, -max_index - 1, -1):  # e.g., 3,2,1,0,-1,-2,-3
-        for i_idx in range(-max_index, max_index + 1):  # e.g., -3,-2,-1,0,1,2,3
-            x = i_idx * step_size_um
-            y = j_idx * step_size_um
-            beam_centers.append((x, y))
-    beam_centers = np.array(beam_centers)  # shape (N_beams, 2)
-
-    beam_disks = [Point(bx, by).buffer(spot_radius, resolution=circle_resolution)
-                  for (bx, by) in beam_centers]
-
-    # Identify central beam (current shot) at (0,0)
-    central_idx = None
-    for idx, (bx, by) in enumerate(beam_centers):
-        if np.isclose(bx, 0.0) and np.isclose(by, 0.0):
-            central_idx = idx
-            break
-    if central_idx is None:
-        raise RuntimeError("Central beam (0,0) not found in beam_centers.")
-
-    central_disk = beam_disks[central_idx]
-
-    # ------------------------------------------------------------------
-    # 3. For each subpixel:
-    #    - central_overlap_area = area overlapped by current beam
-    #    - previous_passes = number of earlier beams overlapping this subpixel
-    #
-    # passes_flat = previous_passes + 1 for subpixels hit by the current beam,
-    # otherwise 0 outside the beam footprint.
-    # ------------------------------------------------------------------
-    central_overlap_area = np.zeros(n_subpix, dtype=float)
-    previous_passes = np.zeros(n_subpix, dtype=int)
-
-    for sub_idx, subpoly in enumerate(subpixel_polys):
-        inter_central = subpoly.intersection(central_disk).area
-        central_overlap_area[sub_idx] = inter_central
-
-        if inter_central <= 0.0:
-            continue
-
-        # Count previous overlapping beams
-        n_prev = 0
-        for b_idx in range(central_idx):
-            if subpoly.intersection(beam_disks[b_idx]).area > 0.0:
-                n_prev += 1
-        previous_passes[sub_idx] = n_prev
-
-    passes_flat = np.zeros(n_subpix, dtype=int)
-    mask_central = central_overlap_area > 0.0
-    passes_flat[mask_central] = previous_passes[mask_central] + 1
-
-    # ------------------------------------------------------------------
-    # 4. Compute contributions: area_fraction × inverse_sigmoid(passes)
-    # ------------------------------------------------------------------
-    area_fraction = central_overlap_area / subpixel_area
-
-    if not np.any(mask_central):
-        raise RuntimeError("Central beam does not intersect any subpixels. Check geometry.")
-
-    passes_nonzero = passes_flat[mask_central]
-    frac_remaining = loss_fn(passes_nonzero, x0=x0, slope=slope,
-                             min_fraction=0.0, max_fraction=1.0)
-
-    raw_contrib = np.zeros(n_subpix, dtype=float)
-    raw_contrib[mask_central] = area_fraction[mask_central] * frac_remaining
-
-    total_raw = raw_contrib.sum()
-    if total_raw <= 0.0:
-        raise RuntimeError(
-            "Total raw contribution is zero after applying loss function. "
-            "Check step_size_um, x0, slope, and geometry."
-        )
-
-    contributions_flat = raw_contrib / total_raw
-
-    # ------------------------------------------------------------------
-    # 5. Aggregate into 3×3 PSF by binning the n_subpixels×n_subpixels grid.
-    #    Row 0 is "top" (first entries in ys), row 2 is "bottom".
-    #    Note: ys goes from top (positive) to bottom (negative), so j=0 is top.
-    #    When reshaping, contrib_2d[0, :] is top row, contrib_2d[n-1, :] is bottom row.
-    #    We need to flip vertically so PSF row 0 (top) gets top subpixels.
-    # ------------------------------------------------------------------
-    psf_kernel = np.zeros((3, 3), dtype=float)
-    bin_size = n_subpixels // 3
-
-    contrib_2d = contributions_flat.reshape(n_subpixels, n_subpixels)
-    # Flip vertically: contrib_2d[0, :] (top in image coords) should map to PSF row 0 (top)
-    # After flip, flipped[0, :] corresponds to the top row of subpixels
-    contrib_2d_flipped = np.flipud(contrib_2d)  # Flip vertically
-    for j in range(n_subpixels):
-        for i in range(n_subpixels):
-            by = min(j // bin_size, 2)  # 0 = top, 2 = bottom
-            bx = min(i // bin_size, 2)  # 0 = left, 2 = right
-            psf_kernel[by, bx] += contrib_2d_flipped[j, i]
-
-    psf_kernel /= psf_kernel.sum()
-
-    return passes_flat, contributions_flat, psf_kernel
+    return compute_hrimc_passes_contributions(
+        step_size_um=step_size_um,
+        loss_fn=loss_fn_wrapper,
+        pixel_size_um=pixel_size_um,
+        spot_diameter_um=spot_diameter_um,
+        n_subpixels=n_subpixels,
+        circle_resolution=circle_resolution
+    )
 
 
 def save_passes_contributions(
