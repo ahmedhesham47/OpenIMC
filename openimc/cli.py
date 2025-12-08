@@ -43,6 +43,7 @@ Available Commands:
     - spatial-autocorr: Run spatial autocorrelation (Moran's I) analysis
     - spatial-ripley: Run Ripley function analysis
     - export-anndata: Export AnnData objects from H5AD file(s)
+    - get-panel: Generate panel.csv file from acquisition information
     - cluster-figures: Generate cluster visualization figures
     - spatial-figures: Generate spatial analysis visualization figures
     - workflow: Execute a complete workflow from a YAML configuration file
@@ -1497,6 +1498,55 @@ def export_anndata_command(args):
     print(f"✓ AnnData exported to: {args.output}")
 
 
+def get_panel_command(args):
+    """Generate panel.csv file from acquisition information.
+    
+    This command creates a panel.csv file with channel metal tags and names
+    from the loaded acquisition data.
+    
+    Args:
+        args: Command-line arguments containing:
+            - input: Path to input MCD file or OME-TIFF directory
+            - output: Path to output panel.csv file
+            - acquisition: Optional acquisition ID or name (uses first if not specified)
+            - channel-format: Format for OME-TIFF files ('CHW' or 'HWC')
+    """
+    from openimc.core import get_panel
+    
+    # Load data
+    loader, loader_type = load_mcd(args.input, channel_format=args.channel_format)
+    
+    try:
+        # Get acquisitions
+        acquisitions = loader.list_acquisitions()
+        if not acquisitions:
+            raise ValueError("No acquisitions found in input")
+        
+        # Select acquisition
+        acq_info = None
+        if args.acquisition:
+            # Try to find by ID or name
+            for acq in acquisitions:
+                if acq.id == args.acquisition or acq.name == args.acquisition:
+                    acq_info = acq
+                    break
+            if acq_info is None:
+                raise ValueError(f"Acquisition '{args.acquisition}' not found")
+        else:
+            # Use first acquisition
+            acq_info = acquisitions[0]
+        
+        # Generate panel
+        output_path = get_panel(acq_info, args.output)
+        print(f"✓ Panel CSV created: {output_path}")
+        print(f"  Channels: {len(acq_info.channel_metals) if acq_info.channel_metals else len(acq_info.channels)}")
+        
+    finally:
+        # Close loader if it has a close method
+        if hasattr(loader, 'close'):
+            loader.close()
+
+
 def cluster_figures_command(args):
     """Generate cluster visualization figures.
     
@@ -2470,6 +2520,14 @@ Examples:
     export_anndata_parser.add_argument('--combined', action='store_true', help='Export as single combined file (default: separate files per ROI)')
     export_anndata_parser.add_argument('--workers', type=int, default=None, help=f'Number of parallel workers (default: {get_default_workers()})')
     export_anndata_parser.set_defaults(func=export_anndata_command)
+    
+    # Get panel command
+    get_panel_parser = subparsers.add_parser('get-panel', help='Generate panel.csv file from acquisition information')
+    get_panel_parser.add_argument('input', help='Input MCD file or OME-TIFF directory')
+    get_panel_parser.add_argument('output', help='Output panel.csv file path')
+    get_panel_parser.add_argument('--acquisition', type=str, help='Acquisition ID or name (uses first if not specified)')
+    get_panel_parser.add_argument('--channel-format', choices=['CHW', 'HWC'], default='CHW', help='Channel format for OME-TIFF files (default: CHW)')
+    get_panel_parser.set_defaults(func=get_panel_command)
     
     # Batch correction command
     batch_parser = subparsers.add_parser('batch-correction', help='Apply batch correction to feature data')

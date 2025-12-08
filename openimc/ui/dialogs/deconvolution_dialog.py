@@ -70,11 +70,23 @@ class DeconvolutionDialog(QtWidgets.QDialog):
         self.generated_passes = None
         self.generated_contributions = None
         self.generated_psf_kernel = None
+        self.generated_kernel_dim = None
+        self.generated_region_data_full = None
+        self.generated_x0 = None
+        self.generated_crater_radius = None
+        self.generated_step = None
+        self.generated_plot_data = None
         
         # Deconvolution kernel arrays (loaded from file or generated)
         self.deconv_passes = None
         self.deconv_contributions = None
         self.deconv_psf_kernel = None
+        # New format arrays
+        self.deconv_passes_arr = None
+        self.deconv_contribs_arr = None
+        self.deconv_kernel_dim = None
+        self.deconv_region_data_full = None
+        self.deconv_sigmoidal_params = None
         
         # Create UI
         self._create_ui()
@@ -270,7 +282,7 @@ class DeconvolutionDialog(QtWidgets.QDialog):
         # Add tabs to nested tab widget
         self.exp_design_tabs.addTab(roi_selection_tab, "ROI Selection")
         self.exp_design_tabs.addTab(plot_tab, "Experimental Design Plot")
-        self.exp_design_tabs.addTab(kernel_gen_tab, "Generate Kernel Arrays")
+        self.exp_design_tabs.addTab(kernel_gen_tab, "Generate Passes and Contributions")
         
         # Disable plot and kernel generation tabs initially
         self.exp_design_tabs.setTabEnabled(1, False)
@@ -349,7 +361,7 @@ class DeconvolutionDialog(QtWidgets.QDialog):
             "First, complete ROI selection and 'Analyze Intensity Decay' in the previous tabs. "
             "Then select an energy from your analysis to automatically populate the sigmoidal loss "
             "function parameters. Configure instrument geometry and generate custom arrays that match "
-            "your experimental setup. These arrays can be saved and loaded for use in deconvolution.\n\n"
+            "your experimental setup. These arrays can be saved to a directory of your choice and loaded for use in deconvolution.\n\n"
             "<b>Note:</b> The generated arrays will replace the default hard-coded arrays when used in deconvolution."
         )
         info_label.setWordWrap(True)
@@ -416,10 +428,21 @@ class DeconvolutionDialog(QtWidgets.QDialog):
         
         self.step_size_spin = QtWidgets.QDoubleSpinBox()
         self.step_size_spin.setRange(0.1, 2.0)
-        self.step_size_spin.setValue(0.333)
         self.step_size_spin.setDecimals(3)
         self.step_size_spin.setSingleStep(0.001)
+        # Set default value to exactly 0.333 (not 0.330)
+        self.step_size_spin.setValue(0.333)
+        # Force update to ensure display is correct
+        self.step_size_spin.update()
         geometry_layout.addRow("Step Size (μm):", self.step_size_spin)
+        
+        # Add info label about integer steps requirement
+        step_size_info = QtWidgets.QLabel(
+            "Step size must result in integer steps (e.g., 0.333 → 3 steps, 0.5 → 2 steps, 0.25 → 4 steps)"
+        )
+        step_size_info.setWordWrap(True)
+        step_size_info.setStyleSheet("QLabel { color: #666; font-size: 9pt; }")
+        geometry_layout.addRow("", step_size_info)
         
         self.pixel_size_spin = QtWidgets.QDoubleSpinBox()
         self.pixel_size_spin.setRange(1.0, 1.0)  # Fixed at 1.0
@@ -451,7 +474,7 @@ class DeconvolutionDialog(QtWidgets.QDialog):
         
         # Generate button
         generate_btn_layout = QtWidgets.QHBoxLayout()
-        self.generate_kernel_btn = QtWidgets.QPushButton("Generate Arrays")
+        self.generate_kernel_btn = QtWidgets.QPushButton("Generate Passes and Contributions")
         self.generate_kernel_btn.clicked.connect(self._generate_kernel_arrays)
         generate_btn_layout.addWidget(self.generate_kernel_btn)
         generate_btn_layout.addStretch()
@@ -465,7 +488,7 @@ class DeconvolutionDialog(QtWidgets.QDialog):
         
         # Save button
         file_btn_layout = QtWidgets.QHBoxLayout()
-        self.save_kernel_btn = QtWidgets.QPushButton("Save Arrays...")
+        self.save_kernel_btn = QtWidgets.QPushButton("Save to Directory...")
         self.save_kernel_btn.clicked.connect(self._save_kernel_arrays)
         self.save_kernel_btn.setEnabled(False)
         file_btn_layout.addWidget(self.save_kernel_btn)
@@ -672,22 +695,22 @@ class DeconvolutionDialog(QtWidgets.QDialog):
         separator.setFrameShadow(QtWidgets.QFrame.Sunken)
         params_layout.addWidget(separator)
         
-        # Kernel arrays (passes and contributions) - moved into parameters section
+        # Deconvolution parameters (passes and contributions) - moved into parameters section
         kernel_info = QtWidgets.QLabel(
-            "Load custom kernel arrays generated from the Experimental Design tab. "
-            "If a PSF kernel is loaded, x0 parameter will be hidden (it's baked into the kernel)."
+            "Load deconvolution parameters (passes_arr, contribs_arr, kernel_dim, region_data_full, and sigmoidal loss parameters) "
+            "generated from the Experimental Design tab. Kernels will be computed per-channel using I0 from each channel's max intensity."
         )
         kernel_info.setWordWrap(True)
         kernel_info.setStyleSheet("QLabel { color: #666; font-size: 9pt; }")
         params_layout.addWidget(kernel_info)
         
         kernel_file_layout = QtWidgets.QHBoxLayout()
-        self.kernel_file_label = QtWidgets.QLabel("No kernel arrays loaded (using defaults)")
+        self.kernel_file_label = QtWidgets.QLabel("No deconvolution parameters loaded (using defaults)")
         self.kernel_file_label.setStyleSheet("QLabel { color: #666; }")
         kernel_file_layout.addWidget(self.kernel_file_label)
         kernel_file_layout.addStretch()
         
-        self.load_kernel_file_btn = QtWidgets.QPushButton("Load Kernel...")
+        self.load_kernel_file_btn = QtWidgets.QPushButton("Load Deconvolution Parameters...")
         self.load_kernel_file_btn.clicked.connect(self._load_kernel_arrays_for_deconv)
         kernel_file_layout.addWidget(self.load_kernel_file_btn)
         
@@ -1215,7 +1238,7 @@ class DeconvolutionDialog(QtWidgets.QDialog):
             
             # Enable plot tab, kernel generation tab, and export button
             self.exp_design_tabs.setTabEnabled(1, True)
-            self.exp_design_tabs.setTabEnabled(2, True)  # Enable Generate Kernel Arrays tab
+            self.exp_design_tabs.setTabEnabled(2, True)  # Enable Generate Passes and Contributions tab
             self.exp_design_tabs.setCurrentIndex(1)  # Switch to plot tab
             self.export_plot_btn.setEnabled(True)
             
@@ -1400,57 +1423,103 @@ class DeconvolutionDialog(QtWidgets.QDialog):
     def _generate_kernel_arrays(self):
         """Generate passes and contributions arrays based on current parameters."""
         from openimc.processing.hrimc_kernel_generator import (
-            compute_hrimc_passes_contributions,
-            example_inverse_sigmoid_loss
+            region_passes_and_contribs,
+            compute_region_kernel
         )
         
         try:
             # Get parameters
-            midpoint = self.midpoint_spin.value()
-            slope = self.slope_spin.value()
-            min_fraction = self.min_fraction_spin.value()
-            max_fraction = self.max_fraction_spin.value()
+            x0 = self.midpoint_spin.value()  # Use midpoint as x0
+            I0 = 1.0  # Default I0, will be set per channel during inference
             step_size = self.step_size_spin.value()
-            pixel_size = self.pixel_size_spin.value()
             spot_diameter = self.spot_diameter_spin.value()
+            crater_radius = spot_diameter / 2.0
             
-            # Create loss function
-            def loss_fn(passes):
-                return example_inverse_sigmoid_loss(
-                    passes,
-                    midpoint=midpoint,
-                    slope=slope,
-                    min_fraction=min_fraction,
-                    max_fraction=max_fraction
+            # Validate step size results in integer steps
+            # Use a more lenient tolerance to account for floating point precision
+            # For 0.333, 1/0.333 = 3.003003... which should round to 3
+            steps_per_unit = 1.0 / step_size
+            steps_per_unit_rounded = round(steps_per_unit)
+            # Use a percentage-based tolerance (2%) to account for floating point precision
+            # This allows values like 0.333 (which gives 3.003...) to pass as valid
+            # Also use a minimum absolute tolerance of 0.01 for very small step sizes
+            tolerance = max(0.01, abs(steps_per_unit) * 0.02)
+            
+            if abs(steps_per_unit - steps_per_unit_rounded) > tolerance:
+                warning_msg = (
+                    f"Warning: Step size {step_size:.3f} μm does not result in integer steps.\n\n"
+                    f"Current: {steps_per_unit:.6f} steps per μm\n"
+                    f"Expected: {steps_per_unit_rounded:.0f} steps per μm\n\n"
+                    f"Valid step sizes include:\n"
+                    f"  • 0.333 μm → 3 steps per μm\n"
+                    f"  • 0.5 μm → 2 steps per μm\n"
+                    f"  • 0.25 μm → 4 steps per μm\n"
+                    f"  • 1.0 μm → 1 step per μm\n\n"
+                    f"Continue anyway?"
                 )
+                reply = QtWidgets.QMessageBox.warning(
+                    self,
+                    "Invalid Step Size",
+                    warning_msg,
+                    QtWidgets.QMessageBox.Yes | QtWidgets.QMessageBox.No,
+                    QtWidgets.QMessageBox.No
+                )
+                if reply == QtWidgets.QMessageBox.No:
+                    return
             
-            # Generate arrays using Shapely geometry
-            passes, contributions, psf_kernel = compute_hrimc_passes_contributions(
-                step_size_um=step_size,
-                loss_fn=loss_fn,
-                pixel_size_um=pixel_size,
-                spot_diameter_um=spot_diameter,
-                n_subpixels=15,  # Default subpixel discretization
-                circle_resolution=64  # Default circle resolution
+            # Determine grid size
+            max_distance = 2.1 * crater_radius
+            num_rows = int(np.ceil(max_distance / step_size) * 2) + 1
+            num_cols = num_rows
+            
+            # Generate arrays using new region_passes_and_contribs function
+            passes_arr, contribs_arr, kernel_dim, region_data_full, plot_data = region_passes_and_contribs(
+                crater_radius=crater_radius,
+                step=step_size,
+                num_rows=num_rows,
+                num_cols=num_cols,
+                x0=x0,
+                I0=I0,
+                grid_res_pass=800,
+                grid_res_full=1000,
+                min_area_pixels_full=150,
+                half=4,
+                rng_pass_seed=42,
+                rng_full_seed=123,
             )
             
-            # Store generated arrays and PSF kernel
-            self.generated_passes = passes
-            self.generated_contributions = contributions
-            self.generated_psf_kernel = psf_kernel
+            # Compute kernel for visualization (using default I0=1.0)
+            kernel, _ = compute_region_kernel(
+                passes_arr, contribs_arr, kernel_dim, region_data_full, x0=x0, I0=I0
+            )
+            
+            # Store generated arrays and data
+            self.generated_passes = passes_arr
+            self.generated_contributions = contribs_arr
+            self.generated_kernel_dim = kernel_dim
+            self.generated_region_data_full = region_data_full
+            self.generated_psf_kernel = kernel  # For backward compatibility
+            self.generated_x0 = x0
+            self.generated_crater_radius = crater_radius
+            self.generated_step = step_size
+            self.generated_plot_data = plot_data
             
             # Update status
             status_text = f"Generated arrays successfully!\n"
-            status_text += f"Passes shape: {passes.shape}, Contributions shape: {contributions.shape}\n"
-            status_text += f"3×3 PSF kernel:\n{psf_kernel}"
+            status_text += f"Passes shape: {passes_arr.shape}, Contributions shape: {contribs_arr.shape}\n"
+            status_text += f"Kernel dimension: {kernel_dim}x{kernel_dim}\n"
+            status_text += f"Number of regions: {len(region_data_full)}"
             self.kernel_status_label.setText(status_text)
             self.kernel_status_label.setStyleSheet("QLabel { color: #006600; font-style: normal; }")
             
             # Enable save button
             self.save_kernel_btn.setEnabled(True)
             
-            # Compute region data for plotting
-            self._compute_region_data_for_plotting(step_size, spot_diameter)
+            # Store region data for plotting
+            self.kernel_region_data = region_data_full
+            self.kernel_crater_radius = crater_radius
+            self.kernel_central_center = plot_data.get("central_center", (0, 0))
+            self.kernel_rel_shots = plot_data.get("centers_full", [])
             
             # Update plot
             self._update_kernel_plot()
@@ -1459,9 +1528,10 @@ class DeconvolutionDialog(QtWidgets.QDialog):
                 self,
                 "Success",
                 f"Arrays generated successfully!\n\n"
-                f"Passes: {passes.shape[0]} elements\n"
-                f"Contributions: {contributions.shape[0]} elements\n"
-                f"Sum of contributions: {contributions.sum():.6f}"
+                f"Passes: {passes_arr.shape[0]} elements\n"
+                f"Contributions: {contribs_arr.shape[0]} elements\n"
+                f"Kernel dimension: {kernel_dim}x{kernel_dim}\n"
+                f"Sum of contributions: {contribs_arr.sum():.6f}"
             )
             
         except Exception as e:
@@ -1601,7 +1671,8 @@ class DeconvolutionDialog(QtWidgets.QDialog):
                 print(f"Warning: Region data count ({len(region_data)}) doesn't match passes count ({len(self.generated_passes)})")
             else:
                 # Check if pass values match (they should be in the same order)
-                region_passes = np.array([rd['val'] for rd in region_data])
+                # Use 'pass' key from new format, fallback to 'val' for backward compatibility
+                region_passes = np.array([rd.get('pass', rd.get('val', 0)) for rd in region_data])
                 if not np.array_equal(region_passes, self.generated_passes):
                     print("Warning: Region pass values don't match generated passes array. Plot may show incorrect data.")
     
@@ -1611,7 +1682,7 @@ class DeconvolutionDialog(QtWidgets.QDialog):
             # Clear plot if no data
             self.kernel_plot_figure.clear()
             ax = self.kernel_plot_figure.add_subplot(111)
-            ax.text(0.5, 0.5, 'Generate kernel arrays to see visualization', 
+            ax.text(0.5, 0.5, 'Generate passes and contributions to see visualization', 
                    ha='center', va='center', transform=ax.transAxes, fontsize=12)
             ax.axis('off')
             self.kernel_plot_canvas.draw()
@@ -1649,7 +1720,12 @@ class DeconvolutionDialog(QtWidgets.QDialog):
         if show_passes:
             # Show pass numbers
             for item in region_data:
-                ax.text(item['x'], item['y'], str(item['val']),
+                # Use 'pass' key from new format, fallback to 'val' for backward compatibility
+                pass_val = item.get('pass', item.get('val', 0))
+                # Use relative coordinates for crater-centered plotting
+                x_coord = item.get('x_rel', item.get('x', 0))
+                y_coord = item.get('y_rel', item.get('y', 0))
+                ax.text(x_coord, y_coord, str(int(pass_val)),
                        fontsize=6, ha='center', va='center',
                        color='white', fontweight='bold', zorder=30,
                        bbox=dict(boxstyle="circle,pad=0.05", fc="red", ec="none", alpha=0.8))
@@ -1664,13 +1740,16 @@ class DeconvolutionDialog(QtWidgets.QDialog):
                         label_text = f"{contrib_val*100:.2f}%"
                     else:
                         label_text = f"{contrib_val*100:.3f}%"
-                    ax.text(item['x'], item['y'], label_text,
+                    # Use relative coordinates for crater-centered plotting
+                    x_coord = item.get('x_rel', item.get('x', 0))
+                    y_coord = item.get('y_rel', item.get('y', 0))
+                    ax.text(x_coord, y_coord, label_text,
                            fontsize=5, ha='center', va='center',
                            color='white', fontweight='bold', zorder=30,
                            bbox=dict(boxstyle="circle,pad=0.05", fc="blue", ec="none", alpha=0.8))
                 title = "Contribution Map (Pole of Inaccessibility)"
             else:
-                ax.text(0.5, 0.5, 'Contributions not available. Generate kernel arrays first.', 
+                ax.text(0.5, 0.5, 'Contributions not available. Generate passes and contributions first.', 
                        ha='center', va='center', transform=ax.transAxes, fontsize=12)
                 title = "Contribution Map"
         
@@ -1683,30 +1762,34 @@ class DeconvolutionDialog(QtWidgets.QDialog):
         self.kernel_plot_canvas.draw()
     
     def _save_kernel_arrays(self):
-        """Save generated passes and contributions arrays to a file."""
+        """Save generated passes and contributions arrays to a directory."""
         if self.generated_passes is None or self.generated_contributions is None:
             QtWidgets.QMessageBox.warning(self, "No Arrays", "Please generate arrays first.")
             return
         
-        from openimc.processing.hrimc_kernel_generator import save_passes_contributions
+        if not hasattr(self, 'generated_kernel_dim') or self.generated_kernel_dim is None:
+            QtWidgets.QMessageBox.warning(self, "No Kernel Data", "Please generate arrays first.")
+            return
         
-        # Generate default filename based on selected energy
-        default_filename = "energy_kernels.npz"
+        from openimc.processing.hrimc_kernel_generator import save_region_data
+        
+        # Generate default directory name based on selected energy
+        default_dirname = "passes_contributions_data"
         if self.energy_combo.currentIndex() >= 0:
             energy = self.energy_combo.itemData(self.energy_combo.currentIndex())
             if energy is not None:
                 # Format energy value (remove negative sign, replace decimal point)
                 energy_str = f"{energy:.2f}".replace("-", "neg").replace(".", "_")
-                default_filename = f"energy_{energy_str}_kernels.npz"
+                default_dirname = f"passes_contributions_energy_{energy_str}"
         
-        file_path, _ = QtWidgets.QFileDialog.getSaveFileName(
+        output_dir = QtWidgets.QFileDialog.getExistingDirectory(
             self,
-            "Save Kernel Arrays",
-            default_filename,
-            "NumPy Files (*.npz);;All Files (*)"
+            "Select Directory to Save Passes and Contributions Data",
+            default_dirname,
+            QtWidgets.QFileDialog.ShowDirsOnly | QtWidgets.QFileDialog.DontResolveSymlinks
         )
         
-        if file_path:
+        if output_dir:
             try:
                 # Create metadata
                 metadata = {
@@ -1719,21 +1802,32 @@ class DeconvolutionDialog(QtWidgets.QDialog):
                     'spot_diameter_um': self.spot_diameter_spin.value()
                 }
                 
-                save_passes_contributions(
+                # Save using new format (saves to directory)
+                npz_path, json_path = save_region_data(
                     self.generated_passes,
                     self.generated_contributions,
-                    file_path,
-                    metadata=metadata,
-                    psf_kernel=self.generated_psf_kernel
+                    self.generated_kernel_dim,
+                    self.generated_region_data_full,
+                    output_dir,
+                    x0=self.generated_x0,
+                    I0=1.0,  # Default I0, will be set per channel during inference
+                    crater_radius=self.generated_crater_radius,
+                    step=self.generated_step,
+                    metadata=metadata
                 )
                 
                 QtWidgets.QMessageBox.information(
                     self,
                     "Success",
-                    f"Arrays saved to:\n{file_path}"
+                    f"Passes and contributions data saved to:\n{output_dir}\n\n"
+                    f"Files created:\n"
+                    f"  - region_data.npz (arrays and region data)\n"
+                    f"  - sigmoidal_loss_params.json (loss function parameters)"
                 )
             except Exception as e:
                 QtWidgets.QMessageBox.critical(self, "Error", f"Failed to save arrays: {str(e)}")
+                import traceback
+                traceback.print_exc()
     
     def _load_kernel_arrays(self):
         """Load passes and contributions arrays from a file."""
@@ -1807,55 +1901,96 @@ class DeconvolutionDialog(QtWidgets.QDialog):
         return self.generated_passes, self.generated_contributions
     
     def _load_kernel_arrays_for_deconv(self):
-        """Load kernel arrays for use in deconvolution."""
-        from openimc.processing.hrimc_kernel_generator import load_passes_contributions
+        """Load deconvolution parameters from directory (region_data.npz and sigmoidal_loss_params.json)."""
+        from openimc.processing.hrimc_kernel_generator import load_region_data
         
-        file_path, _ = QtWidgets.QFileDialog.getOpenFileName(
+        # Load from directory (new format only)
+        directory = QtWidgets.QFileDialog.getExistingDirectory(
             self,
-            "Load Kernel Arrays for Deconvolution",
+            "Load Deconvolution Parameters (Select Directory)",
             "",
-            "NumPy Files (*.npz);;All Files (*)"
+            QtWidgets.QFileDialog.ShowDirsOnly | QtWidgets.QFileDialog.DontResolveSymlinks
         )
         
-        if file_path:
-            try:
-                passes, contributions, metadata, psf_kernel = load_passes_contributions(file_path)
-                
-                # Store loaded arrays and PSF kernel
-                self.deconv_passes = passes
-                self.deconv_contributions = contributions
-                self.deconv_psf_kernel = psf_kernel
-                
-                # Update UI
-                if psf_kernel is not None:
-                    self.kernel_file_label.setText(f"Loaded: {os.path.basename(file_path)} (PSF kernel available)")
-                    # Hide x0 parameter when PSF kernel is loaded (x0 is baked into the kernel)
-                    self.x0_layout.itemAt(0).widget().hide()  # Hide label
-                    self.x0_spin.hide()
-                else:
-                    self.kernel_file_label.setText(f"Loaded: {os.path.basename(file_path)}")
-                self.kernel_file_label.setStyleSheet("QLabel { color: #006600; }")
-                self.clear_kernel_btn.setEnabled(True)
-                
-                msg = f"Kernel arrays loaded successfully!\n\n"
-                msg += f"Passes: {passes.shape[0]} elements\n"
-                msg += f"Contributions: {contributions.shape[0]} elements\n"
-                if psf_kernel is not None:
-                    msg += f"PSF kernel: {psf_kernel.shape} (will be used for direct kernel override)\n"
-                    msg += f"\nNote: x0 parameter is hidden since it's baked into the PSF kernel."
-                msg += f"\nThese arrays will be used for deconvolution."
-                QtWidgets.QMessageBox.information(self, "Success", msg)
-            except Exception as e:
-                QtWidgets.QMessageBox.critical(self, "Error", f"Failed to load arrays: {str(e)}")
-                import traceback
-                traceback.print_exc()
+        if not directory:
+            return
+        
+        try:
+            # Load new format
+            npz_path = os.path.join(directory, "region_data.npz")
+            json_path = os.path.join(directory, "sigmoidal_loss_params.json")
+            
+            if not os.path.exists(npz_path):
+                QtWidgets.QMessageBox.critical(
+                    self,
+                    "Error",
+                    f"region_data.npz not found in directory:\n{directory}\n\n"
+                    f"Please select a directory containing region_data.npz and sigmoidal_loss_params.json"
+                )
+                return
+            
+            if not os.path.exists(json_path):
+                QtWidgets.QMessageBox.warning(
+                    self,
+                    "Warning",
+                    f"sigmoidal_loss_params.json not found in directory:\n{directory}\n\n"
+                    f"Will use default sigmoidal loss parameters."
+                )
+                json_path = None
+            
+            # Load deconvolution parameters
+            passes_arr, contribs_arr, kernel_dim, region_data_full, sigmoidal_params = load_region_data(
+                npz_path, json_path
+            )
+            
+            # Store loaded arrays and data
+            self.deconv_passes_arr = passes_arr
+            self.deconv_contribs_arr = contribs_arr
+            self.deconv_kernel_dim = kernel_dim
+            self.deconv_region_data_full = region_data_full
+            self.deconv_sigmoidal_params = sigmoidal_params
+            
+            # For backward compatibility, also set legacy format
+            self.deconv_passes = passes_arr
+            self.deconv_contributions = contribs_arr
+            self.deconv_psf_kernel = None  # Will be generated per channel
+            
+            # Update UI
+            self.kernel_file_label.setText(f"Loaded: {os.path.basename(directory)}")
+            self.kernel_file_label.setStyleSheet("QLabel { color: #006600; }")
+            self.clear_kernel_btn.setEnabled(True)
+            
+            # Show x0 parameter (it's used per channel with I0)
+            self.x0_layout.itemAt(0).widget().show()
+            self.x0_spin.show()
+            if sigmoidal_params and 'x0' in sigmoidal_params:
+                self.x0_spin.setValue(float(sigmoidal_params['x0']))
+            
+            msg = f"Deconvolution parameters loaded successfully!\n\n"
+            msg += f"Passes: {passes_arr.shape[0]} elements\n"
+            msg += f"Contributions: {contribs_arr.shape[0]} elements\n"
+            msg += f"Kernel dimension: {kernel_dim}x{kernel_dim}\n"
+            if sigmoidal_params:
+                msg += f"x0: {sigmoidal_params.get('x0', 'N/A')}\n"
+            msg += f"\nKernels will be computed per-channel using I0 from each channel's max intensity."
+            QtWidgets.QMessageBox.information(self, "Success", msg)
+            
+        except Exception as e:
+            QtWidgets.QMessageBox.critical(self, "Error", f"Failed to load deconvolution parameters: {str(e)}")
+            import traceback
+            traceback.print_exc()
     
     def _clear_kernel_arrays(self):
         """Clear loaded kernel arrays and use defaults."""
         self.deconv_passes = None
         self.deconv_contributions = None
         self.deconv_psf_kernel = None
-        self.kernel_file_label.setText("No kernel arrays loaded (using defaults)")
+        self.deconv_passes_arr = None
+        self.deconv_contribs_arr = None
+        self.deconv_kernel_dim = None
+        self.deconv_region_data_full = None
+        self.deconv_sigmoidal_params = None
+        self.kernel_file_label.setText("No deconvolution parameters loaded (using defaults)")
         self.kernel_file_label.setStyleSheet("QLabel { color: #666; }")
         self.clear_kernel_btn.setEnabled(False)
         # Show x0 parameter again when kernel is cleared
@@ -1863,6 +1998,15 @@ class DeconvolutionDialog(QtWidgets.QDialog):
         self.x0_spin.show()
     
     def get_deconv_passes_contributions(self):
-        """Get the passes, contributions arrays, and PSF kernel for deconvolution."""
-        return self.deconv_passes, self.deconv_contributions, self.deconv_psf_kernel
+        """Get the passes, contributions arrays, and PSF kernel for deconvolution.
+        
+        Returns tuple: (passes, contributions, kernel, passes_arr, contribs_arr, kernel_dim, region_data_full, sigmoidal_params)
+        For new format: passes_arr, contribs_arr, kernel_dim, region_data_full are populated
+        For legacy format: passes, contributions, kernel are populated
+        """
+        return (
+            self.deconv_passes, self.deconv_contributions, self.deconv_psf_kernel,
+            self.deconv_passes_arr, self.deconv_contribs_arr, self.deconv_kernel_dim,
+            self.deconv_region_data_full, self.deconv_sigmoidal_params
+        )
 

@@ -1,0 +1,40 @@
+channel,name,keep,ilastik,deepcell,cellpose
+In113,Histone H31,1,,,0
+La139,Histone H32,1,,,0
+Pr141,Cytokeratin 5,1,,,1
+Nd142,Fibronectin,1,,,1
+Nd143,Cytokeratin 19,1,,,1
+Nd144,Cytokeratin 8/18,1,,,1
+Nd145,Twist,1,,,
+Nd146,CD68,1,,,1
+Sm147,Keratin 14 (KRT14),1,,,1
+Nd148,SMA,1,,,1
+Sm149,Vimentin,1,,,1
+Nd150,c-Myc,1,,,
+Eu151,c-erbB-2 - Her2,1,,,1
+Sm152,CD3,1,,,1
+Eu153,Histone H33,1,,,
+Sm154,Erk1/2,1,,,
+Gd155,Slug,1,,,
+Gd156,Rabbit IgG H L,1,,,
+Gd158,Progesterone Receptor A/B,1,,,1
+Tb159,p53,1,,,
+Gd160,CD44,1,,,1
+Dy161,EpCAM,1,,,
+Dy162,CD45,1,,,1
+Dy163,GATA3,1,,,
+Dy164,CD20,1,,,1
+Ho165,b-Catenin,1,,,1
+Er166,Carbonic Anhydrase IX,1,,,
+Er167,undefined,1,,,1
+Er168,Ki-67,1,,,1
+Tm169,EGFR,1,,,
+Er170,S6,1,,,
+Yb171,Sox9,1,,,
+Yb172,CD31,1,,,
+Yb173,mTOR,1,,,
+Yb174,Cytokeratin 7,1,,,1
+Lu175,pan Cytokeratin,1,,,1
+Yb176,Cleaved Caspase3,1,,,
+Ir191,DNA1,1,,,0
+Ir193,DNA2,1,,,0

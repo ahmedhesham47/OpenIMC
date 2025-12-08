@@ -765,15 +765,6 @@ class MainWindow(QtWidgets.QMainWindow):
         scaling_layout = QtWidgets.QVBoxLayout(self.scaling_frame)
         scaling_layout.addWidget(QtWidgets.QLabel("Custom Intensity Range:"))
         
-        # Note about arcsinh transform
-        arcsinh_note = QtWidgets.QLabel(
-            "Note: Arcsinh transform should be applied on extracted\n"
-            "intensity features, not on raw images during export."
-        )
-        arcsinh_note.setStyleSheet("QLabel { color: #666; font-size: 9pt; font-style: italic; }")
-        arcsinh_note.setWordWrap(True)
-        scaling_layout.addWidget(arcsinh_note)
-        
         # Channel selection for per-channel scaling
         channel_row = QtWidgets.QHBoxLayout()
         channel_row.addWidget(QtWidgets.QLabel("Channel:"))
@@ -842,25 +833,8 @@ class MainWindow(QtWidgets.QMainWindow):
         self.rgb_combination_frame.setVisible(False)  # Hidden by default, shown in RGB mode
         scaling_layout.addWidget(self.rgb_combination_frame)
         
-        # Arcsinh normalization controls
-        arcsinh_layout = QtWidgets.QHBoxLayout()
-        arcsinh_layout.addWidget(QtWidgets.QLabel("Arcsinh Co-factor:"))
-        self.cofactor_spinbox = QtWidgets.QDoubleSpinBox()
-        self.cofactor_spinbox.setRange(0.1, 100.0)
-        self.cofactor_spinbox.setDecimals(1)
-        self.cofactor_spinbox.setValue(1.0)
-        self.cofactor_spinbox.setSingleStep(0.5)
-        arcsinh_layout.addWidget(self.cofactor_spinbox)
-        arcsinh_layout.addStretch()
-        scaling_layout.addLayout(arcsinh_layout)
-        
         # Control buttons
         button_row = QtWidgets.QVBoxLayout()  # Changed to vertical for better button sizing
-        self.arcsinh_btn = QtWidgets.QPushButton("Arcsinh Normalization")
-        self.arcsinh_btn.clicked.connect(self._arcsinh_normalization)
-        self.arcsinh_btn.setMinimumWidth(200)  # Wide enough for text
-        button_row.addWidget(self.arcsinh_btn)
-        
         self.default_range_btn = QtWidgets.QPushButton("Default Range")
         self.default_range_btn.clicked.connect(self._default_range)
         self.default_range_btn.setMinimumWidth(200)  # Wide enough for text
@@ -927,7 +901,7 @@ class MainWindow(QtWidgets.QMainWindow):
         
         # Per-channel scaling method state
         self.current_scaling_method = "default"  # kept for backward compatibility
-        self.channel_scaling_method: Dict[str, str] = {}  # {channel: "default"|"arcsinh"}
+        self.channel_scaling_method: Dict[str, str] = {}  # {channel: "default"}
         
         # Segmentation state
         # Use dynamic mask manager for large datasets
@@ -994,7 +968,7 @@ class MainWindow(QtWidgets.QMainWindow):
         self.channel_color_assignments = {}
         
         # Available colors for assignment (multicolor mode)
-        self.available_colors_multicolor = ['Blue', 'Teal', 'Yellow', 'Magenta', 'Red', 'White']
+        self.available_colors_multicolor = ['Blue', 'Teal', 'Green', 'Yellow', 'Magenta', 'Red', 'White']
         # Available colors for RGB mode
         self.available_colors_rgb = ['Red', 'Green', 'Blue']
         # Current available colors (default to multicolor)
@@ -1138,6 +1112,8 @@ class MainWindow(QtWidgets.QMainWindow):
             export_submenu = file_menu.addMenu("Export")
             act_export_tiff = export_submenu.addAction("Export to OME-TIFF…")
             act_export_tiff.triggered.connect(self._export_ome_tiff)
+            act_export_panel = export_submenu.addAction("Export Panel CSV…")
+            act_export_panel.triggered.connect(self._export_panel)
             
             # Masks submenu
             masks_submenu = file_menu.addMenu("Segmentation Masks")
@@ -2052,14 +2028,6 @@ class MainWindow(QtWidgets.QMainWindow):
             self._update_scaling_channel_combo()
             self._load_channel_scaling()
         
-        # Handle arcsinh state when switching between RGB and grid view
-        if self.grid_view_chk.isChecked():
-            # Switching to grid view - arcsinh becomes available for all channels
-            self._enable_auto_scaling_for_grid_view()
-        else:
-            # Switching to RGB view - revert channels that had arcsinh applied in grid view
-            self._revert_auto_scaling_for_rgb_view()
-        
         self.preserve_zoom = True
         self._view_selected()
 
@@ -2226,7 +2194,7 @@ class MainWindow(QtWidgets.QMainWindow):
                             assigned_colors.add('Blue')
                 
                 # Add all available colors, but prioritize assigned ones
-                all_colors = ['Blue', 'Teal', 'Yellow', 'Magenta', 'Red', 'White']
+                all_colors = ['Blue', 'Teal', 'Green', 'Yellow', 'Magenta', 'Red', 'White']
                 for color in all_colors:
                     if color in assigned_colors or not assigned_colors:  # Show all if none assigned
                         self.scaling_channel_combo.addItem(color)
@@ -3020,139 +2988,11 @@ class MainWindow(QtWidgets.QMainWindow):
     
     def _update_minmax_controls_state(self):
         """Enable/disable min/max controls based on scaling method."""
-        # Determine current channel's method
-        current_channel = self.scaling_channel_combo.currentText()
-        method = self.channel_scaling_method.get(current_channel, "default")
-        
-        # Check if automatic scaling should be disabled for this channel
-        auto_scaling_disabled = self._is_auto_scaling_disabled_for_channel(current_channel)
-        
-        if method in ["arcsinh"]:
-            # Disable min/max controls for automatic scaling methods
-            self.min_spinbox.setEnabled(False)
-            self.max_spinbox.setEnabled(False)
-            self.min_spinbox.setStyleSheet("QDoubleSpinBox { background-color: #f0f0f0; color: #666; }")
-            self.max_spinbox.setStyleSheet("QDoubleSpinBox { background-color: #f0f0f0; color: #666; }")
-        else:
-            # Enable min/max controls for manual/default scaling
-            self.min_spinbox.setEnabled(True)
-            self.max_spinbox.setEnabled(True)
-            self.min_spinbox.setStyleSheet("")
-            self.max_spinbox.setStyleSheet("")
-        
-        # Update arcsinh button states
-        if auto_scaling_disabled:
-            self.arcsinh_btn.setEnabled(False)
-            self.arcsinh_btn.setToolTip("Arcsinh disabled: Multiple markers assigned to same RGB color")
-            self.cofactor_spinbox.setEnabled(False)
-        else:
-            self.arcsinh_btn.setEnabled(True)
-            self.arcsinh_btn.setToolTip("Apply arcsinh normalization to current channel")
-            self.cofactor_spinbox.setEnabled(True)
-
-    def _is_auto_scaling_disabled_for_channel(self, channel: str) -> bool:
-        """Check if automatic scaling (arcsinh) should be disabled for a channel because multiple markers are assigned to the same RGB color."""
-        if not channel:
-            return False
-        
-        # In grid view, all channels are displayed individually, so arcsinh is always available
-        if self.grid_view_chk.isChecked():
-            return False
-        
-        # Get current RGB color assignments
-        def _checked(lst: QtWidgets.QListWidget) -> List[str]:
-            vals: List[str] = []
-            for i in range(lst.count()):
-                item = lst.item(i)
-                if item.checkState() == Qt.Checked:
-                    vals.append(item.text())
-            return vals
-        
-        red_selection = _checked(self.red_list)
-        green_selection = _checked(self.green_list)
-        blue_selection = _checked(self.blue_list)
-        
-        # Check if this channel is assigned to any RGB color that has multiple channels
-        if channel in red_selection and len(red_selection) > 1:
-            return True
-        if channel in green_selection and len(green_selection) > 1:
-            return True
-        if channel in blue_selection and len(blue_selection) > 1:
-            return True
-        
-        return False
-
-    def _enable_auto_scaling_for_grid_view(self):
-        """Enable arcsinh for all channels when switching to grid view."""
-        # In grid view, all channels are displayed individually, so arcsinh is always available
-        # No special action needed - the _update_minmax_controls_state will handle enabling the buttons
-        pass
-
-    def _revert_auto_scaling_for_rgb_view(self):
-        """Revert channels to default range when switching back to RGB view if they had arcsinh applied in grid view."""
-        # Get current RGB color assignments
-        def _checked(lst: QtWidgets.QListWidget) -> List[str]:
-            vals: List[str] = []
-            for i in range(lst.count()):
-                item = lst.item(i)
-                if item.checkState() == Qt.Checked:
-                    vals.append(item.text())
-            return vals
-        
-        red_selection = _checked(self.red_list)
-        green_selection = _checked(self.green_list)
-        blue_selection = _checked(self.blue_list)
-        
-        # Find channels that have multiple assignments and had arcsinh applied
-        channels_to_revert = []
-        
-        # Check red channels
-        if len(red_selection) > 1:
-            for channel in red_selection:
-                if (channel in self.channel_scaling_method and 
-                    self.channel_scaling_method[channel] == "arcsinh"):
-                    channels_to_revert.append(channel)
-        
-        # Check green channels
-        if len(green_selection) > 1:
-            for channel in green_selection:
-                if (channel in self.channel_scaling_method and 
-                    self.channel_scaling_method[channel] == "arcsinh"):
-                    channels_to_revert.append(channel)
-        
-        # Check blue channels
-        if len(blue_selection) > 1:
-            for channel in blue_selection:
-                if (channel in self.channel_scaling_method and 
-                    self.channel_scaling_method[channel] == "arcsinh"):
-                    channels_to_revert.append(channel)
-        
-        # Revert each channel to default range
-        for channel in channels_to_revert:
-            try:
-                if self.current_acq_id:
-                    loader = self._get_loader_for_acquisition(self.current_acq_id)
-                    if loader is None:
-                        continue
-                    img = loader.get_image(self.current_acq_id, channel)
-                    min_val = float(np.min(img))
-                    max_val = float(np.max(img))
-                    
-                    # Update scaling method to default
-                    self.channel_scaling_method[channel] = "default"
-                    
-                    # Clear normalization settings
-                    if channel in self.channel_normalization:
-                        self.channel_normalization.pop(channel, None)
-                    
-                    # Update scaling values
-                    self.channel_scaling[channel] = {'min': min_val, 'max': max_val}
-                    
-            except Exception as e:
-                print(f"Error reverting channel {channel} to default range: {e}")
-        
-        # Update UI controls to reflect the reverted state
-        self._update_minmax_controls_state()
+        # Min/max controls are always enabled for manual scaling
+        self.min_spinbox.setEnabled(True)
+        self.max_spinbox.setEnabled(True)
+        self.min_spinbox.setStyleSheet("")
+        self.max_spinbox.setStyleSheet("")
 
     def _load_channel_scaling(self):
         """Load scaling values for the currently selected channel or RGB color."""
@@ -3170,7 +3010,7 @@ class MainWindow(QtWidgets.QMainWindow):
             is_rgb_color = current_selection in ['Red', 'Green', 'Blue']
         else:
             # Multicolor mode or grid mode
-            is_rgb_color = current_selection in ['Red', 'Teal', 'Blue', 'Yellow', 'Magenta', 'White']
+            is_rgb_color = current_selection in ['Red', 'Teal', 'Green', 'Blue', 'Yellow', 'Magenta', 'White']
         
         if is_rgb_color:
             # Load RGB color scaling
@@ -3289,13 +3129,6 @@ class MainWindow(QtWidgets.QMainWindow):
         
         # Update spinboxes based on actual values
         self._update_spinboxes_from_values(min_val, max_val)
-        
-        # Load per-channel arcsinh cofactor if available (only for non-RGB mode)
-        if not is_rgb_color and current_selection in self.channel_normalization:
-            norm_cfg = self.channel_normalization[current_selection]
-            if norm_cfg.get("method") == "arcsinh":
-                cofactor = norm_cfg.get("cofactor", 1.0)
-                self.cofactor_spinbox.setValue(float(cofactor))
 
     def _save_channel_scaling(self):
         """Save current scaling values for the selected channel or RGB color."""
@@ -3317,7 +3150,7 @@ class MainWindow(QtWidgets.QMainWindow):
             is_rgb_color = current_selection in ['Red', 'Green', 'Blue']
         else:
             # Multicolor mode or grid mode
-            is_rgb_color = current_selection in ['Red', 'Teal', 'Blue', 'Yellow', 'Magenta', 'White']
+            is_rgb_color = current_selection in ['Red', 'Teal', 'Green', 'Blue', 'Yellow', 'Magenta', 'White']
         
         if is_rgb_color:
             # Save RGB color scaling
@@ -3336,55 +3169,6 @@ class MainWindow(QtWidgets.QMainWindow):
         self.min_spinbox.blockSignals(False)
         self.max_spinbox.blockSignals(False)
 
-
-    def _arcsinh_normalization(self):
-        """Apply arcsinh normalization with configurable co-factor."""
-        if self.current_acq_id is None:
-            return
-        
-        current_channel = self.scaling_channel_combo.currentText()
-        if not current_channel:
-            return
-        
-        # Check if automatic scaling is disabled for this channel
-        if self._is_auto_scaling_disabled_for_channel(current_channel):
-            QtWidgets.QMessageBox.warning(self, "Arcsinh Disabled", 
-                f"Arcsinh normalization is disabled for '{current_channel}' because multiple markers are assigned to the same RGB color.")
-            return
-        
-        try:
-            loader = self._get_loader_for_acquisition(self.current_acq_id)
-            if loader is None:
-                return
-            img = loader.get_image(self.current_acq_id, current_channel)
-            # Apply denoising if enabled/configured before normalization
-            try:
-                img = self._apply_denoise(current_channel, img)
-            except Exception:
-                pass
-            cofactor = self.cofactor_spinbox.value()
-            
-            # Apply arcsinh normalization
-            normalized_img = arcsinh_normalize(img, cofactor=cofactor)
-            
-            # Get the min/max values of the normalized image for scaling
-            min_val = float(np.min(normalized_img))
-            max_val = float(np.max(normalized_img))
-            
-            self._update_spinboxes_from_values(min_val, max_val)
-            
-            # Update scaling method state
-            self.current_scaling_method = "arcsinh"
-            self.channel_scaling_method[current_channel] = "arcsinh"
-            # Only set normalization for the selected channel
-            self.channel_normalization[current_channel] = {"method": "arcsinh", "cofactor": cofactor}
-            self._update_minmax_controls_state()
-            
-            # Auto-apply the scaling
-            self._save_channel_scaling()
-            self._view_selected()
-        except Exception as e:
-            print(f"Error in arcsinh normalization: {e}")
 
     def _default_range(self):
         """Set scaling to the image's actual min/max range."""
@@ -3459,12 +3243,6 @@ class MainWindow(QtWidgets.QMainWindow):
             img = self._apply_denoise(channel, img)
         except Exception:
             pass
-
-        # Apply per-channel normalization (if configured)
-        norm_cfg = self.channel_normalization.get(channel)
-        if norm_cfg and norm_cfg.get("method") == "arcsinh":
-            cofactor = float(norm_cfg.get("cofactor", 1.0))
-            img = arcsinh_normalize(img, cofactor=cofactor)
         
         return img
     
@@ -3546,17 +3324,8 @@ class MainWindow(QtWidgets.QMainWindow):
         common_channels = sorted(list(matrix_channels.intersection(image_channels)), key=lambda x: channels.index(x) if x in channels else 999)
         
         if not common_channels:
-            # No overlap, apply normalization to original images and return
-            channel_images = {}
-            for ch in channels:
-                img = channel_images_denoised[ch]
-                # Apply normalization if configured
-                norm_cfg = self.channel_normalization.get(ch)
-                if norm_cfg and norm_cfg.get("method") == "arcsinh":
-                    cofactor = float(norm_cfg.get("cofactor", 1.0))
-                    img = arcsinh_normalize(img, cofactor=cofactor)
-                channel_images[ch] = img
-            return channel_images
+            # No overlap, return original images
+            return channel_images_denoised
         
         # Step 2: Apply spillover correction
         # Get image dimensions from first channel
@@ -3593,18 +3362,8 @@ class MainWindow(QtWidgets.QMainWindow):
             print(f"Error applying spillover correction: {e}")
             # Continue with original images on error
         
-        # Step 3: Apply normalization/scaling to all channels
-        channel_images = {}
-        for ch in channels:
-            img = channel_images_denoised[ch]
-            # Apply normalization if configured
-            norm_cfg = self.channel_normalization.get(ch)
-            if norm_cfg and norm_cfg.get("method") == "arcsinh":
-                cofactor = float(norm_cfg.get("cofactor", 1.0))
-                img = arcsinh_normalize(img, cofactor=cofactor)
-            channel_images[ch] = img
-        
-        return channel_images
+        # Step 3: Return corrected images (no normalization applied)
+        return channel_images_denoised
 
     def _start_prefetch_all_channels(self, acq_id: str):
         """Prefetch all channels for the given acquisition in the background (non-blocking)."""
@@ -4267,7 +4026,7 @@ class MainWindow(QtWidgets.QMainWindow):
             color_groups[color].append(ch)
         
         title_parts = []
-        for color in ['Red', 'Teal', 'Blue', 'Yellow', 'Magenta', 'White']:
+        for color in ['Red', 'Teal', 'Green', 'Blue', 'Yellow', 'Magenta', 'White']:
             if color in color_groups:
                 ch_list = '+'.join(color_groups[color])
                 title_parts.append(f"{ch_list} ({color})")
@@ -4894,6 +4653,49 @@ class MainWindow(QtWidgets.QMainWindow):
                 )
         
         return True
+    
+    def _export_panel(self):
+        """Export panel.csv file from current acquisition."""
+        if not self.acquisitions:
+            QtWidgets.QMessageBox.information(self, "No acquisitions", "Open a file or folder first.")
+            return
+        
+        if not self.current_acq_id:
+            QtWidgets.QMessageBox.information(self, "No acquisition selected", "Please select an acquisition first.")
+            return
+        
+        # Get current acquisition info
+        acq_info = self._get_acquisition_info(self.current_acq_id)
+        if acq_info is None:
+            QtWidgets.QMessageBox.critical(self, "Error", "Could not find acquisition information.")
+            return
+        
+        # Open file dialog to save panel.csv
+        file_path, _ = QtWidgets.QFileDialog.getSaveFileName(
+            self,
+            "Export Panel CSV",
+            "panel.csv",
+            "CSV Files (*.csv);;All Files (*)"
+        )
+        
+        if not file_path:
+            return  # User cancelled
+        
+        try:
+            from openimc.core import get_panel
+            
+            # Generate panel.csv
+            output_path = get_panel(acq_info, file_path)
+            
+            QtWidgets.QMessageBox.information(
+                self, "Export Complete",
+                f"Panel CSV exported successfully to:\n{output_path}"
+            )
+        except Exception as e:
+            QtWidgets.QMessageBox.critical(
+                self, "Export Failed",
+                f"Failed to export panel CSV:\n{str(e)}"
+            )
     
     def _apply_export_denoising(self, img: np.ndarray, channel: str, 
                                  denoise_source: str, custom_denoise_settings: dict) -> np.ndarray:
@@ -8954,7 +8756,7 @@ class MainWindow(QtWidgets.QMainWindow):
         x0 = dlg.get_x0()
         iterations = dlg.get_iterations()
         output_format = dlg.get_output_format()
-        passes, contributions, psf_kernel = dlg.get_deconv_passes_contributions()
+        passes, contributions, psf_kernel, passes_arr, contribs_arr, kernel_dim, region_data_full, sigmoidal_params = dlg.get_deconv_passes_contributions()
         
         # Create and show progress dialog
         progress_dlg = ProgressDialog("High Resolution Deconvolution", self)
@@ -8963,11 +8765,13 @@ class MainWindow(QtWidgets.QMainWindow):
         try:
             if acq_type == "single":
                 success = self._deconvolve_single_acquisition(
-                    output_dir, progress_dlg, x0, iterations, output_format, passes, contributions, psf_kernel
+                    output_dir, progress_dlg, x0, iterations, output_format, passes, contributions, psf_kernel,
+                    passes_arr, contribs_arr, kernel_dim, region_data_full, None
                 )
             else:
                 success = self._deconvolve_whole_slide(
-                    output_dir, progress_dlg, x0, iterations, output_format, passes, contributions, psf_kernel
+                    output_dir, progress_dlg, x0, iterations, output_format, passes, contributions, psf_kernel,
+                    passes_arr, contribs_arr, kernel_dim, region_data_full, None
                 )
             
             progress_dlg.close()
@@ -9003,8 +8807,10 @@ class MainWindow(QtWidgets.QMainWindow):
             traceback.print_exc()
     
     def _deconvolve_single_acquisition(self, output_dir: str, progress_dlg: ProgressDialog,
-                                       x0: float, iterations: int, output_format: str,
-                                       passes=None, contributions=None, kernel=None) -> bool:
+                                     x0: float, iterations: int, output_format: str,
+                                     passes=None, contributions=None, kernel=None,
+                                     passes_arr=None, contribs_arr=None, kernel_dim=None,
+                                     region_data_full=None, I0=None) -> bool:
         """Deconvolve the currently selected acquisition."""
         if not self.current_acq_id:
             raise ValueError("No acquisition selected")
@@ -9089,6 +8895,10 @@ class MainWindow(QtWidgets.QMainWindow):
         progress_dlg.update_progress(0, f"Deconvolving {acq_info.name}", "Starting deconvolution...")
         
         try:
+            # Clear image cache before deconvolution to ensure fresh data
+            with self._cache_lock:
+                self.image_cache.clear()
+            
             # Deconvolve the acquisition using core function
             progress_dlg.update_progress(10, f"Deconvolving {acq_info.name}", "Loading image data...")
             
@@ -9119,7 +8929,12 @@ class MainWindow(QtWidgets.QMainWindow):
                 unique_acq_id=self.current_acq_id,
                 passes=passes,
                 contributions=contributions,
-                kernel=kernel
+                kernel=kernel,
+                passes_arr=passes_arr,
+                contribs_arr=contribs_arr,
+                kernel_dim=kernel_dim,
+                region_data_full=region_data_full,
+                I0=None  # Will be computed per channel from max intensity
             )
             
             output_path = str(output_path)  # Convert Path to string for compatibility
@@ -9164,24 +8979,221 @@ class MainWindow(QtWidgets.QMainWindow):
     
     def _deconvolve_whole_slide(self, output_dir: str, progress_dlg: ProgressDialog,
                                 x0: float, iterations: int, output_format: str,
-                                passes=None, contributions=None, kernel=None) -> bool:
-        """Deconvolve all acquisitions."""
+                                passes=None, contributions=None, kernel=None,
+                                passes_arr=None, contribs_arr=None, kernel_dim=None,
+                                region_data_full=None, I0=None) -> bool:
+        """Deconvolve all acquisitions. Uses multiprocessing for many ROIs."""
         if not self.acquisitions:
             raise ValueError("No acquisitions found")
         
-        total_acqs = len(self.acquisitions)
-        progress_dlg.set_maximum(total_acqs * 100)
+        # Clear image cache before deconvolution to ensure fresh data
+        with self._cache_lock:
+            self.image_cache.clear()
         
-        processed = 0
-        for acq in self.acquisitions:
-            if progress_dlg.is_cancelled():
-                return False
+        total_acqs = len(self.acquisitions)
+        
+        # Use multiprocessing if we have many acquisitions (>= 4)
+        use_multiprocessing = total_acqs >= 4
+        
+        if use_multiprocessing:
+            # Use multiprocessing for parallel deconvolution
+            import multiprocessing as mp
+            from functools import partial
             
-            progress_dlg.update_progress(
-                processed * 100,
-                f"Deconvolving {acq.name}",
-                f"Processing acquisition {processed + 1} of {total_acqs}"
-            )
+            # Determine number of workers (use CPU count but cap at number of acquisitions)
+            max_workers = min(mp.cpu_count(), total_acqs, 8)  # Cap at 8 to avoid too many processes
+            
+            progress_dlg.set_maximum(total_acqs * 100)
+            progress_dlg.update_progress(0, "Preparing multiprocessing", f"Setting up {max_workers} workers for {total_acqs} acquisitions...")
+            
+            # Prepare arguments for each acquisition
+            deconv_args = []
+            for acq in self.acquisitions:
+                # Get the loader and determine type
+                loader = self._get_loader_for_acquisition(acq.id)
+                if loader is None:
+                    continue
+                
+                # Get original acquisition ID
+                original_acq_id = self._get_original_acq_id(acq.id)
+                
+                # Determine data path and loader type
+                data_path = None
+                loader_type = None
+                source_file_path = None
+                
+                if isinstance(loader, MCDLoader):
+                    loader_type = "mcd"
+                    if acq.id in self.acq_to_file:
+                        data_path = self.acq_to_file[acq.id]
+                    elif acq.source_file:
+                        data_path = acq.source_file
+                    elif self.current_path and os.path.isfile(self.current_path) and self.current_path.lower().endswith('.mcd'):
+                        data_path = self.current_path
+                    
+                    if not data_path or not os.path.isfile(data_path):
+                        continue
+                    source_file_path = data_path
+                    
+                elif isinstance(loader, OMETIFFLoader):
+                    loader_type = "ometiff"
+                    if hasattr(loader, '_acq_map') and original_acq_id in loader._acq_map:
+                        data_path = loader._acq_map[original_acq_id]
+                    elif acq.source_file:
+                        data_path = acq.source_file
+                    elif self.current_path and os.path.isdir(self.current_path):
+                        import glob
+                        tiff_files = glob.glob(os.path.join(self.current_path, "*.ome.tif"))
+                        tiff_files.extend(glob.glob(os.path.join(self.current_path, "*.ome.tiff")))
+                        tiff_files.extend(glob.glob(os.path.join(self.current_path, "*.tif")))
+                        tiff_files.extend(glob.glob(os.path.join(self.current_path, "*.tiff")))
+                        for tiff_file in tiff_files:
+                            if acq.name in os.path.basename(tiff_file):
+                                data_path = tiff_file
+                                break
+                        if not data_path and tiff_files:
+                            data_path = tiff_files[0]
+                    
+                    if not data_path or not os.path.isfile(data_path):
+                        continue
+                    
+                    if self.current_path and os.path.isdir(self.current_path):
+                        source_file_path = self.current_path
+                    else:
+                        source_file_path = os.path.dirname(data_path) if data_path else None
+                
+                if not data_path or loader_type is None:
+                    continue
+                
+                # Convert AcquisitionInfo to dict for multiprocessing (not pickleable)
+                acq_info_dict = {
+                    'id': original_acq_id,
+                    'name': acq.name,
+                    'well': acq.well,
+                    'size': acq.size,
+                    'channels': acq.channels,
+                    'channel_metals': acq.channel_metals,
+                    'channel_labels': acq.channel_labels,
+                    'metadata': acq.metadata,
+                    'source_file': acq.source_file
+                }
+                
+                deconv_args.append((
+                    loader_type, acq_info_dict, data_path, source_file_path, acq.id,
+                    output_dir, x0, iterations, output_format,
+                    passes, contributions, kernel,
+                    passes_arr, contribs_arr, kernel_dim, region_data_full, I0
+                ))
+            
+            # Worker function for multiprocessing
+            def deconv_worker(args):
+                (loader_type, acq_info_dict, data_path, source_file_path, unique_acq_id,
+                 output_dir, x0, iterations, output_format,
+                 passes, contributions, kernel,
+                 passes_arr, contribs_arr, kernel_dim, region_data_full, I0) = args
+                
+                try:
+                    # Create loader in worker process (loaders are not pickleable)
+                    if loader_type == "mcd":
+                        from openimc.data.mcd_loader import MCDLoader
+                        loader = MCDLoader()
+                        loader.open(data_path)
+                    elif loader_type == "ometiff":
+                        from openimc.data.ometiff_loader import OMETIFFLoader
+                        loader = OMETIFFLoader()
+                        loader.open(source_file_path if os.path.isdir(source_file_path) else os.path.dirname(data_path))
+                    else:
+                        raise ValueError(f"Unknown loader type: {loader_type}")
+                    
+                    # Reconstruct AcquisitionInfo from dict
+                    from openimc.data.mcd_loader import AcquisitionInfo
+                    acq_info = AcquisitionInfo(**acq_info_dict)
+                    
+                    try:
+                        from openimc.core import deconvolution
+                        deconvolution(
+                            loader=loader,
+                            acquisition=acq_info,
+                            output_dir=output_dir,
+                            x0=x0,
+                            iterations=iterations,
+                            output_format=output_format,
+                            loader_path=data_path,
+                            source_file_path=source_file_path,
+                            unique_acq_id=unique_acq_id,
+                            passes=passes,
+                            contributions=contributions,
+                            kernel=kernel,
+                            passes_arr=passes_arr,
+                            contribs_arr=contribs_arr,
+                            kernel_dim=kernel_dim,
+                            region_data_full=region_data_full,
+                            I0=I0
+                        )
+                        return (unique_acq_id, True, None)
+                    finally:
+                        # Close loader in worker process
+                        loader.close()
+                except Exception as e:
+                    import traceback
+                    return (unique_acq_id, False, str(e))
+            
+            # Process in parallel
+            processed = 0
+            try:
+                with mp.Pool(processes=max_workers) as pool:
+                    results = []
+                    for result in pool.imap(deconv_worker, deconv_args):
+                        if progress_dlg.is_cancelled():
+                            pool.terminate()
+                            pool.join()
+                            return False
+                        
+                        unique_acq_id, success, error = result
+                        processed += 1
+                        
+                        if success:
+                            progress_dlg.update_progress(
+                                processed * 100,
+                                f"Deconvolved {unique_acq_id}",
+                                f"Completed {processed} of {total_acqs} acquisitions"
+                            )
+                        else:
+                            progress_dlg.update_progress(
+                                processed * 100,
+                                f"Error processing {unique_acq_id}",
+                                f"Error: {error}"
+                            )
+                        results.append((unique_acq_id, success, error))
+                    
+                    # Count successful deconvolutions
+                    successful = sum(1 for _, success, _ in results if success)
+                    progress_dlg.update_progress(
+                        total_acqs * 100,
+                        "Complete",
+                        f"Successfully deconvolved {successful} of {total_acqs} acquisition(s)"
+                    )
+            except Exception as e:
+                # Fall back to sequential processing if multiprocessing fails
+                print(f"Multiprocessing failed, falling back to sequential: {e}")
+                import traceback
+                traceback.print_exc()
+                use_multiprocessing = False
+        
+        if not use_multiprocessing:
+            # Sequential processing (original code)
+            progress_dlg.set_maximum(total_acqs * 100)
+            
+            processed = 0
+            for acq in self.acquisitions:
+                if progress_dlg.is_cancelled():
+                    return False
+                
+                progress_dlg.update_progress(
+                    processed * 100,
+                    f"Deconvolving {acq.name}",
+                    f"Processing acquisition {processed + 1} of {total_acqs}"
+                )
             
             try:
                 # Get the loader and determine type
@@ -9275,7 +9287,12 @@ class MainWindow(QtWidgets.QMainWindow):
                     unique_acq_id=acq.id,
                     passes=passes,
                     contributions=contributions,
-                    kernel=kernel
+                    kernel=kernel,
+                    passes_arr=passes_arr,
+                    contribs_arr=contribs_arr,
+                    kernel_dim=kernel_dim,
+                    region_data_full=region_data_full,
+                    I0=I0
                 )
                 
                 processed += 1

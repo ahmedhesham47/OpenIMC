@@ -144,6 +144,7 @@ class PreprocessingCache:
 COLOR_DEFINITIONS = {
     'Blue': (0.0, 0.0, 1.0),
     'Teal': (0.0, 0.7, 0.7),  # Teal is safer than green for multiplexed images
+    'Green': (0.0, 1.0, 0.0),
     'Yellow': (1.0, 1.0, 0.0),
     'Magenta': (1.0, 0.0, 1.0),
     'Red': (1.0, 0.0, 0.0),

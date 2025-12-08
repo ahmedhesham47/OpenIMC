@@ -2250,7 +2250,12 @@ def deconvolution(
     unique_acq_id: Optional[str] = None,
     passes: Optional[np.ndarray] = None,
     contributions: Optional[np.ndarray] = None,
-    kernel: Optional[np.ndarray] = None
+    kernel: Optional[np.ndarray] = None,
+    passes_arr: Optional[np.ndarray] = None,
+    contribs_arr: Optional[np.ndarray] = None,
+    kernel_dim: Optional[int] = None,
+    region_data_full: Optional[list] = None,
+    I0: Optional[float] = None
 ) -> Path:
     """Apply Richardson-Lucy deconvolution to high resolution IMC images.
     
@@ -2383,7 +2388,12 @@ def deconvolution(
         pixel_size_unit=pixel_size_unit,
         passes=passes,
         contributions=contributions,
-        kernel=kernel
+        kernel=kernel,
+        passes_arr=passes_arr,
+        contribs_arr=contribs_arr,
+        kernel_dim=kernel_dim,
+        region_data_full=region_data_full,
+        I0=I0
     )
     
     return Path(output_path)
@@ -3394,4 +3404,73 @@ def export_anndata(
             adata.write(str(file_path))
         
         return output_path
+
+
+def get_panel(
+    acq_info: AcquisitionInfo,
+    output_path: Union[str, Path]
+) -> Path:
+    """Generate a panel.csv file from acquisition information.
+    
+    Creates a CSV file with two columns:
+    - channel: Metal tag/channel identifier
+    - name: Channel name/label
+    
+    Args:
+        acq_info: AcquisitionInfo object containing channel metadata
+        output_path: Path where panel.csv will be saved
+    
+    Returns:
+        Path to the created panel.csv file
+    
+    Raises:
+        ValueError: If channel_metals and channel_labels are empty or mismatched
+    """
+    output_path = Path(output_path)
+    
+    # Ensure output directory exists
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    
+    # Get channel metals and labels
+    channel_metals = acq_info.channel_metals if acq_info.channel_metals else []
+    channel_labels = acq_info.channel_labels if acq_info.channel_labels else []
+    
+    # If both are empty, try to extract from channel names
+    if not channel_metals and not channel_labels and acq_info.channels:
+        # Try to parse channel names (format: "Label_Metal" or just "Metal")
+        for channel in acq_info.channels:
+            if '_' in channel:
+                parts = channel.split('_', 1)
+                if len(parts) == 2:
+                    channel_labels.append(parts[0])
+                    channel_metals.append(parts[1])
+                else:
+                    channel_labels.append("")
+                    channel_metals.append(channel)
+            else:
+                channel_labels.append("")
+                channel_metals.append(channel)
+    
+    # Ensure both lists have the same length
+    max_len = max(len(channel_metals), len(channel_labels))
+    while len(channel_metals) < max_len:
+        channel_metals.append("")
+    while len(channel_labels) < max_len:
+        channel_labels.append("")
+    
+    if not channel_metals and not channel_labels:
+        raise ValueError("No channel information available in acquisition")
+    
+    # Create DataFrame
+    panel_data = {
+        'channel': channel_metals,
+        'name': channel_labels
+    }
+    
+    df = pd.DataFrame(panel_data)
+    
+    # Save to CSV
+    df.to_csv(output_path, index=False)
+    
+    return output_path
 

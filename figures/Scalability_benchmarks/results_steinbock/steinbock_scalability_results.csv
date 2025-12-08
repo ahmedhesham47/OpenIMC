@@ -1,0 +1,55 @@
+num_images,num_workers,wall_time,peak_ram_mb,max_rss_mb,success,repeat,error
+50,1,45.56,398.87109375,398.87109375,True,0,
+100,1,81.65,430.1640625,430.1640625,True,0,
+200,1,,,,False,0,"intensities: Error: File not found: results_steinbock/temp_steinbock_benchmark/masks_subset_200/BaselTMA_SP41_33.475kx12.66ky_8500x8500_2_20170905_Liver_Liver_X1Y1_2_a0.tiff
+Command exited with non-zero status 1
+	Command being timed: ""steinbock measure intensities --img results_steinbock/temp_steinbock_benchmark/images_subset_200 --masks results_steinbock/temp_steinbock_benchmark/masks_subset_200 --no-mmap --panel /home/dean/Documents/OpenIMC/figures/Scalability_benchmarks/feature_extraction/panel.csv -o results_steinbock/temp_steinbock_benchmark/intensities_200""
+	User time (seconds): 4.58
+	System time (seconds): 0.33
+	Percent of CPU this job got: 252%
+	Elapsed (wall clock) time (h:mm:ss or m:ss): 0:01.94
+	Average shared text size (kbytes): 0
+	Average unshared data size (kbytes): 0
+	Average stack size (kbytes): 0
+	Average total size (kbytes): 0
+	Maximum resident set size (kbytes): 253000
+	Average resident set size (kbytes): 0
+	Major (requiring I/O) page faults: 0
+	Minor (reclaiming a frame) page faults: 56822
+	Voluntary context switches: 266
+	Involuntary context switches: 615
+	Swaps: 0
+	File system inputs: 1680
+	File system outputs: 2704
+	Socket messages sent: 0
+	Socket messages received: 0
+	Signals delivered: 0
+	Page size (bytes): 4096
+	Exit status: 1
+"
+500,1,,,,False,0,"intensities: Error: File not found: results_steinbock/temp_steinbock_benchmark/masks_subset_500/BaselTMA_SP41_33.475kx12.66ky_8500x8500_2_20170905_Liver_Liver_X1Y1_2_a0.tiff
+Command exited with non-zero status 1
+	Command being timed: ""steinbock measure intensities --img results_steinbock/temp_steinbock_benchmark/images_subset_500 --masks results_steinbock/temp_steinbock_benchmark/masks_subset_500 --no-mmap --panel /home/dean/Documents/OpenIMC/figures/Scalability_benchmarks/feature_extraction/panel.csv -o results_steinbock/temp_steinbock_benchmark/intensities_500""
+	User time (seconds): 4.46
+	System time (seconds): 0.33
+	Percent of CPU this job got: 248%
+	Elapsed (wall clock) time (h:mm:ss or m:ss): 0:01.93
+	Average shared text size (kbytes): 0
+	Average unshared data size (kbytes): 0
+	Average stack size (kbytes): 0
+	Average total size (kbytes): 0
+	Maximum resident set size (kbytes): 252492
+	Average resident set size (kbytes): 0
+	Major (requiring I/O) page faults: 0
+	Minor (reclaiming a frame) page faults: 56862
+	Voluntary context switches: 111
+	Involuntary context switches: 470
+	Swaps: 0
+	File system inputs: 0
+	File system outputs: 2704
+	Socket messages sent: 0
+	Socket messages received: 0
+	Signals delivered: 0
+	Page size (bytes): 4096
+	Exit status: 1
+"

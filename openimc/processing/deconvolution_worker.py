@@ -42,35 +42,43 @@ def RLD_HRIMC_circle(
     passes: np.ndarray = None,
     contributions: np.ndarray = None,
     kernel: np.ndarray = None,
+    passes_arr: np.ndarray = None,
+    contribs_arr: np.ndarray = None,
+    kernel_dim: int = None,
+    region_data_full: list = None,
+    I0: float = None,
 ) -> np.ndarray:
     """
     Apply Richardson-Lucy deconvolution to high resolution IMC image stack.
     
-    There are three modes of operation for the PSF kernel:
-    1. Direct kernel override (recommended for new HR-IMC usage):
-       - Provide a 3×3 kernel via `kernel`.
-       - `passes` / `contributions` / `x0` are ignored for PSF construction
-         (x0 should be baked into the kernel by the generator).
-    2. Custom Passes/Contributions path (for advanced users):
+    There are several modes of operation for the PSF kernel:
+    1. New region-based kernel generation (recommended):
+       - Provide `passes_arr`, `contribs_arr`, `kernel_dim`, `region_data_full`.
+       - Kernel is generated per channel using I0 from each channel's max intensity.
+       - Uses `x0` and channel-specific `I0` for sigmoidal loss function.
+    2. Direct kernel override:
+       - Provide a kernel via `kernel` (can be any size, not just 3×3).
+       - `passes` / `contributions` / `x0` are ignored for PSF construction.
+    3. Custom Passes/Contributions path (backward compatibility):
        - Provide 1D arrays `passes` and `contributions` of equal shape.
        - Kernel is built from Passes_scaled = logistic(passes, x0) * contributions
-         using the same index grouping as the original HR-IMC code. This only
-         makes sense if you match the original 97-element indexing convention.
-    3. Legacy hard-coded HR-IMC kernel (default):
-       - If neither `kernel` nor (`passes` + `contributions`) are provided,
-         the original Passes/Contributions arrays from the HR-IMC code are used.
+         using the same index grouping as the original HR-IMC code.
+    4. Legacy hard-coded HR-IMC kernel (default):
+       - If none of the above are provided, uses hard-coded arrays.
     
     Args:
         image_stack: Image stack with shape (C, H, W) or (H, W, C)
-        x0: Parameter for kernel calculation in legacy / Passes-based paths.
-            Ignored when `kernel` is provided directly. (default: 7.0)
+        x0: Parameter for kernel calculation (default: 7.0)
         iterations: Number of Richardson-Lucy iterations (default: 4)
         output_format: Output format, either 'float' or 'uint16' (default: 'float')
-        passes: Optional array of pass counts per subpixel. If None, uses default hard-coded array.
-        contributions: Optional array of contributions per subpixel. If None, uses default hard-coded array.
-                      Must be provided if passes is provided.
-        kernel: Optional direct 3×3 PSF kernel for HR-IMC. If provided, this overrides the
-                Passes/Contributions logic entirely.
+        passes: Optional array of pass counts (legacy format)
+        contributions: Optional array of contributions (legacy format)
+        kernel: Optional direct PSF kernel (any size). If provided, overrides other methods.
+        passes_arr: Optional new format passes array per region
+        contribs_arr: Optional new format contributions array per region
+        kernel_dim: Optional kernel dimension (for new format)
+        region_data_full: Optional list of region data dicts (for new format)
+        I0: Optional I0 value for sigmoidal loss. If None, uses max intensity per channel.
     
     Returns:
         Deconvolved image stack with same shape as input (except for border cropping)
@@ -119,79 +127,83 @@ def RLD_HRIMC_circle(
     # ------------------------------------------------------------------
     # Determine PSF construction mode
     # ------------------------------------------------------------------
+    use_new_region_format = False
+    use_direct_kernel = False
+    use_legacy_format = False
+    
     if kernel is not None:
-        # Direct 3×3 kernel override (recommended new behavior)
+        # Direct kernel override (any size)
         kernel = np.asarray(kernel, dtype=np.float32)
-        if kernel.shape != (3, 3):
-            raise ValueError(f"Provided kernel must be 3×3, got {kernel.shape}")
+        if kernel.ndim != 2:
+            raise ValueError(f"Provided kernel must be 2D, got {kernel.ndim}D with shape {kernel.shape}")
         if kernel.sum() <= 0:
             raise ValueError("Provided kernel has non-positive sum")
         kernel = kernel / kernel.sum()
         use_direct_kernel = True
+    elif passes_arr is not None and contribs_arr is not None and kernel_dim is not None and region_data_full is not None:
+        # New region-based format
+        use_new_region_format = True
+        from openimc.processing.hrimc_kernel_generator import compute_region_kernel
+    elif passes is not None and contributions is not None:
+        # Legacy custom passes+contributions format
+        use_legacy_format = True
+        passes = np.asarray(passes, dtype=float)
+        contributions = np.asarray(contributions, dtype=float)
+        if passes.shape != contributions.shape:
+            raise ValueError(
+                f"Passes and contributions arrays must have the same shape. "
+                f"Got passes.shape={passes.shape}, contributions.shape={contributions.shape}"
+            )
+        Contributions = contributions / contributions.sum()
+        Passes = passes
     else:
-        use_direct_kernel = False
-    
-    if not use_direct_kernel:
-        # Either custom passes+contributions or legacy hard-coded arrays
-        if passes is not None and contributions is not None:
-            passes = np.asarray(passes, dtype=float)
-            contributions = np.asarray(contributions, dtype=float)
-            if passes.shape != contributions.shape:
-                raise ValueError(
-                    f"Passes and contributions arrays must have the same shape. "
-                    f"Got passes.shape={passes.shape}, contributions.shape={contributions.shape}"
-                )
-            Contributions = contributions / contributions.sum()
-            Passes = passes
-        elif passes is not None or contributions is not None:
-            raise ValueError("Both passes and contributions must be provided together, or both must be None")
-        else:
-            # Legacy hard-coded arrays from original HR-IMC code
-            Passes = np.array([
-                7,6,5,8,7,
-                7,8,7,6,6,
-                7,9,8,7,8,
-                8,7,7,6,6,
-                7,6,6,5,5,
-                6,6,5,5,4,
-                4,6,4,5,3,
-                4,5,6,6,5,
-                4,5,5,4,3,
-                4,4,3,6,5,
-                4,5,5,4,4,
-                3,3,4,4,3,
-                3,2,4,3,2,
-                2,1,1,3,2,
-                2,1,1,3,3,
-                2,2,2,2,1,
-                1,1,1,3,2,
-                1,2,2,1,1,
-                2,1,1,4,3,
-                2,1
-            ], dtype=float)
-            Contributions = np.array([
-                0.02,0.00108,0.00108,0.0034,0.0196,
-                0.0196,0.0034,0.0034,0.0196,0.0196,
-                0.0034,0.00223,0.00223,0.00223,0.0034,
-                0.0034,0.0034,0.0034,0.0034,0.0034,
-                0.0196,0.00106,0.0196,0.00106,0.0196,
-                0.00108,0.00106,0.00106,0.00106,0.00106,
-                0.00108,0.0196,0.00106,0.0196,0.00106,
-                0.0196,0.0196,0.0034,0.0034,0.0196,
-                0.0196,0.0034,0.0034,0.0196,0.0196,
-                0.0034,0.0034,0.0196,0.00223,0.00223,
-                0.00223,0.0034,0.0034,0.0034,0.0034,
-                0.0034,0.0034,0.0196,0.00108,0.0196,
-                0.00106,0.0196,0.00108,0.00106,0.00106,
-                0.00106,0.00106,0.00108,0.0196,0.00106,
-                0.0196,0.00106,0.0196,0.0034,0.0034,
-                0.0196,0.0196,0.0034,0.0034,0.0196,
-                0.0196,0.0034,0.0034,0.00223,0.00223,
-                0.00223,0.0034,0.0034,0.0034,0.0034,
-                0.00108,0.00196,0.00108,0.00219,0.00219,
-                0.00219,0.00219
-            ], dtype=float)
-            Contributions = Contributions / Contributions.sum()
+        # Legacy hard-coded arrays from original HR-IMC code
+        use_legacy_format = True
+        Passes = np.array([
+            7,6,5,8,7,
+            7,8,7,6,6,
+            7,9,8,7,8,
+            8,7,7,6,6,
+            7,6,6,5,5,
+            6,6,5,5,4,
+            4,6,4,5,3,
+            4,5,6,6,5,
+            4,5,5,4,3,
+            4,4,3,6,5,
+            4,5,5,4,4,
+            3,3,4,4,3,
+            3,2,4,3,2,
+            2,1,1,3,2,
+            2,1,1,3,3,
+            2,2,2,2,1,
+            1,1,1,3,2,
+            1,2,2,1,1,
+            2,1,1,4,3,
+            2,1
+        ], dtype=float)
+        Contributions = np.array([
+            0.02,0.00108,0.00108,0.0034,0.0196,
+            0.0196,0.0034,0.0034,0.0196,0.0196,
+            0.0034,0.00223,0.00223,0.00223,0.0034,
+            0.0034,0.0034,0.0034,0.0034,0.0034,
+            0.0196,0.00106,0.0196,0.00106,0.0196,
+            0.00108,0.00106,0.00106,0.00106,0.00106,
+            0.00108,0.0196,0.00106,0.0196,0.00106,
+            0.0196,0.0196,0.0034,0.0034,0.0196,
+            0.0196,0.0034,0.0034,0.0196,0.0196,
+            0.0034,0.0034,0.0196,0.00223,0.00223,
+            0.00223,0.0034,0.0034,0.0034,0.0034,
+            0.0034,0.0034,0.0196,0.00108,0.0196,
+            0.00106,0.0196,0.00108,0.00106,0.00106,
+            0.00106,0.00106,0.00108,0.0196,0.00106,
+            0.0196,0.00106,0.0196,0.0034,0.0034,
+            0.0196,0.0196,0.0034,0.0034,0.0196,
+            0.0196,0.0034,0.0034,0.00223,0.00223,
+            0.00223,0.0034,0.0034,0.0034,0.0034,
+            0.00108,0.00196,0.00108,0.00219,0.00219,
+            0.00219,0.00219
+        ], dtype=float)
+        Contributions = Contributions / Contributions.sum()
     
     # Process each channel
     processed_layers = []
@@ -216,15 +228,36 @@ def RLD_HRIMC_circle(
         # Build or reuse kernel for this channel
         if use_direct_kernel:
             channel_kernel = kernel
+        elif use_new_region_format:
+            # New region-based kernel generation with I0 per channel
+            channel_I0 = float(np.max(layer_data)) if I0 is None else I0
+            if channel_I0 <= 0 or np.isnan(channel_I0) or np.isinf(channel_I0):
+                print(f"Warning: Layer {layer_idx} has invalid I0={channel_I0}, using identity kernel")
+                # Create identity kernel with correct dimensions
+                channel_kernel = np.zeros((kernel_dim, kernel_dim), dtype=np.float32)
+                center = kernel_dim // 2
+                channel_kernel[center, center] = 1.0
+            else:
+                # Generate kernel using new compute_region_kernel function
+                channel_kernel, _ = compute_region_kernel(
+                    passes_arr, contribs_arr, kernel_dim, region_data_full,
+                    x0=x0, I0=channel_I0
+                )
+                if channel_kernel.sum() <= 0 or np.isnan(channel_kernel.sum()) or np.isinf(channel_kernel.sum()):
+                    print(f"Warning: Layer {layer_idx} has invalid kernel sum, using identity kernel")
+                    channel_kernel = np.zeros((kernel_dim, kernel_dim), dtype=np.float32)
+                    center = kernel_dim // 2
+                    channel_kernel[center, center] = 1.0
         else:
-            I0 = float(np.max(layer_data))
-            if I0 <= 0 or np.isnan(I0) or np.isinf(I0):
-                print(f"Warning: Layer {layer_idx} has invalid I0={I0}, using identity kernel")
+            # Legacy format (passes + contributions or hard-coded)
+            channel_I0 = float(np.max(layer_data))
+            if channel_I0 <= 0 or np.isnan(channel_I0) or np.isinf(channel_I0):
+                print(f"Warning: Layer {layer_idx} has invalid I0={channel_I0}, using identity kernel")
                 channel_kernel = np.array([[0.0, 0.0, 0.0],
                                            [0.0, 1.0, 0.0],
                                            [0.0, 0.0, 0.0]], dtype=np.float32)
             else:
-                Passes_scaled = I0 - I0 / (1 + np.exp(-(Passes - x0)))
+                Passes_scaled = channel_I0 - channel_I0 / (1 + np.exp(-(Passes - x0)))
                 y_array = Passes_scaled * Contributions
                 total_sum = np.sum(y_array)
                 if total_sum <= 0 or np.isnan(total_sum) or np.isinf(total_sum):
@@ -374,7 +407,12 @@ def deconvolve_acquisition_from_mcd(
     pixel_size_unit: str = "µm",
     passes: np.ndarray = None,
     contributions: np.ndarray = None,
-    kernel: np.ndarray = None
+    kernel: np.ndarray = None,
+    passes_arr: np.ndarray = None,
+    contribs_arr: np.ndarray = None,
+    kernel_dim: int = None,
+    region_data_full: list = None,
+    I0: float = None
 ) -> str:
     """
     Deconvolve a single acquisition from an MCD file and save as OME-TIFF.
@@ -479,7 +517,12 @@ def deconvolve_acquisition_from_mcd(
             output_format=output_format,
             passes=passes,
             contributions=contributions,
-            kernel=kernel
+            kernel=kernel,
+            passes_arr=passes_arr,
+            contribs_arr=contribs_arr,
+            kernel_dim=kernel_dim,
+            region_data_full=region_data_full,
+            I0=I0
         )  # Returns (C, H, W)
         print(f"Deconvolution complete: output shape={deconvolved_stack.shape}, dtype={deconvolved_stack.dtype}")
         
@@ -617,7 +660,12 @@ def deconvolve_acquisition_from_ometiff(
     pixel_size_unit: str = "µm",
     passes: np.ndarray = None,
     contributions: np.ndarray = None,
-    kernel: np.ndarray = None
+    kernel: np.ndarray = None,
+    passes_arr: np.ndarray = None,
+    contribs_arr: np.ndarray = None,
+    kernel_dim: int = None,
+    region_data_full: list = None,
+    I0: float = None
 ) -> str:
     """
     Deconvolve a single acquisition from an OME-TIFF file and save as OME-TIFF.
@@ -891,7 +939,12 @@ def deconvolve_acquisition(
     pixel_size_unit: str = "µm",
     passes: np.ndarray = None,
     contributions: np.ndarray = None,
-    kernel: np.ndarray = None
+    kernel: np.ndarray = None,
+    passes_arr: np.ndarray = None,
+    contribs_arr: np.ndarray = None,
+    kernel_dim: int = None,
+    region_data_full: list = None,
+    I0: float = None
 ) -> str:
     """
     Deconvolve a single acquisition from an MCD file or OME-TIFF file and save as OME-TIFF.
@@ -930,7 +983,12 @@ def deconvolve_acquisition(
             pixel_size_unit=pixel_size_unit,
             passes=passes,
             contributions=contributions,
-            kernel=kernel
+            kernel=kernel,
+            passes_arr=passes_arr,
+            contribs_arr=contribs_arr,
+            kernel_dim=kernel_dim,
+            region_data_full=region_data_full,
+            I0=I0
         )
     elif loader_type == "ometiff":
         return deconvolve_acquisition_from_ometiff(
@@ -949,7 +1007,12 @@ def deconvolve_acquisition(
             pixel_size_unit=pixel_size_unit,
             passes=passes,
             contributions=contributions,
-            kernel=kernel
+            kernel=kernel,
+            passes_arr=passes_arr,
+            contribs_arr=contribs_arr,
+            kernel_dim=kernel_dim,
+            region_data_full=region_data_full,
+            I0=I0
         )
     else:
         raise ValueError(f"Unknown loader type: {loader_type}")

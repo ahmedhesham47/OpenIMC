@@ -36,6 +36,7 @@ htmlcov/
 benchmarks/
 figures/Scalability_benchmarks/segmentation/results/
 figures/Scalability_benchmarks/feature_extraction/results/output_data/
+figures/Scalability_benchmarks/intensities/
 figures/Figure1_SampleData/*.mcd
 figures/Figure2_BloodBased/*.mcd
 figures/Figure2_BloodBased/masks/

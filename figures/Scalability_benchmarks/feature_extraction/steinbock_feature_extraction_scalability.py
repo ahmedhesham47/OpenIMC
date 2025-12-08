@@ -230,24 +230,11 @@ def run_steinbock_command(
         metrics = parse_time_output(combined_output)
         
         if result.returncode != 0:
-            # Show more detailed error information
-            error_msg = result.stderr if result.stderr else "Unknown error"
-            stdout_msg = result.stdout if result.stdout else ""
+            error_msg = result.stderr[:500] if result.stderr else "Unknown error"
             print(f"Error: {description} failed with return code {result.returncode}")
-            if stdout_msg:
-                print(f"stdout: {stdout_msg[:1000]}")
-            if error_msg:
-                print(f"stderr: {error_msg[:1000]}")
+            print(f"stderr: {error_msg}")
             return metrics, False, error_msg
         else:
-            # Print success message and show any warnings
-            if result.stdout:
-                # Filter out time output, show steinbock messages
-                steinbock_output = [line for line in result.stdout.split('\n') 
-                                   if 'Elapsed' not in line and 'Maximum resident' not in line 
-                                   and 'User time' not in line and 'System time' not in line]
-                if steinbock_output:
-                    print(f"Output: {' '.join(steinbock_output[:10])}")
             return metrics, True, None
     
     except subprocess.TimeoutExpired:
@@ -295,41 +282,19 @@ def run_steinbock_benchmark(
     )
     
     # Create output directories for this run
-    # Remove existing directories to ensure clean output
     intensities_output_dir = base_temp_dir / f'intensities_{num_images}'
     regionprops_output_dir = base_temp_dir / f'regionprops_{num_images}'
-    if intensities_output_dir.exists():
-        shutil.rmtree(intensities_output_dir)
-    if regionprops_output_dir.exists():
-        shutil.rmtree(regionprops_output_dir)
     intensities_output_dir.mkdir(parents=True, exist_ok=True)
     regionprops_output_dir.mkdir(parents=True, exist_ok=True)
     
-    # Verify input directories have files
-    num_images_found = len(list(images_subset_dir.glob('*')))
-    num_masks_found = len(list(masks_subset_dir.glob('*')))
-    print(f"Input: {num_images_found} images, {num_masks_found} masks")
-    
     # Build steinbock measure intensities command
-    # Use panel.csv from the feature_extraction directory
-    panel_file = Path(__file__).parent / 'feature_extraction' / 'panel.csv'
-    if not panel_file.exists():
-        # Fallback: try current directory
-        panel_file = Path(__file__).parent / 'panel.csv'
-        if not panel_file.exists():
-            print(f"Warning: Panel file not found at {panel_file}. Continuing without --panel option.")
-            panel_file = None
-    
     intensities_cmd = [
         '/usr/bin/time', '-v',
         'steinbock', 'measure', 'intensities',
         '--img', str(images_subset_dir),
         '--masks', str(masks_subset_dir),
-        '--no-mmap',  # Disable memory mapping for compatibility
+        '-o', str(intensities_output_dir)
     ]
-    if panel_file:
-        intensities_cmd.extend(['--panel', str(panel_file)])
-    intensities_cmd.extend(['-o', str(intensities_output_dir)])
     
     # Build steinbock measure regionprops command
     # Common regionprops: area, eccentricity, extent, major_axis_length, 
@@ -351,16 +316,6 @@ def run_steinbock_benchmark(
         timeout=3600
     )
     
-    # Check if output files were created
-    if intensities_success:
-        output_files = list(intensities_output_dir.glob('*'))
-        if len(output_files) == 0:
-            print(f"Warning: steinbock measure intensities completed but no output files found in {intensities_output_dir}")
-            intensities_success = False
-            intensities_error = "No output files created"
-        else:
-            print(f"Created {len(output_files)} intensity output files")
-    
     if not intensities_success:
         return {
             'num_images': num_images,
@@ -378,16 +333,6 @@ def run_steinbock_benchmark(
         'steinbock measure regionprops',
         timeout=3600
     )
-    
-    # Check if output files were created
-    if regionprops_success:
-        output_files = list(regionprops_output_dir.glob('*'))
-        if len(output_files) == 0:
-            print(f"Warning: steinbock measure regionprops completed but no output files found in {regionprops_output_dir}")
-            regionprops_success = False
-            regionprops_error = "No output files created"
-        else:
-            print(f"Created {len(output_files)} regionprops output files")
     
     if not regionprops_success:
         return {
@@ -578,4 +523,5 @@ def main():
 
 if __name__ == '__main__':
     main()
+
 
