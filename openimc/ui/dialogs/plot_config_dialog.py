@@ -181,18 +181,42 @@ class PlotConfigDialog(QtWidgets.QDialog):
         heatmap_options_layout.addStretch()
         heatmap_layout.addLayout(heatmap_options_layout)
         
-        # Feature tick font size (for heatmap)
-        feature_fontsize_layout = QtWidgets.QHBoxLayout()
-        self.feature_fontsize_label = QtWidgets.QLabel("Feature label font size:")
-        feature_fontsize_layout.addWidget(self.feature_fontsize_label)
+        # X-tick and Y-tick font sizes (for heatmap and cluster map)
+        tick_fontsize_layout = QtWidgets.QVBoxLayout()
+        tick_fontsize_title = QtWidgets.QLabel("Tick Label Font Sizes:")
+        tick_fontsize_layout.addWidget(tick_fontsize_title)
+        
+        # X-tick font size
+        x_tick_fontsize_layout = QtWidgets.QHBoxLayout()
+        self.x_tick_fontsize_label = QtWidgets.QLabel("X-axis tick font size:")
+        x_tick_fontsize_layout.addWidget(self.x_tick_fontsize_label)
+        self.x_tick_fontsize_spinbox = QtWidgets.QSpinBox()
+        self.x_tick_fontsize_spinbox.setMinimum(4)
+        self.x_tick_fontsize_spinbox.setMaximum(20)
+        self.x_tick_fontsize_spinbox.setValue(10)
+        self.x_tick_fontsize_spinbox.setToolTip("Font size for x-axis tick labels")
+        x_tick_fontsize_layout.addWidget(self.x_tick_fontsize_spinbox)
+        x_tick_fontsize_layout.addStretch()
+        tick_fontsize_layout.addLayout(x_tick_fontsize_layout)
+        
+        # Y-tick font size
+        y_tick_fontsize_layout = QtWidgets.QHBoxLayout()
+        self.y_tick_fontsize_label = QtWidgets.QLabel("Y-axis tick font size:")
+        y_tick_fontsize_layout.addWidget(self.y_tick_fontsize_label)
+        self.y_tick_fontsize_spinbox = QtWidgets.QSpinBox()
+        self.y_tick_fontsize_spinbox.setMinimum(4)
+        self.y_tick_fontsize_spinbox.setMaximum(20)
+        self.y_tick_fontsize_spinbox.setValue(8)
+        self.y_tick_fontsize_spinbox.setToolTip("Font size for y-axis tick labels")
+        y_tick_fontsize_layout.addWidget(self.y_tick_fontsize_spinbox)
+        y_tick_fontsize_layout.addStretch()
+        tick_fontsize_layout.addLayout(y_tick_fontsize_layout)
+        
+        # Keep old feature_fontsize_spinbox for backward compatibility (hidden)
         self.feature_fontsize_spinbox = QtWidgets.QSpinBox()
-        self.feature_fontsize_spinbox.setMinimum(4)
-        self.feature_fontsize_spinbox.setMaximum(20)
-        self.feature_fontsize_spinbox.setValue(8)
-        self.feature_fontsize_spinbox.setToolTip("Font size for feature labels on y-axis")
-        feature_fontsize_layout.addWidget(self.feature_fontsize_spinbox)
-        feature_fontsize_layout.addStretch()
-        heatmap_layout.addLayout(feature_fontsize_layout)
+        self.feature_fontsize_spinbox.setVisible(False)
+        
+        heatmap_layout.addLayout(tick_fontsize_layout)
         
         # Legend configuration (for heatmap)
         legend_config_layout = QtWidgets.QVBoxLayout()
@@ -299,6 +323,50 @@ class PlotConfigDialog(QtWidgets.QDialog):
         
         self.patient_annotation_group.setLayout(patient_annotation_group_layout)
         content_layout.addWidget(self.patient_annotation_group)
+        
+        # Feature selection for display (separate from clustering features)
+        self.feature_selection_group = QtWidgets.QGroupBox("Feature Selection for Display")
+        feature_selection_layout = QtWidgets.QVBoxLayout()
+        
+        feature_selection_info = QtWidgets.QLabel(
+            "Select which features to display in the heatmap.\n"
+            "This is separate from features used for clustering."
+        )
+        feature_selection_info.setWordWrap(True)
+        feature_selection_layout.addWidget(feature_selection_info)
+        
+        # Search/filter box for features
+        self.feature_search = QtWidgets.QLineEdit()
+        self.feature_search.setPlaceholderText("Search/filter features...")
+        self.feature_search.textChanged.connect(self._filter_feature_options)
+        feature_selection_layout.addWidget(self.feature_search)
+        
+        # Feature list widget (multi-select)
+        self.feature_listwidget = QtWidgets.QListWidget()
+        self.feature_listwidget.setSelectionMode(QtWidgets.QAbstractItemView.MultiSelection)
+        self.feature_listwidget.setMaximumHeight(200)
+        feature_selection_layout.addWidget(self.feature_listwidget)
+        
+        # Select all / Deselect all buttons
+        feature_buttons_layout = QtWidgets.QHBoxLayout()
+        self.select_all_features_btn = QtWidgets.QPushButton("Select All")
+        self.select_all_features_btn.clicked.connect(self._select_all_features)
+        feature_buttons_layout.addWidget(self.select_all_features_btn)
+        
+        self.deselect_all_features_btn = QtWidgets.QPushButton("Deselect All")
+        self.deselect_all_features_btn.clicked.connect(self._deselect_all_features)
+        feature_buttons_layout.addWidget(self.deselect_all_features_btn)
+        
+        self.use_all_features_btn = QtWidgets.QPushButton("Use All Features")
+        self.use_all_features_btn.setToolTip("Use all available features (clear custom selection)")
+        self.use_all_features_btn.clicked.connect(self._use_all_features)
+        feature_buttons_layout.addWidget(self.use_all_features_btn)
+        
+        feature_buttons_layout.addStretch()
+        feature_selection_layout.addLayout(feature_buttons_layout)
+        
+        self.feature_selection_group.setLayout(feature_selection_layout)
+        content_layout.addWidget(self.feature_selection_group)
         
         # Feature label customization button (available for all views)
         self.feature_labels_btn = QtWidgets.QPushButton("Customize Feature Labels...")
@@ -419,6 +487,9 @@ class PlotConfigDialog(QtWidgets.QDialog):
         # Heatmap settings: For Heatmap and Cluster Map
         self.heatmap_group.setVisible(view in ['Heatmap', 'Cluster Map'])
         
+        # Feature selection: Only for Heatmap and Cluster Map
+        self.feature_selection_group.setVisible(view in ['Heatmap', 'Cluster Map'])
+        
         # Orientation control: Only for Cluster Map
         if hasattr(self, 'orientation_label'):
             self.orientation_label.setVisible(view == 'Cluster Map')
@@ -443,10 +514,81 @@ class PlotConfigDialog(QtWidgets.QDialog):
         # Feature labels: Available for all views
         self.feature_labels_btn.setVisible(True)
     
+    def _populate_feature_list(self):
+        """Populate feature list widget with available features from parent dialog."""
+        if not self.parent_dialog or not hasattr(self.parent_dialog, 'feature_dataframe'):
+            return
+        
+        df = self.parent_dialog.feature_dataframe
+        if df is None or df.empty:
+            return
+        
+        # Get all numeric feature columns (excluding metadata and cluster columns)
+        if hasattr(self.parent_dialog, '_select_feature_columns'):
+            # Temporarily disable selected_display_features to get all features
+            original_selected = getattr(self.parent_dialog, 'selected_display_features', None)
+            self.parent_dialog.selected_display_features = None
+            all_features = self.parent_dialog._select_feature_columns(df)
+            self.parent_dialog.selected_display_features = original_selected
+        else:
+            # Fallback: get numeric columns excluding standard metadata
+            exclude_cols = {'cluster', '__group__', 'cluster_phenotype', 'manual_phenotype',
+                          'cell_id', 'acquisition_id', 'source_file', 'source_well', 
+                          'batch_group', 'centroid_x', 'centroid_y'}
+            all_features = [col for col in df.columns 
+                          if col not in exclude_cols 
+                          and pd.api.types.is_numeric_dtype(df[col])
+                          and df[col].dtype != bool]
+        
+        # Populate list widget
+        self.feature_listwidget.clear()
+        for feature in sorted(all_features):
+            item = QtWidgets.QListWidgetItem(feature)
+            self.feature_listwidget.addItem(item)
+        
+        # Select features that are currently selected in parent dialog
+        selected_features = getattr(self.parent_dialog, 'selected_display_features', None)
+        if selected_features:
+            for i in range(self.feature_listwidget.count()):
+                item = self.feature_listwidget.item(i)
+                if item.text() in selected_features:
+                    item.setSelected(True)
+        else:
+            # If no selection, select all by default
+            for i in range(self.feature_listwidget.count()):
+                self.feature_listwidget.item(i).setSelected(True)
+    
+    def _filter_feature_options(self, text: str):
+        """Filter feature options based on search text."""
+        text_lower = text.lower()
+        for i in range(self.feature_listwidget.count()):
+            item = self.feature_listwidget.item(i)
+            item.setHidden(text_lower not in item.text().lower())
+    
+    def _select_all_features(self):
+        """Select all visible features."""
+        for i in range(self.feature_listwidget.count()):
+            item = self.feature_listwidget.item(i)
+            if not item.isHidden():
+                item.setSelected(True)
+    
+    def _deselect_all_features(self):
+        """Deselect all features."""
+        for i in range(self.feature_listwidget.count()):
+            self.feature_listwidget.item(i).setSelected(False)
+    
+    def _use_all_features(self):
+        """Clear custom selection to use all features."""
+        self._select_all_features()
+        # This will be handled in _apply_settings by setting selected_display_features to None
+    
     def _populate_from_parent(self):
         """Populate UI from parent dialog's current settings."""
         if not self.parent_dialog:
             return
+        
+        # Populate feature list
+        self._populate_feature_list()
         
         # Populate color-by options from parent
         # Temporarily block signals to prevent triggering dialogs
@@ -489,7 +631,20 @@ class PlotConfigDialog(QtWidgets.QDialog):
             self.heatmap_source_combo.setCurrentText(self.parent_dialog.heatmap_source_combo.currentText())
         if hasattr(self.parent_dialog, 'heatmap_scaling_combo'):
             self.heatmap_scaling_combo.setCurrentText(self.parent_dialog.heatmap_scaling_combo.currentText())
-        # Feature tick font size
+        # X-tick and Y-tick font sizes
+        if hasattr(self.parent_dialog, 'x_tick_fontsize'):
+            self.x_tick_fontsize_spinbox.setValue(self.parent_dialog.x_tick_fontsize)
+        elif hasattr(self.parent_dialog, 'feature_tick_fontsize'):
+            # Fallback to old feature_tick_fontsize for backward compatibility
+            self.x_tick_fontsize_spinbox.setValue(10)  # Default x-tick size
+        
+        if hasattr(self.parent_dialog, 'y_tick_fontsize'):
+            self.y_tick_fontsize_spinbox.setValue(self.parent_dialog.y_tick_fontsize)
+        elif hasattr(self.parent_dialog, 'feature_tick_fontsize'):
+            # Fallback to old feature_tick_fontsize for backward compatibility
+            self.y_tick_fontsize_spinbox.setValue(self.parent_dialog.feature_tick_fontsize)
+        
+        # Keep old feature_fontsize_spinbox for backward compatibility
         if hasattr(self.parent_dialog, 'feature_tick_fontsize'):
             self.feature_fontsize_spinbox.setValue(self.parent_dialog.feature_tick_fontsize)
         
@@ -689,9 +844,15 @@ class PlotConfigDialog(QtWidgets.QDialog):
             self.parent_dialog.heatmap_scaling_combo.setCurrentText(self.heatmap_scaling_combo.currentText())
             if hasattr(self.parent_dialog, '_on_heatmap_scaling_changed'):
                 self.parent_dialog._on_heatmap_scaling_changed(self.heatmap_scaling_combo.currentText())
-        # Feature tick font size
+        # X-tick and Y-tick font sizes
+        if hasattr(self.parent_dialog, 'x_tick_fontsize'):
+            self.parent_dialog.x_tick_fontsize = self.x_tick_fontsize_spinbox.value()
+        if hasattr(self.parent_dialog, 'y_tick_fontsize'):
+            self.parent_dialog.y_tick_fontsize = self.y_tick_fontsize_spinbox.value()
+        
+        # Keep old feature_tick_fontsize for backward compatibility
         if hasattr(self.parent_dialog, 'feature_tick_fontsize'):
-            self.parent_dialog.feature_tick_fontsize = self.feature_fontsize_spinbox.value()
+            self.parent_dialog.feature_tick_fontsize = self.y_tick_fontsize_spinbox.value()
         
         # Legend configuration
         if hasattr(self.parent_dialog, 'legend_nrows'):
@@ -783,6 +944,26 @@ class PlotConfigDialog(QtWidgets.QDialog):
                             break
             if hasattr(self.parent_dialog, '_on_color_by_changed'):
                 self.parent_dialog._on_color_by_changed()
+        
+        # Feature selection for display
+        selected_features = []
+        for i in range(self.feature_listwidget.count()):
+            item = self.feature_listwidget.item(i)
+            if item.isSelected():
+                selected_features.append(item.text())
+        
+        # Set selected display features in parent dialog
+        if selected_features:
+            # Check if all features are selected (if so, set to None to use all)
+            all_features = [self.feature_listwidget.item(j).text() 
+                          for j in range(self.feature_listwidget.count())]
+            if set(selected_features) == set(all_features):
+                self.parent_dialog.selected_display_features = None
+            else:
+                self.parent_dialog.selected_display_features = selected_features
+        else:
+            # If nothing selected, use all features (set to None)
+            self.parent_dialog.selected_display_features = None
         
         # Refresh the current view in parent dialog
         if hasattr(self.parent_dialog, 'view_combo'):

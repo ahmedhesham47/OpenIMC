@@ -28,6 +28,7 @@ import json
 import os
 import sys
 import gc
+import multiprocessing as mp
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, Dict, List, Optional, Tuple, Union
 
@@ -68,6 +69,7 @@ from openimc.processing.spillover_matrix import (
     build_spillover_from_comp_mcd
 )
 from openimc.processing.deconvolution_worker import RLD_HRIMC_circle
+from openimc.processing.spatial_analysis_worker import roi_enrichment_worker, distance_distribution_worker
 from openimc.ui.utils import (
     arcsinh_normalize,
     percentile_clip_normalize,
@@ -2406,12 +2408,13 @@ def spatial_enrichment(
     n_permutations: int = 100,
     seed: int = 42,
     roi_column: Optional[str] = None,
-    output_path: Optional[Union[str, Path]] = None
+    output_path: Optional[Union[str, Path]] = None,
+    n_workers: Optional[int] = None
 ) -> pd.DataFrame:
     """Compute pairwise spatial enrichment between clusters.
     
     This function computes enrichment of spatial interactions between cluster
-    pairs using permutation-based null distribution.
+    pairs using permutation-based null distribution with multiprocessing support.
     
     Args:
         features_df: DataFrame with cell features and cluster labels
@@ -2421,6 +2424,7 @@ def spatial_enrichment(
         seed: Random seed for reproducibility (default: 42)
         roi_column: Column name for ROI grouping (auto-detected if None)
         output_path: Optional path to save enrichment results CSV
+        n_workers: Number of parallel workers (default: None = use all available CPUs - 2)
     
     Returns:
         DataFrame with enrichment results (cluster_A, cluster_B, observed, expected, p_value, z_score, etc.)
@@ -2441,108 +2445,86 @@ def spatial_enrichment(
     random.seed(seed)
     np.random.seed(seed)
     
-    enrichment_results = []
+    # Determine number of workers
+    if n_workers is None:
+        try:
+            cpu_count = mp.cpu_count()
+            n_workers = max(1, cpu_count - 2)
+        except (NotImplementedError, RuntimeError):
+            n_workers = 1
+    n_workers = max(1, n_workers)
     
-    # Process per ROI
+    print(f"[DEBUG] spatial_enrichment: Starting enrichment analysis")
+    print(f"[DEBUG] spatial_enrichment: n_permutations={n_permutations}, n_workers={n_workers}, seed={seed}")
+    
+    # Collect all ROIs first
+    roi_tasks = []
     for roi_id, roi_df in features_df.groupby(roi_column):
         roi_edges = edges_df[edges_df['roi_id'] == str(roi_id)]
         
         if roi_edges.empty:
+            print(f"[DEBUG] spatial_enrichment: ROI {roi_id} has no edges, skipping")
             continue
         
         # Get unique clusters
         unique_clusters = sorted(roi_df[cluster_column].dropna().unique())
         if len(unique_clusters) < 2:
+            print(f"[DEBUG] spatial_enrichment: ROI {roi_id} has < 2 clusters, skipping")
             continue
         
-        # Create cell_id to cluster mapping
-        cell_to_cluster = dict(zip(roi_df['cell_id'], roi_df[cluster_column]))
-        
-        # Count observed edges between cluster pairs
-        observed_edges = {}
-        for _, edge in roi_edges.iterrows():
-            cell_a = int(edge['cell_id_A'])
-            cell_b = int(edge['cell_id_B'])
+        # Prepare ROI task for worker
+        roi_tasks.append((
+            roi_id,
+            roi_df.copy(),  # Copy to avoid shared state issues
+            roi_edges.copy(),  # Copy to avoid shared state issues
+            cluster_column,
+            n_permutations,
+            seed + len(roi_tasks)  # Unique seed for each ROI
+        ))
+    
+    print(f"[DEBUG] spatial_enrichment: Prepared {len(roi_tasks)} ROI tasks")
+    
+    # Process ROIs with multiprocessing
+    enrichment_results = []
+    if len(roi_tasks) > 0:
+        if n_workers > 1 and len(roi_tasks) > 1:
+            # Use multiprocessing: one ROI per worker
+            print(f"[DEBUG] spatial_enrichment: Using MULTIPROCESSING with {n_workers} workers")
+            print(f"[DEBUG] spatial_enrichment: Distributing {len(roi_tasks)} ROIs across {n_workers} workers")
+            import time
+            start_time = time.time()
+            with mp.Pool(processes=n_workers) as pool:
+                print(f"[DEBUG] spatial_enrichment: Pool created, starting parallel ROI processing...")
+                roi_results = pool.map(roi_enrichment_worker, roi_tasks)
+            elapsed = time.time() - start_time
+            print(f"[DEBUG] spatial_enrichment: Multiprocessing completed in {elapsed:.2f} seconds")
             
-            cluster_a = cell_to_cluster.get(cell_a)
-            cluster_b = cell_to_cluster.get(cell_b)
-            
-            if cluster_a is not None and cluster_b is not None:
-                pair = tuple(sorted([cluster_a, cluster_b]))
-                observed_edges[pair] = observed_edges.get(pair, 0) + 1
-        
-        # Compute enrichment for each cluster pair
-        for i, cluster_a in enumerate(unique_clusters):
-            for j, cluster_b in enumerate(unique_clusters):
-                if j < i:
-                    continue
-                
-                pair = tuple(sorted([cluster_a, cluster_b]))
-                observed = observed_edges.get(pair, 0)
-                
-                # Get cells in each cluster
-                cells_a = set(roi_df[roi_df[cluster_column] == cluster_a]['cell_id'])
-                cells_b = set(roi_df[roi_df[cluster_column] == cluster_b]['cell_id'])
-                
-                # Permutation test
-                n_a = len(cells_a)
-                n_b = len(cells_b)
-                total_edges = len(roi_edges)
-                
-                if total_edges == 0:
-                    continue
-                
-                # Expected number of edges (proportional to cluster sizes)
-                expected = (n_a * n_b / (len(roi_df) * (len(roi_df) - 1) / 2)) * total_edges
-                
-                # Permutation: randomly shuffle cluster labels
-                permuted_counts = []
-                cluster_labels = roi_df[cluster_column].values.copy()
-                
-                for _ in range(n_permutations):
-                    np.random.shuffle(cluster_labels)
-                    perm_cell_to_cluster = dict(zip(roi_df['cell_id'], cluster_labels))
-                    
-                    perm_observed = 0
-                    for _, edge in roi_edges.iterrows():
-                        cell_a = int(edge['cell_id_A'])
-                        cell_b = int(edge['cell_id_B'])
-                        
-                        perm_cluster_a = perm_cell_to_cluster.get(cell_a)
-                        perm_cluster_b = perm_cell_to_cluster.get(cell_b)
-                        
-                        if perm_cluster_a == cluster_a and perm_cluster_b == cluster_b:
-                            perm_observed += 1
-                        elif perm_cluster_a == cluster_b and perm_cluster_b == cluster_a:
-                            perm_observed += 1
-                    
-                    permuted_counts.append(perm_observed)
-                
-                # Calculate p-value and z-score
-                permuted_counts = np.array(permuted_counts)
-                p_value = (np.sum(permuted_counts >= observed) + 1) / (n_permutations + 1)
-                z_score = (observed - expected) / (np.std(permuted_counts) + 1e-10)
-                
-                enrichment_results.append({
-                    'roi_id': str(roi_id),
-                    'cluster_A': cluster_a,
-                    'cluster_B': cluster_b,
-                    'observed': observed,
-                    'expected': expected,
-                    'p_value': p_value,
-                    'z_score': z_score,
-                    'n_permutations': n_permutations
-                })
+            # Flatten results from all ROIs
+            for roi_result_list in roi_results:
+                enrichment_results.extend(roi_result_list)
+        else:
+            # Single-threaded fallback: process ROIs sequentially
+            print(f"[DEBUG] spatial_enrichment: Using SINGLE-THREADED mode (n_workers={n_workers}, rois={len(roi_tasks)})")
+            import time
+            start_time = time.time()
+            for roi_task in roi_tasks:
+                roi_result_list = roi_enrichment_worker(roi_task)
+                enrichment_results.extend(roi_result_list)
+            elapsed = time.time() - start_time
+            print(f"[DEBUG] spatial_enrichment: Single-threaded computation completed in {elapsed:.2f} seconds")
     
     if not enrichment_results:
+        print(f"[DEBUG] spatial_enrichment: No enrichment results generated")
         return pd.DataFrame()
     
     results_df = pd.DataFrame(enrichment_results)
+    print(f"[DEBUG] spatial_enrichment: Completed! Generated {len(results_df)} enrichment results")
     
     # Save output if path is provided
     if output_path is not None:
         output_path = Path(output_path)
         results_df.to_csv(output_path, index=False)
+        print(f"[DEBUG] spatial_enrichment: Results saved to {output_path}")
     
     return results_df
 
@@ -2552,22 +2534,26 @@ def spatial_distance_distribution(
     edges_df: pd.DataFrame,
     cluster_column: str = "cluster",
     roi_column: Optional[str] = None,
-    output_path: Optional[Union[str, Path]] = None
+    output_path: Optional[Union[str, Path]] = None,
+    pixel_size_um: float = 1.0,
+    n_workers: Optional[int] = None
 ) -> pd.DataFrame:
     """Compute distance distributions between clusters.
     
-    This function computes the distribution of spatial distances between
-    cells of different clusters.
+    This function computes nearest neighbor distances from each cell to each cluster type
+    using multiprocessing at ROI level for efficiency.
     
     Args:
         features_df: DataFrame with cell features and cluster labels
-        edges_df: DataFrame with spatial graph edges (must have 'cell_id_A', 'cell_id_B', 'distance_um', 'roi_id')
+        edges_df: DataFrame with spatial graph edges (must have 'cell_id_A', 'cell_id_B', 'roi_id')
         cluster_column: Column name containing cluster labels
         roi_column: Column name for ROI grouping (auto-detected if None)
         output_path: Optional path to save distance distribution results CSV
+        pixel_size_um: Pixel size in micrometers for coordinate conversion (default: 1.0)
+        n_workers: Number of parallel workers (default: None = use all available CPUs - 2)
     
     Returns:
-        DataFrame with distance distribution statistics per cluster pair
+        DataFrame with distance data (cell_A_id, cell_A_cluster, nearest_B_cluster, nearest_B_dist_um, etc.)
     """
     # Auto-detect ROI column
     if roi_column is None:
@@ -2579,61 +2565,56 @@ def spatial_distance_distribution(
     if roi_column is None:
         roi_column = 'roi_id'
     
-    distance_results = []
+    # Determine number of workers
+    if n_workers is None:
+        try:
+            cpu_count = mp.cpu_count()
+            n_workers = max(1, cpu_count - 2)
+        except (NotImplementedError, RuntimeError):
+            n_workers = 1
     
-    # Process per ROI
+    n_workers = max(1, n_workers)
+    
+    print(f"[DEBUG] spatial_distance_distribution: Starting distance distribution analysis")
+    print(f"[DEBUG] spatial_distance_distribution: n_workers={n_workers}, pixel_size_um={pixel_size_um}")
+    
+    # Collect all ROIs first
+    roi_tasks = []
     for roi_id, roi_df in features_df.groupby(roi_column):
-        roi_edges = edges_df[edges_df['roi_id'] == str(roi_id)]
-        
-        if roi_edges.empty:
-            continue
-        
         # Get unique clusters
         unique_clusters = sorted(roi_df[cluster_column].dropna().unique())
-        if len(unique_clusters) < 2:
+        if len(unique_clusters) < 1:
+            print(f"[DEBUG] spatial_distance_distribution: ROI {roi_id} has no clusters, skipping")
             continue
         
-        # Create cell_id to cluster mapping
-        cell_to_cluster = dict(zip(roi_df['cell_id'], roi_df[cluster_column]))
-        
-        # Compute distances for each cluster pair
-        for i, cluster_a in enumerate(unique_clusters):
-            for j, cluster_b in enumerate(unique_clusters):
-                if j < i:
-                    continue
-                
-                # Find edges between these clusters
-                pair_distances = []
-                for _, edge in roi_edges.iterrows():
-                    cell_a = int(edge['cell_id_A'])
-                    cell_b = int(edge['cell_id_B'])
-                    
-                    cluster_a_edge = cell_to_cluster.get(cell_a)
-                    cluster_b_edge = cell_to_cluster.get(cell_b)
-                    
-                    if (cluster_a_edge == cluster_a and cluster_b_edge == cluster_b) or \
-                       (cluster_a_edge == cluster_b and cluster_b_edge == cluster_a):
-                        dist = edge.get('distance_um', edge.get('distance', 0.0))
-                        pair_distances.append(dist)
-                
-                if not pair_distances:
-                    continue
-                
-                pair_distances = np.array(pair_distances)
-                
-                distance_results.append({
-                    'roi_id': str(roi_id),
-                    'cluster_A': cluster_a,
-                    'cluster_B': cluster_b,
-                    'n_edges': len(pair_distances),
-                    'mean_distance': float(np.mean(pair_distances)),
-                    'median_distance': float(np.median(pair_distances)),
-                    'std_distance': float(np.std(pair_distances)),
-                    'min_distance': float(np.min(pair_distances)),
-                    'max_distance': float(np.max(pair_distances)),
-                    'q25_distance': float(np.percentile(pair_distances, 25)),
-                    'q75_distance': float(np.percentile(pair_distances, 75))
-                })
+        # Prepare ROI task for worker
+        roi_tasks.append((
+            str(roi_id),
+            roi_df.copy(),  # Copy to avoid shared state issues
+            cluster_column,
+            pixel_size_um
+        ))
+    
+    print(f"[DEBUG] spatial_distance_distribution: Prepared {len(roi_tasks)} ROI tasks")
+    
+    # Process ROIs with multiprocessing
+    distance_results = []
+    if len(roi_tasks) > 0:
+        if n_workers > 1 and len(roi_tasks) > 1:
+            # Use multiprocessing: one ROI per worker
+            print(f"[DEBUG] spatial_distance_distribution: Using MULTIPROCESSING with {n_workers} workers")
+            print(f"[DEBUG] spatial_distance_distribution: Distributing {len(roi_tasks)} ROIs across {n_workers} workers")
+            with mp.Pool(processes=n_workers) as pool:
+                roi_results = pool.map(distance_distribution_worker, roi_tasks)
+                # Flatten results from all ROIs
+                for roi_result in roi_results:
+                    distance_results.extend(roi_result)
+        else:
+            # Single-threaded processing
+            print(f"[DEBUG] spatial_distance_distribution: Using SINGLE-THREADED processing")
+            for roi_task in roi_tasks:
+                roi_result = distance_distribution_worker(roi_task)
+                distance_results.extend(roi_result)
     
     if not distance_results:
         return pd.DataFrame()
@@ -2920,6 +2901,18 @@ def spatial_neighborhood_enrichment(
             print(f"[DEBUG]   Skipping {roi_id}: cluster_key '{cluster_key}' not in obs")
             continue
         
+        # Filter out cells with NaN cluster values
+        cluster_values = adata.obs[cluster_key]
+        nan_mask = pd.isna(cluster_values)
+        n_nan = nan_mask.sum()
+        if n_nan > 0:
+            print(f"[DEBUG]   Filtering out {n_nan} cells with NaN cluster values")
+            # Create boolean mask for valid cells (non-NaN)
+            valid_mask = ~nan_mask
+            # Filter AnnData object (this will also filter spatial_connectivities)
+            adata = adata[valid_mask].copy()
+            print(f"[DEBUG]   After filtering: {adata.n_obs} cells remaining")
+        
         # Ensure categorical
         if not hasattr(adata.obs[cluster_key], 'cat'):
             adata.obs[cluster_key] = adata.obs[cluster_key].astype('category')
@@ -3152,6 +3145,16 @@ def spatial_cooccurrence(
         if cluster_key not in adata.obs.columns:
             continue
         
+        # Filter out cells with NaN cluster values
+        cluster_values = adata.obs[cluster_key]
+        nan_mask = pd.isna(cluster_values)
+        n_nan = nan_mask.sum()
+        if n_nan > 0:
+            print(f"[DEBUG]   Filtering out {n_nan} cells with NaN cluster values")
+            valid_mask = ~nan_mask
+            adata = adata[valid_mask].copy()
+            print(f"[DEBUG]   After filtering: {adata.n_obs} cells remaining")
+        
         # Ensure categorical
         if not hasattr(adata.obs[cluster_key], 'cat'):
             adata.obs[cluster_key] = adata.obs[cluster_key].astype('category')
@@ -3326,6 +3329,16 @@ def spatial_ripley(
         
         if cluster_key not in adata.obs.columns:
             continue
+        
+        # Filter out cells with NaN cluster values
+        cluster_values = adata.obs[cluster_key]
+        nan_mask = pd.isna(cluster_values)
+        n_nan = nan_mask.sum()
+        if n_nan > 0:
+            print(f"[DEBUG]   Filtering out {n_nan} cells with NaN cluster values")
+            valid_mask = ~nan_mask
+            adata = adata[valid_mask].copy()
+            print(f"[DEBUG]   After filtering: {adata.n_obs} cells remaining")
         
         # Ensure categorical
         if not hasattr(adata.obs[cluster_key], 'cat'):

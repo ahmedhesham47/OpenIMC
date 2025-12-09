@@ -228,7 +228,9 @@ class CellClusteringDialog(QtWidgets.QDialog):
                     else:
                         self.patient_annotation_column = metadata_cols[0]
         self.patient_annotation_enabled = False  # Track whether patient annotation is enabled
-        self.feature_tick_fontsize = 8  # Font size for feature labels on y-axis
+        self.feature_tick_fontsize = 8  # Font size for feature labels on y-axis (deprecated, use y_tick_fontsize)
+        self.x_tick_fontsize = 10  # Font size for x-axis tick labels
+        self.y_tick_fontsize = 8  # Font size for y-axis tick labels
         self.legend_nrows = 1  # Number of rows for legend layout
         self.legend_ncols = 1  # Number of columns for legend layout
         self.legend_fontsize = 8  # Font size for legend text
@@ -238,11 +240,111 @@ class CellClusteringDialog(QtWidgets.QDialog):
         self.seed = 42  # Default seed for reproducibility
         self.statistical_results = {}  # Store statistical test results for export: {marker: [(cluster1, cluster2, p_val, adj_p_val)]}
         self.filter_settings = None  # Store filter settings from feature selector
+        self.selected_display_features = None  # Store selected features for display (separate from clustering features)
         
         self._create_ui()
         self._setup_plot()
         self._on_clustering_type_changed()  # Initialize UI state
         self._on_leiden_mode_changed()  # Initialize Leiden mode state
+        
+        # Check if cluster columns exist and auto-draw heatmap if they do
+        self._check_and_auto_draw_heatmap()
+    
+    def _check_and_auto_draw_heatmap(self):
+        """Check if cluster columns exist in feature dataframe and auto-draw heatmap if they do."""
+        if self.feature_dataframe is None or self.feature_dataframe.empty:
+            return
+        
+        # Check for cluster columns
+        cluster_cols = ['cluster', 'cluster_id', 'cluster_phenotype']
+        has_cluster_col = any(col in self.feature_dataframe.columns for col in cluster_cols)
+        
+        if not has_cluster_col:
+            return
+        
+        # Find which cluster column exists
+        cluster_col = None
+        for col in cluster_cols:
+            if col in self.feature_dataframe.columns:
+                cluster_col = col
+                break
+        
+        if cluster_col is None:
+            return
+        
+        # Check for morphometric and _mean intensity features
+        all_cols = self.feature_dataframe.columns.tolist()
+        
+        # Morphometric features (common names)
+        # Exclude centroid_x and centroid_y by default
+        morpho_keywords = ['area', 'perimeter', 'eccentricity', 'solidity', 'extent', 
+                          'major_axis', 'minor_axis', 'orientation', 'convex_area',
+                          'equivalent_diameter', 'bbox']
+        morpho_features = [col for col in all_cols 
+                          if any(keyword in col.lower() for keyword in morpho_keywords)
+                          and pd.api.types.is_numeric_dtype(self.feature_dataframe[col])
+                          and col not in ['centroid_x', 'centroid_y']]
+        
+        # Mean intensity features
+        mean_features = [col for col in all_cols 
+                       if col.endswith('_mean') 
+                       and pd.api.types.is_numeric_dtype(self.feature_dataframe[col])]
+        
+        # Include touches_edge if it exists
+        touches_edge_features = []
+        if 'touches_edge' in all_cols and pd.api.types.is_numeric_dtype(self.feature_dataframe['touches_edge']):
+            touches_edge_features = ['touches_edge']
+        
+        # Combine morphometric, mean, and touches_edge features
+        display_features = morpho_features + mean_features + touches_edge_features
+        
+        if not display_features:
+            # Show warning if no morphometric or mean features found
+            QtWidgets.QMessageBox.warning(
+                self,
+                "Missing Features",
+                "The loaded features file contains cluster information, but no morphometric "
+                "or _mean intensity features were found.\n\n"
+                "Please re-cluster the data to generate the required features for visualization."
+            )
+            return
+        
+        # Set up clustered_data from existing feature dataframe
+        self.clustered_data = self.feature_dataframe.copy()
+        
+        # Ensure cluster column is named 'cluster' for consistency
+        if cluster_col != 'cluster':
+            if 'cluster' in self.clustered_data.columns:
+                # If both exist, prefer the numeric one
+                if cluster_col in ['cluster_id']:
+                    self.clustered_data['cluster'] = self.clustered_data[cluster_col]
+            else:
+                self.clustered_data['cluster'] = self.clustered_data[cluster_col]
+        
+        # Convert cluster column to numeric if it's not already
+        if not pd.api.types.is_numeric_dtype(self.clustered_data['cluster']):
+            # Try to convert to numeric, creating a mapping if needed
+            unique_clusters = self.clustered_data['cluster'].unique()
+            # Filter out NaN values for mapping
+            unique_clusters = [c for c in unique_clusters if pd.notna(c)]
+            cluster_map = {val: idx + 1 for idx, val in enumerate(sorted(unique_clusters))}
+            self.clustered_data['cluster'] = self.clustered_data['cluster'].map(cluster_map)
+        
+        # Ensure cluster column is numeric and handle NaN/inf values
+        self.clustered_data['cluster'] = pd.to_numeric(self.clustered_data['cluster'], errors='coerce')
+        # Replace inf and fill NaN with 0 (unassigned)
+        self.clustered_data['cluster'] = self.clustered_data['cluster'].replace([np.inf, -np.inf], np.nan).fillna(0)
+        
+        # Store unscaled data
+        self.clustered_data_unscaled = self.clustered_data.copy()
+        
+        # Set selected display features to morphometric and mean features
+        self.selected_display_features = display_features
+        
+        # Set view to Heatmap and draw it
+        if hasattr(self, 'view_combo'):
+            self.view_combo.setCurrentText('Heatmap')
+        self._show_heatmap()
         
     def _create_ui(self):
         layout = QtWidgets.QVBoxLayout(self)
@@ -1965,7 +2067,10 @@ class CellClusteringDialog(QtWidgets.QDialog):
                 # Ensure cluster is integer before sorting
                 if data_to_plot['cluster'].dtype != int and not data_to_plot['cluster'].dtype.name.startswith('int'):
                     print(f"[DEBUG PLOT] Converting cluster to int before sorting, current dtype: {data_to_plot['cluster'].dtype}")
-                    data_to_plot['cluster'] = data_to_plot['cluster'].astype(int)
+                    # Handle NaN/inf values before converting to int
+                    data_to_plot['cluster'] = pd.to_numeric(data_to_plot['cluster'], errors='coerce')
+                    # Fill NaN/inf with 0, then convert to int
+                    data_to_plot['cluster'] = data_to_plot['cluster'].replace([np.inf, -np.inf], np.nan).fillna(0).astype(int)
                 data_to_plot = data_to_plot.sort_values('cluster')
                 print(f"[DEBUG PLOT] Sorted data_to_plot, shape: {data_to_plot.shape}")
             except Exception as e:
@@ -2506,7 +2611,7 @@ class CellClusteringDialog(QtWidgets.QDialog):
                 gs = self.figure.add_gridspec(
                     nrows=2, ncols=2,
                     height_ratios=[0.15, 0.85],  # Dendrogram, heatmap
-                    width_ratios=[0.92, 0.08],  # Heatmap area, colorbar
+                    width_ratios=[0.97, 0.03],  # Heatmap area, colorbar (narrower)
                     hspace=0.02, wspace=0.02,
                     left=0.12, right=0.98, top=0.95, bottom=0.12
                 )
@@ -2520,7 +2625,7 @@ class CellClusteringDialog(QtWidgets.QDialog):
                 # Landscape: no dendrogram, heatmap and colorbar side by side
                 gs = self.figure.add_gridspec(
                     nrows=1, ncols=2,
-                    width_ratios=[0.92, 0.08],  # Heatmap area, colorbar
+                    width_ratios=[0.97, 0.03],  # Heatmap area, colorbar (narrower)
                     wspace=0.02,
                     left=0.12, right=0.98, top=0.95, bottom=0.12
                 )
@@ -2531,11 +2636,12 @@ class CellClusteringDialog(QtWidgets.QDialog):
         else:
             if has_dendro:
                 # Portrait: dendrogram on left, heatmap on right, colorbar on far right
+                # Move dendrogram further left to avoid overlapping with cluster names
                 gs = self.figure.add_gridspec(
                     nrows=1, ncols=3,
-                    width_ratios=[0.15, 0.77, 0.08],  # Dendrogram, heatmap area, colorbar
+                    width_ratios=[0.22, 0.75, 0.03],  # Dendrogram (wider), heatmap area, colorbar (narrower)
                     wspace=0.02,
-                    left=0.12, right=0.98, top=0.95, bottom=0.12
+                    left=0.05, right=0.98, top=0.95, bottom=0.12  # Move left margin further left
                 )
                 dendro_row = 0
                 dendro_col = 0
@@ -2547,7 +2653,7 @@ class CellClusteringDialog(QtWidgets.QDialog):
                 # Portrait: no dendrogram, heatmap and colorbar side by side
                 gs = self.figure.add_gridspec(
                     nrows=1, ncols=2,
-                    width_ratios=[0.92, 0.08],  # Heatmap area, colorbar
+                    width_ratios=[0.97, 0.03],  # Heatmap area, colorbar (narrower)
                     wspace=0.02,
                     left=0.12, right=0.98, top=0.95, bottom=0.12
                 )
@@ -2640,14 +2746,18 @@ class CellClusteringDialog(QtWidgets.QDialog):
         feature_labels_display = [self._get_feature_display_name(f) for f in feature_cols_ordered]
         cluster_labels_display = [self._get_cluster_display_name(cid) for cid in cluster_order]
         
+        # Get font sizes (use new separate controls if available, fallback to old feature_tick_fontsize)
+        x_tick_fontsize = getattr(self, 'x_tick_fontsize', getattr(self, 'feature_tick_fontsize', 10))
+        y_tick_fontsize = getattr(self, 'y_tick_fontsize', getattr(self, 'feature_tick_fontsize', 8))
+        
         if is_landscape:
             # Landscape: clusters on x-axis, features on y-axis
             ax_heatmap.set_xticks(np.arange(n_clusters))
-            ax_heatmap.set_xticklabels(cluster_labels_display, fontsize=10, rotation=90, ha='right')
+            ax_heatmap.set_xticklabels(cluster_labels_display, fontsize=x_tick_fontsize, rotation=90, ha='right')
             ax_heatmap.set_xlabel('Clusters', fontsize=10, fontweight='bold')
             
             ax_heatmap.set_yticks(np.arange(n_features))
-            ax_heatmap.set_yticklabels(feature_labels_display, fontsize=self.feature_tick_fontsize, rotation=0)
+            ax_heatmap.set_yticklabels(feature_labels_display, fontsize=y_tick_fontsize, rotation=0)
             ax_heatmap.set_ylabel('Features', fontsize=10, fontweight='bold')
             
             ax_heatmap.set_xlim(-0.5, n_clusters - 0.5)
@@ -2655,11 +2765,11 @@ class CellClusteringDialog(QtWidgets.QDialog):
         else:
             # Portrait: features on x-axis, clusters on y-axis
             ax_heatmap.set_xticks(np.arange(n_features))
-            ax_heatmap.set_xticklabels(feature_labels_display, fontsize=self.feature_tick_fontsize, rotation=90, ha='right')
+            ax_heatmap.set_xticklabels(feature_labels_display, fontsize=x_tick_fontsize, rotation=90, ha='right')
             ax_heatmap.set_xlabel('Features', fontsize=10, fontweight='bold')
             
             ax_heatmap.set_yticks(np.arange(n_clusters))
-            ax_heatmap.set_yticklabels(cluster_labels_display, fontsize=10)
+            ax_heatmap.set_yticklabels(cluster_labels_display, fontsize=y_tick_fontsize)
             ax_heatmap.set_ylabel('Clusters', fontsize=10, fontweight='bold')
             
             ax_heatmap.set_xlim(-0.5, n_features - 0.5)
@@ -3843,7 +3953,18 @@ class CellClusteringDialog(QtWidgets.QDialog):
         return colormap_name
 
     def _select_feature_columns(self, df: pd.DataFrame):
-        """Return numeric feature columns to plot, excluding non-numeric/meta columns."""
+        """Return numeric feature columns to plot, excluding non-numeric/meta columns.
+        
+        If selected_display_features is set, only return those features.
+        Otherwise, return all numeric features (excluding metadata and cluster columns).
+        """
+        # If display features are explicitly selected, use only those
+        if self.selected_display_features is not None and len(self.selected_display_features) > 0:
+            # Filter to only include features that exist in the dataframe
+            available_features = [f for f in self.selected_display_features if f in df.columns]
+            if available_features:
+                return available_features
+        
         # Standard columns to exclude
         exclude_cols = { 'cluster', '__group__', 'cluster_phenotype', 'manual_phenotype' }
         

@@ -29,10 +29,144 @@ import pandas as pd
 from scipy.spatial import cKDTree
 
 
+def roi_enrichment_worker(args):
+    """
+    Worker function for computing enrichment for an entire ROI (all cluster pairs).
+    This function must be at module level to be picklable for multiprocessing.
+    
+    Args:
+        args: Tuple containing:
+            - roi_id: ROI identifier
+            - roi_df: DataFrame with cells for this ROI
+            - roi_edges: DataFrame with edges for this ROI
+            - cluster_col: Name of cluster column
+            - n_perm: Number of permutations
+            - seed: Random seed
+            
+    Returns:
+        List of dictionaries with enrichment statistics for all cluster pairs in this ROI
+    """
+    import os
+    roi_id, roi_df, roi_edges, cluster_col, n_perm, seed = args
+    
+    worker_pid = os.getpid()
+    print(f"[DEBUG] roi_enrichment_worker: PID {worker_pid} processing ROI {roi_id}, "
+          f"n_perm={n_perm}, n_edges={len(roi_edges)}, n_cells={len(roi_df)}")
+    
+    results = []
+    
+    # Get unique clusters
+    unique_clusters = sorted(roi_df[cluster_col].dropna().unique())
+    if len(unique_clusters) < 2:
+        print(f"[DEBUG] roi_enrichment_worker: PID {worker_pid} ROI {roi_id} has < 2 clusters, skipping")
+        return results
+    
+    # Create cell_id to cluster mapping
+    cell_to_cluster = dict(zip(roi_df['cell_id'], roi_df[cluster_col]))
+    
+    # Count observed edges between cluster pairs (optimized)
+    observed_edges = {}
+    # Convert edges to list of tuples for faster iteration
+    edge_list = [(int(row['cell_id_A']), int(row['cell_id_B'])) 
+                 for _, row in roi_edges.iterrows()]
+    
+    for cell_a, cell_b in edge_list:
+        cluster_a = cell_to_cluster.get(cell_a)
+        cluster_b = cell_to_cluster.get(cell_b)
+        
+        if cluster_a is not None and cluster_b is not None:
+            pair = tuple(sorted([cluster_a, cluster_b]))
+            observed_edges[pair] = observed_edges.get(pair, 0) + 1
+    
+    # Get cluster values as array for shuffling (reused for all pairs)
+    cluster_values = roi_df[cluster_col].values.copy()
+    cell_ids = roi_df['cell_id'].values
+    total_cells = len(roi_df)
+    total_edges = len(roi_edges)
+    
+    if total_edges == 0:
+        print(f"[DEBUG] roi_enrichment_worker: PID {worker_pid} ROI {roi_id} has no edges, skipping")
+        return results
+    
+    # Process each cluster pair
+    for i, cluster_a in enumerate(unique_clusters):
+        for j, cluster_b in enumerate(unique_clusters):
+            if j < i:
+                continue
+            
+            pair = tuple(sorted([cluster_a, cluster_b]))
+            observed = observed_edges.get(pair, 0)
+            
+            # Get cells in each cluster
+            cells_a = set(roi_df[roi_df[cluster_col] == cluster_a]['cell_id'])
+            cells_b = set(roi_df[roi_df[cluster_col] == cluster_b]['cell_id'])
+            
+            n_a = len(cells_a)
+            n_b = len(cells_b)
+            
+            # Expected number of edges (proportional to cluster sizes)
+            expected = (n_a * n_b / (total_cells * (total_cells - 1) / 2)) * total_edges
+            
+            # Permutation test for this cluster pair
+            permuted_counts = []
+            for perm_idx in range(n_perm):
+                # Use a different seed for each permutation to ensure reproducibility
+                np.random.seed(seed + perm_idx)
+                # Shuffle cluster labels
+                shuffled_clusters = cluster_values.copy()
+                np.random.shuffle(shuffled_clusters)
+                
+                # Create temporary mapping
+                temp_cell_to_cluster = dict(zip(cell_ids, shuffled_clusters))
+                
+                # Count edges for this permutation
+                perm_count = 0
+                for cell_a, cell_b in edge_list:
+                    perm_cluster_a = temp_cell_to_cluster.get(cell_a)
+                    perm_cluster_b = temp_cell_to_cluster.get(cell_b)
+                    
+                    if perm_cluster_a is not None and perm_cluster_b is not None:
+                        perm_pair = tuple(sorted([perm_cluster_a, perm_cluster_b]))
+                        if perm_pair == pair:
+                            perm_count += 1
+                
+                permuted_counts.append(perm_count)
+            
+            # Calculate statistics
+            permuted_counts = np.array(permuted_counts)
+            expected_mean = np.mean(permuted_counts)
+            expected_std = np.std(permuted_counts)
+            
+            if expected_std > 0:
+                z_score = (observed - expected_mean) / expected_std
+                # Two-tailed p-value from permutation distribution
+                p_value = np.mean(np.abs(permuted_counts - expected_mean) >= abs(observed - expected_mean))
+            else:
+                z_score = 0.0
+                p_value = 1.0
+            
+            results.append({
+                'roi_id': str(roi_id),
+                'cluster_A': cluster_a,
+                'cluster_B': cluster_b,
+                'observed': observed,
+                'expected': expected,
+                'p_value': p_value,
+                'z_score': z_score,
+                'n_permutations': n_perm
+            })
+    
+    print(f"[DEBUG] roi_enrichment_worker: PID {worker_pid} completed ROI {roi_id}, "
+          f"processed {len(results)} cluster pairs")
+    
+    return results
+
+
 def permutation_worker(args):
     """
     Worker function for computing permutations for a single cluster pair.
     This function must be at module level to be picklable for multiprocessing.
+    Kept for backward compatibility but roi_enrichment_worker is preferred.
     
     Args:
         args: Tuple containing:
@@ -49,7 +183,12 @@ def permutation_worker(args):
     Returns:
         Dictionary with enrichment statistics for this cluster pair
     """
+    import os
     roi_edges, roi_df, cluster_col, cluster_a, cluster_b, pair, observed, n_perm, seed = args
+    
+    worker_pid = os.getpid()
+    print(f"[DEBUG] permutation_worker: PID {worker_pid} processing cluster pair {cluster_a}-{cluster_b}, "
+          f"n_perm={n_perm}, n_edges={len(roi_edges)}, n_cells={len(roi_df)}")
     
     # Convert roi_edges to list of tuples for faster iteration
     edge_list = [(int(row['cell_id_A']), int(row['cell_id_B'])) 
@@ -95,6 +234,9 @@ def permutation_worker(args):
         z_score = 0.0
         p_value = 1.0
     
+    print(f"[DEBUG] permutation_worker: PID {worker_pid} completed cluster pair {cluster_a}-{cluster_b}, "
+          f"observed={observed}, expected_mean={expected_mean:.2f}, z_score={z_score:.2f}, p_value={p_value:.4f}")
+    
     return {
         'cluster_A': cluster_a,
         'cluster_B': cluster_b,
@@ -131,8 +273,11 @@ def distance_distribution_worker(args):
     cell_ids = roi_df["cell_id"].astype(int).to_numpy()
     cell_clusters = roi_df[cluster_col].values
     
-    # Get unique clusters in this ROI
-    unique_clusters = sorted(roi_df[cluster_col].unique())
+    # Get unique clusters in this ROI, filtering out NaN values
+    unique_clusters = sorted([c for c in roi_df[cluster_col].dropna().unique() if pd.notna(c)])
+    
+    if len(unique_clusters) == 0:
+        return distance_data
     
     # Create KDTree for efficient nearest neighbor search
     tree = cKDTree(coords_um)
@@ -147,6 +292,10 @@ def distance_distribution_worker(args):
         cell_id = int(cell_ids[pos_idx])
         cell_cluster = cell_clusters[pos_idx]
         cell_coord = coords_um[pos_idx]
+        
+        # Skip cells with NaN cluster assignments
+        if pd.isna(cell_cluster):
+            continue
         
         # Find nearest neighbor for each cluster type
         for target_cluster in unique_clusters:

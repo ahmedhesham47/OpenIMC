@@ -668,6 +668,12 @@ class SimpleSpatialAnalysisDialog(QtWidgets.QDialog):
         enrichment_desc.setStyleSheet("color: #666; font-style: italic; padding: 5px;")
         enrichment_layout.addWidget(enrichment_desc)
         
+        # Warning label about computation time
+        enrichment_warning = QtWidgets.QLabel("⚠ Warning: Large datasets with high numbers of permutations may take a long time to compute.")
+        enrichment_warning.setWordWrap(True)
+        enrichment_warning.setStyleSheet("color: #d9534f; font-weight: bold; padding: 5px; background-color: #fcf8e3; border: 1px solid #f0ad4e; border-radius: 3px;")
+        enrichment_layout.addWidget(enrichment_warning)
+        
         enrichment_params = QtWidgets.QHBoxLayout()
         enrichment_params.addWidget(QtWidgets.QLabel("Permutations:"))
         enrichment_params.addWidget(self.n_perm_spin)
@@ -689,7 +695,12 @@ class SimpleSpatialAnalysisDialog(QtWidgets.QDialog):
         self.distance_tab = QtWidgets.QWidget()
         distance_layout = QtWidgets.QVBoxLayout(self.distance_tab)
         
-        distance_desc = QtWidgets.QLabel("Computes nearest neighbor distances between all cluster pairs. Results show distance distributions as violin plots to assess spatial relationships.")
+        distance_desc = QtWidgets.QLabel(
+            "Computes nearest neighbor distances from each cell to each cluster type. "
+            "For each cell in cluster A, finds the distance to the nearest cell in cluster B. "
+            "Results show distance distributions as box plots to assess spatial relationships between clusters. "
+            "Shorter distances indicate closer spatial proximity, longer distances indicate spatial separation."
+        )
         distance_desc.setWordWrap(True)
         distance_desc.setStyleSheet("color: #666; font-style: italic; padding: 5px;")
         distance_layout.addWidget(distance_desc)
@@ -714,14 +725,27 @@ class SimpleSpatialAnalysisDialog(QtWidgets.QDialog):
         distance_btn_layout.addStretch()
         distance_layout.addLayout(distance_btn_layout)
         
-        # Cluster selection for filtering distance distributions
+        # Cluster selection for displaying distance distributions
         distance_cluster_layout = QtWidgets.QHBoxLayout()
-        distance_cluster_layout.addWidget(QtWidgets.QLabel("Filter clusters:"))
+        distance_cluster_layout.addWidget(QtWidgets.QLabel("Select clusters to display:"))
         self.distance_cluster_list = QtWidgets.QListWidget()
-        self.distance_cluster_list.setToolTip("Select clusters to display in distance distribution plot. Only pairs involving selected clusters will be shown.")
+        self.distance_cluster_list.setToolTip(
+            "Select clusters to include in the distance distribution plot. "
+            "The plot will show distances from cells in selected clusters to their nearest neighbors "
+            "in selected clusters (including self-distances)."
+        )
         self.distance_cluster_list.setMaximumHeight(100)
         self.distance_cluster_list.setSelectionMode(QtWidgets.QAbstractItemView.MultiSelection)
         distance_cluster_layout.addWidget(self.distance_cluster_list)
+        
+        # Option to show/hide self-pairs
+        self.distance_show_self_pairs_check = QtWidgets.QCheckBox("Show self-distances\n(A→A pairs)")
+        self.distance_show_self_pairs_check.setChecked(True)
+        self.distance_show_self_pairs_check.setToolTip(
+            "When checked, shows distances from cells to nearest neighbors in the same cluster. "
+            "When unchecked, only shows distances between different clusters."
+        )
+        self.distance_show_self_pairs_check.toggled.connect(self._on_distance_cluster_selection_changed)
         
         distance_cluster_btn_layout = QtWidgets.QVBoxLayout()
         self.distance_select_all_btn = QtWidgets.QPushButton("Select All")
@@ -734,6 +758,7 @@ class SimpleSpatialAnalysisDialog(QtWidgets.QDialog):
         distance_cluster_btn_layout.addWidget(self.distance_deselect_all_btn)
         distance_cluster_btn_layout.addStretch()
         distance_cluster_layout.addLayout(distance_cluster_btn_layout)
+        distance_cluster_layout.addWidget(self.distance_show_self_pairs_check)
         distance_cluster_layout.addStretch()
         distance_layout.addLayout(distance_cluster_layout)
         
@@ -835,9 +860,6 @@ class SimpleSpatialAnalysisDialog(QtWidgets.QDialog):
         self.tabs.addTab(self.community_tab, "Spatial Communities")
         
         layout.addWidget(self.tabs, 1)
-        
-        # Set default tab to the leftmost tab (index 0)
-        self.tabs.setCurrentIndex(0)
 
         # Wire signals
         self.build_graph_btn.clicked.connect(self._on_build_graph_clicked)
@@ -857,6 +879,14 @@ class SimpleSpatialAnalysisDialog(QtWidgets.QDialog):
         self.advanced_analysis_btn.clicked.connect(self._open_advanced_analysis)
         
         self._update_tab_states()
+        
+        # Set default tab to Pairwise Enrichment (index 0) AFTER updating tab states
+        # Temporarily enable the tab if needed to set it, then disable if graph not built
+        if not (self.edge_df is not None and not self.edge_df.empty):
+            self.tabs.setTabEnabled(0, True)
+        self.tabs.setCurrentIndex(0)
+        if not (self.edge_df is not None and not self.edge_df.empty):
+            self.tabs.setTabEnabled(0, False)
         self._load_cluster_annotations()
         self._populate_roi_combo()
         self._populate_spatial_color_options()
@@ -933,6 +963,10 @@ class SimpleSpatialAnalysisDialog(QtWidgets.QDialog):
 
     def _get_cluster_display_name(self, cluster_id):
         """Return display label for a cluster id, using annotation if available."""
+        # Handle NaN values
+        if pd.isna(cluster_id):
+            return "Unknown Cluster"
+        
         try:
             parent = self.parent()
             if parent is not None and hasattr(parent, '_get_cluster_display_name'):
@@ -943,8 +977,11 @@ class SimpleSpatialAnalysisDialog(QtWidgets.QDialog):
         if isinstance(self.cluster_annotation_map, dict) and cluster_id in self.cluster_annotation_map and self.cluster_annotation_map[cluster_id]:
             name = self.cluster_annotation_map[cluster_id]
             return name.replace('_', ' ')
-            
-        return f"Cluster {int(cluster_id)}"
+        
+        try:
+            return f"Cluster {int(cluster_id)}"
+        except (ValueError, TypeError):
+            return f"Cluster {cluster_id}"
 
     def _check_annotation_updates(self):
         """Periodically check for cluster annotation updates from parent."""
@@ -1011,15 +1048,19 @@ class SimpleSpatialAnalysisDialog(QtWidgets.QDialog):
             # Get filtered dataframe (respects source file filter)
             filtered_df = self._get_filtered_dataframe()
             
-            # Get pixel size (use first ROI's pixel size as default)
+            # Get pixel size (use first ROI's pixel size as default, default to 1.0 um if not available)
             pixel_size_um = 1.0
             roi_col = self._get_roi_column()
             if roi_col and roi_col in filtered_df.columns:
                 first_roi = filtered_df[roi_col].iloc[0] if len(filtered_df) > 0 else None
                 if first_roi is not None and parent is not None and hasattr(parent, '_get_pixel_size_um'):
                     try:
-                        pixel_size_um = float(parent._get_pixel_size_um(first_roi))
+                        pixel_size = parent._get_pixel_size_um(first_roi)
+                        if pixel_size is not None:
+                            pixel_size_um = float(pixel_size)
+                        # If None, keep default 1.0
                     except Exception:
+                        # Default to 1.0 um if pixel size cannot be retrieved (e.g., MCD file not loaded)
                         pixel_size_um = 1.0
             
             # Use core.build_spatial_graph to build edges
@@ -1274,7 +1315,13 @@ class SimpleSpatialAnalysisDialog(QtWidgets.QDialog):
         QtWidgets.QApplication.processEvents()
         
         try:
-            # Use core spatial_enrichment function
+            # Get number of workers from UI
+            n_workers = int(self.workers_spin.value())
+            print(f"[DEBUG] _compute_pairwise_enrichment: UI workers_spin value = {n_workers}")
+            print(f"[DEBUG] _compute_pairwise_enrichment: n_permutations = {n_perm}")
+            print(f"[DEBUG] _compute_pairwise_enrichment: Calling spatial_enrichment with n_workers={n_workers}")
+            
+            # Use core spatial_enrichment function with multiprocessing
             self.enrichment_df = spatial_enrichment(
                 features_df=filtered_df,
                 edges_df=self.edge_df,
@@ -1282,7 +1329,8 @@ class SimpleSpatialAnalysisDialog(QtWidgets.QDialog):
                 n_permutations=n_perm,
                 seed=seed,
                 roi_column=roi_col,
-                output_path=None  # Don't save, we'll use the dataframe directly
+                output_path=None,  # Don't save, we'll use the dataframe directly
+                n_workers=n_workers
             )
         except Exception as e:
             QtWidgets.QMessageBox.critical(
@@ -1328,6 +1376,23 @@ class SimpleSpatialAnalysisDialog(QtWidgets.QDialog):
         # Get ROI column
         roi_col = self._get_roi_column()
         
+        # Get pixel size (use first ROI's pixel size as default, default to 1.0 um if not available)
+        pixel_size_um = 1.0
+        if roi_col and roi_col in filtered_df.columns:
+            first_roi = filtered_df[roi_col].iloc[0] if len(filtered_df) > 0 else None
+            if first_roi is not None and parent is not None and hasattr(parent, '_get_pixel_size_um'):
+                try:
+                    pixel_size = parent._get_pixel_size_um(first_roi)
+                    if pixel_size is not None:
+                        pixel_size_um = float(pixel_size)
+                    # If None, keep default 1.0
+                except Exception:
+                    # Default to 1.0 um if pixel size cannot be retrieved (e.g., MCD file not loaded)
+                    pixel_size_um = 1.0
+        
+        # Get number of workers from UI
+        n_workers = int(self.distance_workers_spin.value()) if hasattr(self, 'distance_workers_spin') else None
+        
         # Show progress dialog
         progress_dlg = QtWidgets.QProgressDialog(
             "Computing distance distributions...",
@@ -1343,13 +1408,15 @@ class SimpleSpatialAnalysisDialog(QtWidgets.QDialog):
         QtWidgets.QApplication.processEvents()
         
         try:
-            # Use core spatial_distance_distribution function
+            # Use core spatial_distance_distribution function with multiprocessing
             self.distance_df = spatial_distance_distribution(
                 features_df=filtered_df,
                 edges_df=self.edge_df,
                 cluster_column=cluster_col,
                 roi_column=roi_col,
-                output_path=None  # Don't save, we'll use the dataframe directly
+                output_path=None,  # Don't save, we'll use the dataframe directly
+                pixel_size_um=pixel_size_um,
+                n_workers=n_workers
             )
         except Exception as e:
             QtWidgets.QMessageBox.critical(
@@ -1453,13 +1520,17 @@ class SimpleSpatialAnalysisDialog(QtWidgets.QDialog):
         # Get color option
         color_option = self.spatial_color_combo.currentText() if hasattr(self, 'spatial_color_combo') else 'cluster'
         
-        # Get pixel size
+        # Get pixel size (default to 1.0 um if not available, e.g., MCD file not loaded)
         parent = self.parent() if hasattr(self, 'parent') else None
         pixel_size_um = 1.0
         try:
             if parent is not None and hasattr(parent, '_get_pixel_size_um'):
-                pixel_size_um = float(parent._get_pixel_size_um(roi_id))
+                pixel_size = parent._get_pixel_size_um(roi_id)
+                if pixel_size is not None:
+                    pixel_size_um = float(pixel_size)
+                # If None, keep default 1.0
         except Exception:
+            # Default to 1.0 um if pixel size cannot be retrieved (e.g., MCD file not loaded)
             pixel_size_um = 1.0
         
         # Get coordinates
@@ -1637,13 +1708,17 @@ class SimpleSpatialAnalysisDialog(QtWidgets.QDialog):
         self.community_canvas.figure.clear()
         ax = self.community_canvas.figure.add_subplot(111)
         
-        # Get pixel size
+        # Get pixel size (default to 1.0 um if not available, e.g., MCD file not loaded)
         parent = self.parent() if hasattr(self, 'parent') else None
         pixel_size_um = 1.0
         try:
             if parent is not None and hasattr(parent, '_get_pixel_size_um'):
-                pixel_size_um = float(parent._get_pixel_size_um(roi_id))
+                pixel_size = parent._get_pixel_size_um(roi_id)
+                if pixel_size is not None:
+                    pixel_size_um = float(pixel_size)
+                # If None, keep default 1.0
         except Exception:
+            # Default to 1.0 um if pixel size cannot be retrieved (e.g., MCD file not loaded)
             pixel_size_um = 1.0
         
         # Get coordinates
@@ -1889,8 +1964,12 @@ class SimpleSpatialAnalysisDialog(QtWidgets.QDialog):
         self.distance_canvas.figure.clear()
         ax = self.distance_canvas.figure.add_subplot(111)
         
-        # Get selected clusters for filtering
+        # Get selected clusters
         selected_clusters = self._get_selected_distance_clusters()
+        
+        # Check if self-pairs should be shown
+        show_self_pairs = (hasattr(self, 'distance_show_self_pairs_check') and 
+                           self.distance_show_self_pairs_check.isChecked())
         
         # If no clusters are selected, show message
         if not selected_clusters:
@@ -1900,8 +1979,12 @@ class SimpleSpatialAnalysisDialog(QtWidgets.QDialog):
             self.distance_canvas.draw()
             return
         
-        # Get unique cluster pairs
+        # Get unique cluster pairs, filtering out NaN values
         unique_pairs = self.distance_df[['cell_A_cluster', 'nearest_B_cluster']].drop_duplicates()
+        unique_pairs = unique_pairs[
+            unique_pairs['cell_A_cluster'].notna() & 
+            unique_pairs['nearest_B_cluster'].notna()
+        ]
         
         # Filter pairs based on selected clusters (show pairs where both clusters are selected)
         unique_pairs = unique_pairs[
@@ -1909,7 +1992,13 @@ class SimpleSpatialAnalysisDialog(QtWidgets.QDialog):
             (unique_pairs['nearest_B_cluster'].isin(selected_clusters))
         ]
         
-        # Create violin/box plot for each pair
+        # Optionally filter out self-pairs (A→A)
+        if not show_self_pairs:
+            unique_pairs = unique_pairs[
+                unique_pairs['cell_A_cluster'] != unique_pairs['nearest_B_cluster']
+            ]
+        
+        # Create box plot for each pair
         plot_data = []
         plot_labels = []
         
@@ -1924,7 +2013,11 @@ class SimpleSpatialAnalysisDialog(QtWidgets.QDialog):
             
             if len(pair_data) > 0:
                 plot_data.append(pair_data)
-                plot_labels.append(f"{self._get_cluster_display_name(cluster_a)} → {self._get_cluster_display_name(cluster_b)}")
+                # Format label: show "A → A" for self-pairs, "A → B" for cross-pairs
+                if cluster_a == cluster_b:
+                    plot_labels.append(f"{self._get_cluster_display_name(cluster_a)} → {self._get_cluster_display_name(cluster_b)} (self)")
+                else:
+                    plot_labels.append(f"{self._get_cluster_display_name(cluster_a)} → {self._get_cluster_display_name(cluster_b)}")
         
         if not plot_data:
             ax.text(0.5, 0.5, 'No data to display for selected clusters.', 
@@ -1945,7 +2038,9 @@ class SimpleSpatialAnalysisDialog(QtWidgets.QDialog):
         ax.set_ylabel('Distance to Nearest Neighbor (µm)')
         title = 'Distance Distribution: Nearest Neighbor Distances Between Cluster Pairs'
         if selected_clusters:
-            title += f' (Filtered: {len(selected_clusters)} clusters)'
+            title += f' (Showing {len(selected_clusters)} selected cluster{"s" if len(selected_clusters) > 1 else ""})'
+        if not show_self_pairs:
+            title += ' (self-distances hidden)'
         ax.set_title(title)
         ax.tick_params(axis='x', rotation=45)
         ax.grid(True, alpha=0.3, axis='y')
@@ -1982,7 +2077,10 @@ class SimpleSpatialAnalysisDialog(QtWidgets.QDialog):
             return
         
         # Get all unique clusters from both cell_A_cluster and nearest_B_cluster
-        all_clusters = set(self.distance_df['cell_A_cluster'].unique()) | set(self.distance_df['nearest_B_cluster'].unique())
+        # Filter out NaN values
+        clusters_a = [c for c in self.distance_df['cell_A_cluster'].unique() if pd.notna(c)]
+        clusters_b = [c for c in self.distance_df['nearest_B_cluster'].unique() if pd.notna(c)]
+        all_clusters = set(clusters_a) | set(clusters_b)
         all_clusters = sorted(all_clusters)
         
         self.distance_cluster_list.blockSignals(True)

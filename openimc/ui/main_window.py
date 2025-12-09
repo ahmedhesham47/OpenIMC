@@ -1197,6 +1197,7 @@ class MainWindow(QtWidgets.QMainWindow):
             pass
         
         # Initialize cluster mode availability (will be disabled initially)
+        # Also initialize clustering button and spatial analysis button state
         try:
             self._update_cluster_mode_availability()
         except Exception:
@@ -7003,7 +7004,7 @@ class MainWindow(QtWidgets.QMainWindow):
         return has_cluster_col
     
     def _update_cluster_mode_availability(self):
-        """Update the availability of Cluster mode in the overlay dropdown."""
+        """Update the availability of Cluster mode in the overlay dropdown, clustering button, and spatial analysis button."""
         # Check for cluster data - first try current acquisition, then check all data
         current_acq_id = self.current_acq_id if hasattr(self, 'current_acq_id') else None
         has_cluster = self._has_cluster_data(current_acq_id)
@@ -7011,6 +7012,22 @@ class MainWindow(QtWidgets.QMainWindow):
         # If no cluster data for current acquisition, check if any cluster data exists at all
         if not has_cluster:
             has_cluster = self._has_cluster_data(None)  # Check all data
+        
+        # Enable/disable clustering button based on feature data availability (not cluster columns)
+        # The button should work regardless of whether cluster columns exist
+        if hasattr(self, 'clustering_btn'):
+            has_feature_data = (self.feature_dataframe is not None and 
+                              not self.feature_dataframe.empty)
+            self.clustering_btn.setEnabled(has_feature_data)
+        
+        # Enable/disable spatial analysis button based on cluster column presence
+        # Spatial analysis requires cluster columns to be available
+        if hasattr(self, 'spatial_btn'):
+            has_cluster_columns = False
+            if self.feature_dataframe is not None and not self.feature_dataframe.empty:
+                has_cluster_columns = any(col in self.feature_dataframe.columns 
+                                       for col in ['cluster', 'cluster_id', 'cluster_phenotype'])
+            self.spatial_btn.setEnabled(has_cluster_columns)
         
         # Find the Cluster item in the combo box
         cluster_index = -1
