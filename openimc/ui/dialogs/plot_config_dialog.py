@@ -194,6 +194,65 @@ class PlotConfigDialog(QtWidgets.QDialog):
         feature_fontsize_layout.addStretch()
         heatmap_layout.addLayout(feature_fontsize_layout)
         
+        # Legend configuration (for heatmap)
+        legend_config_layout = QtWidgets.QVBoxLayout()
+        legend_config_title = QtWidgets.QLabel("Legend Configuration:")
+        legend_config_layout.addWidget(legend_config_title)
+        
+        # Legend rows
+        legend_rows_layout = QtWidgets.QHBoxLayout()
+        self.legend_rows_label = QtWidgets.QLabel("Legend rows:")
+        legend_rows_layout.addWidget(self.legend_rows_label)
+        self.legend_rows_spinbox = QtWidgets.QSpinBox()
+        self.legend_rows_spinbox.setMinimum(1)
+        self.legend_rows_spinbox.setMaximum(20)
+        self.legend_rows_spinbox.setValue(1)
+        self.legend_rows_spinbox.setToolTip("Number of rows for legend layout")
+        legend_rows_layout.addWidget(self.legend_rows_spinbox)
+        legend_rows_layout.addStretch()
+        legend_config_layout.addLayout(legend_rows_layout)
+        
+        # Legend columns
+        legend_cols_layout = QtWidgets.QHBoxLayout()
+        self.legend_cols_label = QtWidgets.QLabel("Legend columns:")
+        legend_cols_layout.addWidget(self.legend_cols_label)
+        self.legend_cols_spinbox = QtWidgets.QSpinBox()
+        self.legend_cols_spinbox.setMinimum(1)
+        self.legend_cols_spinbox.setMaximum(20)
+        self.legend_cols_spinbox.setValue(1)
+        self.legend_cols_spinbox.setToolTip("Number of columns for legend layout")
+        legend_cols_layout.addWidget(self.legend_cols_spinbox)
+        legend_cols_layout.addStretch()
+        legend_config_layout.addLayout(legend_cols_layout)
+        
+        # Legend font size
+        legend_fontsize_layout = QtWidgets.QHBoxLayout()
+        self.legend_fontsize_label = QtWidgets.QLabel("Legend font size:")
+        legend_fontsize_layout.addWidget(self.legend_fontsize_label)
+        self.legend_fontsize_spinbox = QtWidgets.QSpinBox()
+        self.legend_fontsize_spinbox.setMinimum(4)
+        self.legend_fontsize_spinbox.setMaximum(20)
+        self.legend_fontsize_spinbox.setValue(8)
+        self.legend_fontsize_spinbox.setToolTip("Font size for legend text")
+        legend_fontsize_layout.addWidget(self.legend_fontsize_spinbox)
+        legend_fontsize_layout.addStretch()
+        legend_config_layout.addLayout(legend_fontsize_layout)
+        
+        heatmap_layout.addLayout(legend_config_layout)
+        
+        # Orientation control (for Cluster Map only)
+        orientation_layout = QtWidgets.QHBoxLayout()
+        self.orientation_label = QtWidgets.QLabel("Orientation:")
+        orientation_layout.addWidget(self.orientation_label)
+        self.orientation_combo = QtWidgets.QComboBox()
+        self.orientation_combo.addItems(["Portrait (Clusters on Y-axis)", "Landscape (Clusters on X-axis)"])
+        self.orientation_combo.setCurrentText("Portrait (Clusters on Y-axis)")
+        self.orientation_combo.setToolTip("Orientation of the cluster map: Portrait shows clusters on Y-axis, Landscape shows clusters on X-axis")
+        self.orientation_combo.currentTextChanged.connect(self._on_orientation_changed)
+        orientation_layout.addWidget(self.orientation_combo)
+        orientation_layout.addStretch()
+        heatmap_layout.addLayout(orientation_layout)
+        
         self.heatmap_group.setLayout(heatmap_layout)
         content_layout.addWidget(self.heatmap_group)
 
@@ -353,12 +412,24 @@ class PlotConfigDialog(QtWidgets.QDialog):
         # Group-by: Only for Stacked Bars
         self.group_by_widget.setVisible(view == 'Stacked Bars')
         
-        # Colormap: For Heatmap and Differential Expression
-        show_colormap = view in ['Heatmap', 'Differential Expression']
+        # Colormap: For Heatmap, Cluster Map, and Differential Expression
+        show_colormap = view in ['Heatmap', 'Cluster Map', 'Differential Expression']
         self.colormap_widget.setVisible(show_colormap)
         
-        # Heatmap settings: Only for Heatmap
-        self.heatmap_group.setVisible(view == 'Heatmap')
+        # Heatmap settings: For Heatmap and Cluster Map
+        self.heatmap_group.setVisible(view in ['Heatmap', 'Cluster Map'])
+        
+        # Orientation control: Only for Cluster Map
+        if hasattr(self, 'orientation_label'):
+            self.orientation_label.setVisible(view == 'Cluster Map')
+        if hasattr(self, 'orientation_combo'):
+            self.orientation_combo.setVisible(view == 'Cluster Map')
+        
+        # Heatmap source: Only for Heatmap (not Cluster Map)
+        if hasattr(self, 'heatmap_source_label'):
+            self.heatmap_source_label.setVisible(view == 'Heatmap')
+        if hasattr(self, 'heatmap_source_combo'):
+            self.heatmap_source_combo.setVisible(view == 'Heatmap')
         
         # Patient annotation: Only for Heatmap
         self.patient_annotation_group.setVisible(view == 'Heatmap')
@@ -421,6 +492,20 @@ class PlotConfigDialog(QtWidgets.QDialog):
         # Feature tick font size
         if hasattr(self.parent_dialog, 'feature_tick_fontsize'):
             self.feature_fontsize_spinbox.setValue(self.parent_dialog.feature_tick_fontsize)
+        
+        # Legend configuration
+        if hasattr(self.parent_dialog, 'legend_nrows'):
+            self.legend_rows_spinbox.setValue(self.parent_dialog.legend_nrows)
+        if hasattr(self.parent_dialog, 'legend_ncols'):
+            self.legend_cols_spinbox.setValue(self.parent_dialog.legend_ncols)
+        if hasattr(self.parent_dialog, 'legend_fontsize'):
+            self.legend_fontsize_spinbox.setValue(self.parent_dialog.legend_fontsize)
+        
+        # Cluster Map orientation
+        if hasattr(self.parent_dialog, 'cluster_map_orientation'):
+            orientation_text = "Portrait (Clusters on Y-axis)" if self.parent_dialog.cluster_map_orientation == 'portrait' else "Landscape (Clusters on X-axis)"
+            if hasattr(self, 'orientation_combo'):
+                self.orientation_combo.setCurrentText(orientation_text)
         
         # Patient annotation - populate column options
         # Block signals to prevent triggering dialogs during population
@@ -524,6 +609,17 @@ class PlotConfigDialog(QtWidgets.QDialog):
         if hasattr(self.parent_dialog, '_open_heatmap_filter_dialog'):
             self.parent_dialog._open_heatmap_filter_dialog()
     
+    def _on_orientation_changed(self, text: str):
+        """Handle orientation change for Cluster Map."""
+        # Update parent dialog immediately if Cluster Map is active
+        if hasattr(self.parent_dialog, 'view_combo') and self.parent_dialog.view_combo.currentText() == 'Cluster Map':
+            if 'Portrait' in text:
+                self.parent_dialog.cluster_map_orientation = 'portrait'
+            else:
+                self.parent_dialog.cluster_map_orientation = 'landscape'
+            if hasattr(self.parent_dialog, '_show_cluster_map'):
+                self.parent_dialog._show_cluster_map()
+    
     def _on_patient_annotation_changed(self, state: int):
         """Handle patient annotation checkbox change."""
         is_checked = (state == 2)
@@ -596,6 +692,26 @@ class PlotConfigDialog(QtWidgets.QDialog):
         # Feature tick font size
         if hasattr(self.parent_dialog, 'feature_tick_fontsize'):
             self.parent_dialog.feature_tick_fontsize = self.feature_fontsize_spinbox.value()
+        
+        # Legend configuration
+        if hasattr(self.parent_dialog, 'legend_nrows'):
+            self.parent_dialog.legend_nrows = self.legend_rows_spinbox.value()
+        if hasattr(self.parent_dialog, 'legend_ncols'):
+            self.parent_dialog.legend_ncols = self.legend_cols_spinbox.value()
+        if hasattr(self.parent_dialog, 'legend_fontsize'):
+            self.parent_dialog.legend_fontsize = self.legend_fontsize_spinbox.value()
+        
+        # Cluster Map orientation
+        if hasattr(self, 'orientation_combo') and hasattr(self.parent_dialog, 'cluster_map_orientation'):
+            orientation_text = self.orientation_combo.currentText()
+            if 'Portrait' in orientation_text:
+                self.parent_dialog.cluster_map_orientation = 'portrait'
+            else:
+                self.parent_dialog.cluster_map_orientation = 'landscape'
+            # Refresh Cluster Map if it's the current view
+            if hasattr(self.parent_dialog, 'view_combo') and self.parent_dialog.view_combo.currentText() == 'Cluster Map':
+                if hasattr(self.parent_dialog, '_show_cluster_map'):
+                    self.parent_dialog._show_cluster_map()
         
         # Patient annotation
         # Update the enabled state in parent dialog
