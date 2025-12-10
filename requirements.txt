@@ -10,6 +10,7 @@ statsmodels>=0.14.0
 h5py
 lxml
 imageio
+pyyaml
 
 # UI
 PyQt5>=5.15

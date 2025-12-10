@@ -734,12 +734,30 @@ class AdvancedSpatialAnalysisDialog(QtWidgets.QDialog):
                 self.source_file_status_label.setText(f"{count} of {total} files")
     
     def _load_cluster_annotations(self):
-        """Load cluster annotations from parent."""
+        """Load cluster annotations from parent dialog if available."""
         try:
             parent = self.parent()
             if parent is not None and hasattr(parent, 'cluster_annotation_map'):
                 self.cluster_annotation_map = parent.cluster_annotation_map.copy()
-        except Exception:
+            elif parent is not None and hasattr(parent, '_get_cluster_display_name'):
+                pass
+            
+            if self.feature_dataframe is not None and 'cluster_phenotype' in self.feature_dataframe.columns:
+                phenotype_map = {}
+                for cluster_id in self.feature_dataframe['cluster'].unique():
+                    if pd.notna(cluster_id):
+                        phenotype_rows = self.feature_dataframe[
+                            (self.feature_dataframe['cluster'] == cluster_id) & 
+                            (self.feature_dataframe['cluster_phenotype'].notna()) &
+                            (self.feature_dataframe['cluster_phenotype'] != '')
+                        ]
+                        if not phenotype_rows.empty:
+                            phenotype_map[cluster_id] = phenotype_rows['cluster_phenotype'].iloc[0]
+                
+                if phenotype_map:
+                    self.cluster_annotation_map.update(phenotype_map)
+                    
+        except Exception as e:
             pass
     
     def _populate_roi_combo(self):
@@ -776,11 +794,26 @@ class AdvancedSpatialAnalysisDialog(QtWidgets.QDialog):
                     combo.addItem(str(roi_id), roi_id)
     
     def _get_cluster_display_name(self, cluster_id):
-        """Get display name for cluster with annotation if available."""
-        if cluster_id in self.cluster_annotation_map:
-            annotation = self.cluster_annotation_map[cluster_id]
-            return f"{cluster_id} ({annotation})"
-        return str(cluster_id)
+        """Return display label for a cluster id, using annotation if available."""
+        # Handle NaN values
+        if pd.isna(cluster_id):
+            return "Unknown Cluster"
+        
+        try:
+            parent = self.parent()
+            if parent is not None and hasattr(parent, '_get_cluster_display_name'):
+                return parent._get_cluster_display_name(cluster_id)
+        except Exception:
+            pass
+        
+        if isinstance(self.cluster_annotation_map, dict) and cluster_id in self.cluster_annotation_map and self.cluster_annotation_map[cluster_id]:
+            name = self.cluster_annotation_map[cluster_id]
+            return name.replace('_', ' ')
+        
+        try:
+            return f"Cluster {int(cluster_id)}"
+        except (ValueError, TypeError):
+            return f"Cluster {cluster_id}"
     
     def _on_feature_set_changed(self):
         """Handle feature set change - invalidate cache and refresh."""
@@ -795,6 +828,9 @@ class AdvancedSpatialAnalysisDialog(QtWidgets.QDialog):
                 return
         else:
             self.feature_dataframe = self.original_feature_dataframe.copy()
+        
+        # Reload cluster annotations since dataframe may have changed
+        self._load_cluster_annotations()
         
         # Clear cache since data changed
         self.anndata_cache = {}
@@ -1383,7 +1419,7 @@ class AdvancedSpatialAnalysisDialog(QtWidgets.QDialog):
             QtWidgets.QMessageBox.critical(self, "Error", f"Error running enrichment: {str(e)}")
     
     def _plot_sq_nhood_enrichment(self, adata: 'ad.AnnData'):
-        """Plot neighborhood enrichment results."""
+        """Plot neighborhood enrichment results with improved visualization."""
         print(f"[DEBUG] _plot_sq_nhood_enrichment: Starting")
         print(f"[DEBUG] adata: {adata}")
         if adata is None:
@@ -1406,7 +1442,7 @@ class AdvancedSpatialAnalysisDialog(QtWidgets.QDialog):
             self.sq_nhood_canvas.draw()
             return
         
-        # Manual plotting (more reliable than squidpy's plotting with custom canvas)
+        # Clear figure and create new subplot
         self.sq_nhood_canvas.figure.clear()
         ax = self.sq_nhood_canvas.figure.add_subplot(111)
         
@@ -1417,11 +1453,9 @@ class AdvancedSpatialAnalysisDialog(QtWidgets.QDialog):
         if isinstance(enrichment_data, dict):
             print(f"[DEBUG] enrichment_data keys: {list(enrichment_data.keys())}")
         
-        # Convert to numpy array if needed
+        # Extract matrix from enrichment data
         matrix = None
         if isinstance(enrichment_data, dict):
-            # Squidpy stores the result in a nested structure
-            # Try common keys
             if 'zscore' in enrichment_data:
                 matrix = enrichment_data['zscore']
                 print(f"[DEBUG] Found 'zscore' key, shape: {matrix.shape if hasattr(matrix, 'shape') else 'N/A'}")
@@ -1433,17 +1467,13 @@ class AdvancedSpatialAnalysisDialog(QtWidgets.QDialog):
                 print(f"[DEBUG] Found 'stat' key, shape: {matrix.shape if hasattr(matrix, 'shape') else 'N/A'}")
             else:
                 # Try to find a matrix-like value
-                print(f"[DEBUG] Searching for matrix-like value in dict")
                 for key, value in enrichment_data.items():
-                    print(f"[DEBUG]   Checking key '{key}': type={type(value)}, ndim={getattr(value, 'ndim', 'N/A')}")
                     if isinstance(value, np.ndarray) and value.ndim == 2:
                         matrix = value
                         print(f"[DEBUG]   Found matrix at key '{key}', shape: {matrix.shape}")
                         break
-                # If still not found, try first value
                 if matrix is None and len(enrichment_data) > 0:
                     first_val = list(enrichment_data.values())[0]
-                    print(f"[DEBUG] Trying first value: type={type(first_val)}, ndim={getattr(first_val, 'ndim', 'N/A')}")
                     if isinstance(first_val, np.ndarray) and first_val.ndim == 2:
                         matrix = first_val
                         print(f"[DEBUG]   Using first value as matrix, shape: {matrix.shape}")
@@ -1451,246 +1481,125 @@ class AdvancedSpatialAnalysisDialog(QtWidgets.QDialog):
             matrix = enrichment_data
             print(f"[DEBUG] enrichment_data is numpy array, shape: {matrix.shape}")
         
-        print(f"[DEBUG] Final matrix: {matrix is not None}, type: {type(matrix) if matrix is not None else 'None'}")
-        if matrix is not None:
-            print(f"[DEBUG] Matrix shape: {matrix.shape}, ndim: {matrix.ndim}, dtype: {matrix.dtype}")
+        # Get cluster labels
+        categories = None
+        if hasattr(adata, 'obs') and cluster_key in adata.obs.columns:
+            if hasattr(adata.obs[cluster_key], 'cat'):
+                categories = list(adata.obs[cluster_key].cat.categories)
+            else:
+                categories = sorted(adata.obs[cluster_key].unique())
+            print(f"[DEBUG] Found {len(categories)} categories: {categories[:5]}...")
         
         if matrix is not None and isinstance(matrix, np.ndarray) and matrix.ndim == 2:
             print(f"[DEBUG] Plotting matrix with shape {matrix.shape}")
-            print(f"[DEBUG] Matrix dtype: {matrix.dtype}, min: {np.nanmin(matrix)}, max: {np.nanmax(matrix)}")
             try:
                 # Handle NaN/inf values
                 if np.any(np.isnan(matrix)) or np.any(np.isinf(matrix)):
                     print(f"[DEBUG] Found NaN/inf values, replacing")
-                    # Replace with 0 for display
                     matrix = np.nan_to_num(matrix, nan=0.0, posinf=3.0, neginf=-3.0)
                 
-                # Determine vmin/vmax from data if reasonable
-                vmin, vmax = -3, 3
-                if matrix.size > 0:
-                    finite_vals = matrix[np.isfinite(matrix)]
-                    if len(finite_vals) > 0:
-                        data_min, data_max = np.min(finite_vals), np.max(finite_vals)
-                        print(f"[DEBUG] Matrix value range: [{data_min}, {data_max}]")
-                        if abs(data_min) < 10 and abs(data_max) < 10:
-                            vmin, vmax = data_min, data_max
-                        else:
-                            # Use percentiles for extreme values
-                            vmin = np.percentile(finite_vals, 5)
-                            vmax = np.percentile(finite_vals, 95)
-                        print(f"[DEBUG] Using vmin={vmin}, vmax={vmax}")
+                # Determine color scale
+                finite_vals = matrix[np.isfinite(matrix)]
+                if len(finite_vals) > 0:
+                    data_min, data_max = np.min(finite_vals), np.max(finite_vals)
+                    # Use symmetric scale centered at 0 for better visualization
+                    abs_max = max(abs(data_min), abs(data_max))
+                    vmin, vmax = -max(abs_max, 1), max(abs_max, 1)
+                    # Clamp to reasonable range
+                    vmin = max(vmin, -5)
+                    vmax = min(vmax, 5)
+                else:
+                    vmin, vmax = -3, 3
                 
-                # Create square heatmap with aspect='equal' for square cells
-                # Use extent to ensure proper square cells
-                n_rows, n_cols = matrix.shape
-                im = ax.imshow(matrix, cmap='RdBu_r', aspect='equal', vmin=vmin, vmax=vmax, 
-                              interpolation='nearest', origin='upper', 
-                              extent=[-0.5, n_cols - 0.5, n_rows - 0.5, -0.5])
-                print(f"[DEBUG] imshow created with extent=[-0.5, {n_cols-0.5}, {n_rows-0.5}, -0.5]")
+                print(f"[DEBUG] Using vmin={vmin}, vmax={vmax}")
                 
-                # Add colorbar with proper spacing
-                # Use pad to control spacing between plot and colorbar
-                cbar = self.sq_nhood_canvas.figure.colorbar(im, ax=ax, label='Z-Score', pad=0.02, shrink=0.8)
-                print(f"[DEBUG] Colorbar created")
-                
-                # Set axis limits to ensure proper display
-                ax.set_xlim(-0.5, n_cols - 0.5)
-                ax.set_ylim(n_rows - 0.5, -0.5)
-                print(f"[DEBUG] Axis limits set: x=[-0.5, {n_cols-0.5}], y=[{n_rows-0.5}, -0.5]")
-                print(f"[DEBUG] imshow and colorbar created successfully")
-                
-                # Add circles for significant interactions if available
+                # Get significance information
                 significant_counts = None
-                # Try to get significant_counts from adata object
+                significance_threshold = 2.0
                 if hasattr(adata, '_significant_counts') and adata._significant_counts is not None:
                     significant_counts = adata._significant_counts
                     print(f"[DEBUG] Found significant_counts in adata, shape: {significant_counts.shape}")
                 else:
-                    # For single ROI, compute from matrix (threshold = 2.0)
-                    # This is a fallback - ideally we'd have it from the core function
-                    significance_threshold = 2.0
+                    # Compute significance from z-scores
                     significant_counts = (np.abs(matrix) > significance_threshold).astype(int)
-                    print(f"[DEBUG] Computed significant_counts from matrix (single ROI), threshold={significance_threshold}")
+                    print(f"[DEBUG] Computed significant_counts from matrix, threshold={significance_threshold}")
                 
-                if significant_counts is not None and significant_counts.shape == matrix.shape:
-                    print(f"[DEBUG] Adding circles for significant interactions")
-                    # Normalize circle sizes (0 to max count)
-                    max_count = np.max(significant_counts) if significant_counts.size > 0 else 1
-                    if max_count > 0:
-                        # Circle size will be proportional to count, scaled to fit within cell
-                        # Use a fraction of cell size (e.g., 0.3 to 0.8 of cell width)
-                        n_rows, n_cols = matrix.shape
-                        # Calculate cell size in data coordinates
-                        cell_size = 1.0  # Since we're using integer indices
-                        min_radius = 0.15 * cell_size  # Minimum circle radius
-                        max_radius = 0.4 * cell_size   # Maximum circle radius
+                # Create DataFrame for seaborn heatmap
+                if categories is not None and len(categories) == matrix.shape[0] == matrix.shape[1]:
+                    cluster_labels = [self._get_cluster_display_name(c) for c in categories]
+                    df = pd.DataFrame(matrix, index=cluster_labels, columns=cluster_labels)
+                else:
+                    df = pd.DataFrame(matrix)
+                
+                # Create annotation matrix: z-score values + significance markers
+                annot_matrix = np.empty(matrix.shape, dtype=object)
+                for i in range(matrix.shape[0]):
+                    for j in range(matrix.shape[1]):
+                        z_val = matrix[i, j]
+                        # Format z-score (2 decimal places)
+                        z_str = f"{z_val:.2f}"
                         
-                        # Draw circles for each cell
-                        # With extent=[-0.5, n_cols-0.5, n_rows-0.5, -0.5] and origin='upper',
-                        # cell (i, j) has center at (j, i) in data coordinates
-                        circles_added = 0
-                        for i in range(n_rows):
-                            for j in range(n_cols):
-                                count = significant_counts[i, j]
-                                if count > 0:
-                                    # Scale radius based on count
-                                    radius = min_radius + (max_radius - min_radius) * (count / max_count)
-                                    # Center of cell in data coordinates
-                                    # Row i corresponds to y = i (with origin='upper', y decreases downward)
-                                    # Column j corresponds to x = j
-                                    circle = Circle((j, i), radius, color='black', 
-                                                   fill=False, linewidth=1.5, alpha=0.7)
-                                    ax.add_patch(circle)
-                                    circles_added += 1
-                        print(f"[DEBUG] Added {circles_added} circles for cells with significant interactions")
+                        # Add significance marker
+                        if significant_counts is not None and significant_counts[i, j] > 0:
+                            # Use star(s) to indicate significance
+                            # More stars for higher counts (if multiple ROIs)
+                            if significant_counts[i, j] > 1:
+                                stars = "*" * min(significant_counts[i, j], 3)  # Max 3 stars
+                                z_str = f"{z_str}\n{stars}"
+                            else:
+                                z_str = f"{z_str}\n*"
                         
-                        # Add legend for circle sizes
-                        # Show legend for 1, max_count//2, and max_count (or closest values)
-                        legend_counts = [1]
-                        if max_count > 1:
-                            if max_count > 2:
-                                mid_count = max(1, max_count // 2)
-                                if mid_count not in legend_counts:
-                                    legend_counts.append(mid_count)
-                            if max_count not in legend_counts:
-                                legend_counts.append(max_count)
-                        
-                        # Remove duplicates and sort
-                        legend_counts = sorted(set(legend_counts))
-                        
-                        # Create legend using a custom handler that properly scales circles
-                        from matplotlib.legend_handler import HandlerPatch
-                        
-                        # Store radius information for the handler
-                        class CircleLegendHandler(HandlerPatch):
-                            def __init__(self, radius_data, max_radius_data, ax_ref):
-                                super().__init__()
-                                self.radius_data = radius_data
-                                self.max_radius_data = max_radius_data
-                                self.ax_ref = ax_ref
-                            
-                            def create_artists(self, legend, orig_handle,
-                                             xdescent, ydescent, width, height, fontsize, trans):
-                                # Convert data radius to display coordinates
-                                # Get the transform from data to display coordinates
-                                data_to_display = self.ax_ref.transData
-                                
-                                # Use a reference point in the plot (center of a cell at (0, 0))
-                                # Convert the radius from data coordinates to display coordinates
-                                p_center = data_to_display.transform((0, 0))
-                                p_radius = data_to_display.transform((self.radius_data, 0))
-                                
-                                # Calculate display radius in pixels
-                                display_radius = abs(p_radius[0] - p_center[0])
-                                
-                                # Now convert display radius to legend box coordinates
-                                # The legend box uses a transform that maps to display coordinates
-                                # We need to scale the display radius to fit in the legend box
-                                # Use a reasonable fraction of the legend box size
-                                max_legend_size = min(width, height) * 0.4  # Max circle size in legend box
-                                
-                                # Scale the display radius to fit in legend box
-                                # We want the largest circle to be max_legend_size
-                                # First, get the max radius in display coordinates for reference
-                                p_max_center = data_to_display.transform((0, 0))
-                                p_max_radius = data_to_display.transform((self.max_radius_data, 0))
-                                max_display_radius = abs(p_max_radius[0] - p_max_center[0])
-                                
-                                # Scale proportionally
-                                if max_display_radius > 0:
-                                    scale_factor = max_legend_size / max_display_radius
-                                    legend_radius = display_radius * scale_factor
-                                else:
-                                    # Fallback: use proportional scaling based on data radius
-                                    legend_radius = max_legend_size * (self.radius_data / self.max_radius_data) if self.max_radius_data > 0 else max_legend_size
-                                
-                                center_x = xdescent + width / 2
-                                center_y = ydescent + height / 2
-                                circle = Circle((center_x, center_y), legend_radius,
-                                              color='black', fill=False, linewidth=1.5, alpha=0.7,
-                                              transform=trans)
-                                return [circle]
-                        
-                        # Create legend handles with radius information
-                        legend_handles = []
-                        legend_labels = []
-                        handler_map = {}
-                        
-                        for count_val in legend_counts:
-                            # Calculate the actual radius used in the plot (in data coordinates)
-                            radius_data = min_radius + (max_radius - min_radius) * (count_val / max_count)
-                            
-                            # Create a dummy circle patch (size doesn't matter, handler will override)
-                            legend_circle = Circle((0, 0), 1.0, 
-                                                  color='black', fill=False, 
-                                                  linewidth=1.5, alpha=0.7)
-                            legend_circle._radius_data = radius_data  # Store actual radius
-                            legend_handles.append(legend_circle)
-                            label = f"{count_val} image{'s' if count_val > 1 else ''}"
-                            legend_labels.append(label)
-                            
-                            # Create handler for this circle with radius info
-                            handler_map[legend_circle] = CircleLegendHandler(radius_data, max_radius, ax)
-                        
-                        # Create legend positioned on top of the plot, horizontal layout
-                        legend_created = False
-                        if legend_handles:
-                            # Position legend on top, centered, horizontal layout
-                            # Move it higher to avoid overlapping with title
-                            legend = ax.legend(legend_handles, legend_labels,
-                                             title='Significant Interactions',
-                                             loc='lower center',
-                                             bbox_to_anchor=(0.5, 1.08),
-                                             frameon=True,
-                                             fancybox=True,
-                                             shadow=True,
-                                             fontsize=9,
-                                             ncol=len(legend_handles),  # Horizontal layout
-                                             handler_map=handler_map)
-                            legend.get_frame().set_facecolor('white')
-                            legend.get_frame().set_alpha(0.95)
-                            legend.get_title().set_fontsize(9)
-                            legend_created = True
-                            print(f"[DEBUG] Added legend with {len(legend_handles)} entries")
+                        annot_matrix[i, j] = z_str
+                
+                # Create heatmap using seaborn for better aesthetics
+                # Use a diverging colormap centered at 0 (red-white-blue)
+                # Seaborn accepts matplotlib colormap names as strings
+                cmap = 'RdBu_r'
+                
+                # Create the heatmap
+                sns.heatmap(df, 
+                           annot=annot_matrix, 
+                           fmt='', 
+                           cmap=cmap,
+                           center=0,
+                           vmin=vmin, 
+                           vmax=vmax,
+                           square=True,
+                           linewidths=0.5,
+                           cbar_kws={'label': 'Z-Score', 'shrink': 0.8},
+                           ax=ax,
+                           annot_kws={'size': 8, 'weight': 'bold', 'color': 'black'},
+                           xticklabels=True,
+                           yticklabels=True)
+                
+                # Rotate labels for better readability
+                ax.set_xticklabels(ax.get_xticklabels(), rotation=45, ha='right')
+                ax.set_yticklabels(ax.get_yticklabels(), rotation=0)
+                
+                # Set labels
+                ax.set_xlabel("Neighbor Cluster", fontsize=11, fontweight='bold')
+                ax.set_ylabel("Cell Cluster", fontsize=11, fontweight='bold')
+                ax.set_title("Neighborhood Enrichment Analysis", fontsize=13, fontweight='bold', pad=15)
+                
+                # Add legend for significance markers if we have multi-ROI data
+                if significant_counts is not None and np.max(significant_counts) > 1:
+                    max_count = np.max(significant_counts)
+                    legend_text = "Significance: * = significant (|z| > 2.0)"
+                    if max_count > 1:
+                        legend_text += f"\nMultiple * = significant in {max_count} images"
+                    ax.text(0.02, 0.98, legend_text, 
+                           transform=ax.transAxes, 
+                           fontsize=9,
+                           verticalalignment='top',
+                           bbox=dict(boxstyle='round', facecolor='wheat', alpha=0.8))
+                
+                print(f"[DEBUG] Plot completed successfully")
                 
             except Exception as e:
                 print(f"[DEBUG] Error during plotting: {e}")
                 import traceback
                 traceback.print_exc()
                 raise
-            
-            # Add labels if available
-            if hasattr(adata, 'obs') and cluster_key in adata.obs.columns:
-                if hasattr(adata.obs[cluster_key], 'cat'):
-                    categories = list(adata.obs[cluster_key].cat.categories)
-                else:
-                    categories = sorted(adata.obs[cluster_key].unique())
-                
-                print(f"[DEBUG] Found {len(categories)} categories: {categories[:5]}...")
-                n_cats = len(categories)
-                if matrix.shape[0] == n_cats and matrix.shape[1] == n_cats:
-                    ax.set_xticks(np.arange(n_cats))
-                    ax.set_yticks(np.arange(n_cats))
-                    ax.set_xticklabels([self._get_cluster_display_name(c) for c in categories], rotation=45, ha='right')
-                    ax.set_yticklabels([self._get_cluster_display_name(c) for c in categories])
-                    print(f"[DEBUG] Added cluster labels")
-                else:
-                    print(f"[DEBUG] Shape mismatch: matrix {matrix.shape} vs {n_cats} categories")
-                    # Still plot, but without labels
-                    ax.set_xticks(np.arange(min(matrix.shape[1], 10)))
-                    ax.set_yticks(np.arange(min(matrix.shape[0], 10)))
-            else:
-                print(f"[DEBUG] No cluster labels available (obs exists: {hasattr(adata, 'obs')}, cluster_key: {cluster_key})")
-                # Plot without labels
-                ax.set_xticks(np.arange(min(matrix.shape[1], 10)))
-                ax.set_yticks(np.arange(min(matrix.shape[0], 10)))
-            
-            # Set title with padding to avoid overlap with legend
-            has_legend_at_title = ax.get_legend() is not None
-            ax.set_title("Neighborhood Enrichment", pad=25 if has_legend_at_title else 10)
-            ax.set_xlabel("Neighbor Cluster")
-            ax.set_ylabel("Cell Cluster")
-            print(f"[DEBUG] Plot completed successfully")
         else:
             # Debug: show what we got
             print(f"[DEBUG] Failed to extract matrix for plotting")
@@ -1707,25 +1616,9 @@ class AdvancedSpatialAnalysisDialog(QtWidgets.QDialog):
         
         try:
             print(f"[DEBUG] Applying layout adjustments...")
-            # Check if legend exists on the axis
-            has_legend = ax.get_legend() is not None
-            
-            # Adjust subplot parameters to center the plot and make room for legend/colorbar
-            # Legend is now on top, so adjust top margin accordingly
-            if has_legend:
-                top_margin = 0.85  # Less space on top to make room for legend above title
-            else:
-                top_margin = 0.95   # Normal top margin without legend
-            
-            self.sq_nhood_canvas.figure.subplots_adjust(
-                left=0.10,           # Left margin
-                right=0.88,          # Right margin (for colorbar)
-                top=top_margin,      # Top margin (adjusted for legend on top)
-                bottom=0.10,         # Bottom margin
-                wspace=0.1,          # Width space between subplots
-                hspace=0.1           # Height space between subplots
-            )
-            print(f"[DEBUG] subplots_adjust completed")
+            # Adjust layout for better spacing
+            self.sq_nhood_canvas.figure.tight_layout()
+            print(f"[DEBUG] tight_layout completed")
             print(f"[DEBUG] Drawing canvas...")
             self.sq_nhood_canvas.draw()
             print(f"[DEBUG] Canvas draw completed")
@@ -1734,8 +1627,6 @@ class AdvancedSpatialAnalysisDialog(QtWidgets.QDialog):
             self.sq_nhood_canvas.update()
             self.sq_nhood_canvas.repaint()
             print(f"[DEBUG] Canvas update and repaint completed")
-            print(f"[DEBUG] Canvas size: {self.sq_nhood_canvas.size()}")
-            print(f"[DEBUG] Figure size: {self.sq_nhood_canvas.figure.get_size_inches()}")
         except Exception as e:
             print(f"[DEBUG] Error during canvas update: {e}")
             import traceback
@@ -1989,25 +1880,47 @@ class AdvancedSpatialAnalysisDialog(QtWidgets.QDialog):
                 if occ_array.ndim == 3:
                     # Extract 2D slice at the selected distance
                     heatmap_data = occ_array[:, :, distance_idx]
+                    self.sq_cooccur_canvas.figure.clear()
                     ax = self.sq_cooccur_canvas.figure.add_subplot(111)
                     
-                    # Create heatmap
-                    im = ax.imshow(heatmap_data, cmap='viridis', aspect='auto', interpolation='nearest')
+                    # Create DataFrame for better visualization
+                    if len(categories) == heatmap_data.shape[0] == heatmap_data.shape[1]:
+                        cluster_labels = [self._get_cluster_display_name(c) for c in categories]
+                        df = pd.DataFrame(heatmap_data, index=cluster_labels, columns=cluster_labels)
+                    else:
+                        df = pd.DataFrame(heatmap_data)
                     
-                    # Set labels
-                    if len(categories) == heatmap_data.shape[0] and len(categories) == heatmap_data.shape[1]:
-                        ax.set_xticks(np.arange(len(categories)))
-                        ax.set_yticks(np.arange(len(categories)))
-                        ax.set_xticklabels([self._get_cluster_display_name(c) for c in categories], rotation=45, ha='right')
-                        ax.set_yticklabels([self._get_cluster_display_name(c) for c in categories])
+                    # Create annotation matrix with values
+                    annot_matrix = np.empty(heatmap_data.shape, dtype=object)
+                    for i in range(heatmap_data.shape[0]):
+                        for j in range(heatmap_data.shape[1]):
+                            val = heatmap_data[i, j]
+                            # Format to 3 decimal places for co-occurrence scores
+                            annot_matrix[i, j] = f"{val:.3f}"
                     
-                    ax.set_xlabel('To Phenotype')
-                    ax.set_ylabel('From Phenotype')
-                    ax.set_title(f'Co-occurrence Heatmap at {selected_distance} µm')
+                    # Use seaborn heatmap with better colormap
+                    # Use a sequential colormap that works well for co-occurrence (probability-like values)
+                    sns.heatmap(df,
+                               annot=annot_matrix,
+                               fmt='',
+                               cmap='YlOrRd',  # Yellow-Orange-Red colormap for co-occurrence
+                               square=True,
+                               linewidths=0.5,
+                               cbar_kws={'label': 'Co-occurrence Score', 'shrink': 0.8},
+                               ax=ax,
+                               annot_kws={'size': 8, 'weight': 'normal', 'color': 'black'},
+                               xticklabels=True,
+                               yticklabels=True)
                     
-                    # Add colorbar
-                    cbar = self.sq_cooccur_canvas.figure.colorbar(im, ax=ax)
-                    cbar.set_label('Co-occurrence Score')
+                    # Rotate labels for better readability
+                    ax.set_xticklabels(ax.get_xticklabels(), rotation=45, ha='right')
+                    ax.set_yticklabels(ax.get_yticklabels(), rotation=0)
+                    
+                    # Set labels with better formatting
+                    ax.set_xlabel('To Phenotype', fontsize=11, fontweight='bold')
+                    ax.set_ylabel('From Phenotype', fontsize=11, fontweight='bold')
+                    ax.set_title(f'Co-occurrence Analysis at {selected_distance} µm', 
+                               fontsize=13, fontweight='bold', pad=15)
                     
                     self.sq_cooccur_canvas.figure.tight_layout()
                     self.sq_cooccur_canvas.draw()
@@ -2152,8 +2065,15 @@ class AdvancedSpatialAnalysisDialog(QtWidgets.QDialog):
             else:
                 df = pd.DataFrame(cluster_data, columns=categories_list)
             
+            # Create mapping from cluster IDs to display names for legend
+            cluster_display_map = {cat: self._get_cluster_display_name(cat) for cat in categories_list}
+            
+            # Create DataFrame with display names for columns (for legend)
+            df_display = df.copy()
+            df_display.columns = [cluster_display_map.get(col, str(col)) for col in df_display.columns]
+            
             # Melt to long format like squidpy
-            df_melted = df.melt(var_name=cluster_key, value_name="probability")
+            df_melted = df_display.melt(var_name=cluster_key, value_name="probability")
             df_melted["distance"] = np.tile(interval, len(categories_list))
             
             # Use seaborn lineplot like squidpy
@@ -2163,13 +2083,16 @@ class AdvancedSpatialAnalysisDialog(QtWidgets.QDialog):
                 # Convert dict to list in the order of categories_list
                 plot_palette = [palette.get(cat, '#000000') for cat in categories_list]
             
+            # Use display names for hue_order
+            hue_order_display = [cluster_display_map.get(cat, str(cat)) for cat in categories_list]
+            
             sns.lineplot(
                 x="distance",
                 y="probability",
                 data=df_melted,
                 dashes=False,
                 hue=cluster_key,
-                hue_order=categories_list,
+                hue_order=hue_order_display,
                 palette=plot_palette,
                 ax=ax,
                 legend='full',  # Ensure all entries are shown
@@ -2191,15 +2114,16 @@ class AdvancedSpatialAnalysisDialog(QtWidgets.QDialog):
                     unique_handles.append(h)
                     unique_labels.append(l)
             
-            # Recreate legend with all unique entries
+            # Recreate legend with all unique entries (labels already have display names)
             if unique_handles:
                 ax.legend(unique_handles, unique_labels, **legend_kwargs)
             else:
                 # If no handles, create default legend
                 ax.legend(**legend_kwargs)
             
-            # Set title like squidpy (LaTeX format)
-            ax.set_title(rf"$\frac{{p(exp|{g})}}{{p(exp)}}$")
+            # Set title like squidpy (LaTeX format) with display name
+            g_display = cluster_display_map.get(g, str(g))
+            ax.set_title(rf"$\frac{{p(exp|{g_display})}}{{p(exp)}}$")
             ax.set_ylabel("value")
         
         self.sq_cooccur_canvas.figure.tight_layout()
@@ -2692,19 +2616,32 @@ class AdvancedSpatialAnalysisDialog(QtWidgets.QDialog):
         
         stat_df = res[stat_key]
         
+        # Create mapping from cluster IDs to display names
+        cluster_display_map = {cat: self._get_cluster_display_name(cat) for cat in categories_list}
+        
+        # Create a copy of stat_df with display names for the hue column
+        stat_df_display = stat_df.copy()
+        if cluster_key in stat_df_display.columns:
+            stat_df_display[cluster_key] = stat_df_display[cluster_key].map(
+                lambda x: cluster_display_map.get(x, str(x))
+            )
+        
         # Convert palette dict to list if needed (seaborn can handle both)
         plot_palette = palette
         if isinstance(palette, dict):
             # Convert dict to list in the order of categories_list
             plot_palette = [palette.get(cat, '#000000') for cat in categories_list]
         
+        # Use display names for hue_order
+        hue_order_display = [cluster_display_map.get(cat, str(cat)) for cat in categories_list]
+        
         # Use seaborn lineplot like squidpy does
         sns.lineplot(
             y="stats",
             x="bins",
             hue=cluster_key,
-            data=stat_df,
-            hue_order=categories_list,
+            data=stat_df_display,
+            hue_order=hue_order_display,
             palette=plot_palette,
             ax=ax,
         )
@@ -2721,7 +2658,7 @@ class AdvancedSpatialAnalysisDialog(QtWidgets.QDialog):
                 ax=ax
             )
         
-        # Set legend like squidpy
+        # Set legend like squidpy (labels already have display names from stat_df_display)
         legend_kwargs = {"loc": "center left", "bbox_to_anchor": (1, 0.5)}
         ax.legend(**legend_kwargs)
         

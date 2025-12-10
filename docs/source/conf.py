@@ -33,6 +33,8 @@ autodoc_mock_imports = [
     "readimc",
     "tifffile",
     "numpy_groupies",
+    "yaml",
+    "anndata",
 ]
 
 templates_path = ["_templates"]
@@ -40,5 +42,7 @@ exclude_patterns = []
 
 # -- Options for HTML output -------------------------------------------------
 
-html_theme = "sphinx_rtd_theme"
+# Use a compatible theme - sphinx_rtd_theme needs to be updated for Sphinx 9+
+# Using 'alabaster' as default fallback, or install sphinx_rtd_theme>=2.0.0
+html_theme = "alabaster"
 html_static_path = ["_static"]
