@@ -235,6 +235,8 @@ class CellClusteringDialog(QtWidgets.QDialog):
         self.legend_ncols = 1  # Number of columns for legend layout
         self.legend_fontsize = 8  # Font size for legend text
         self.cluster_map_orientation = 'portrait'  # 'portrait' or 'landscape' for Cluster Map
+        self.cluster_map_dendrogram = 'Columns only'  # 'Both rows and columns', 'Rows only', 'Columns only', 'No dendrogram'
+        self.cluster_map_zscore_method = 'Mean'  # 'Mean', 'Median', 'Max', 'Min' for cluster aggregation
         self.gating_rules = []  # list of dict: {name, logic, conditions: [{column, op, threshold}]}
         self.llm_phenotype_cache = {}  # Cache for LLM phenotype suggestions
         self.seed = 42  # Default seed for reproducibility
@@ -2519,12 +2521,22 @@ class CellClusteringDialog(QtWidgets.QDialog):
             feature_cols = self._select_feature_columns(data_to_plot)
             print(f"[DEBUG PLOT] Selected {len(feature_cols)} feature columns")
             
-            # Aggregate data per cluster (mean)
-            cluster_means = data_to_plot.groupby('cluster')[feature_cols].mean()
-            print(f"[DEBUG PLOT] Cluster means shape: {cluster_means.shape}")
+            # Aggregate data per cluster using selected method
+            zscore_method = getattr(self, 'cluster_map_zscore_method', 'Mean')
+            if zscore_method == 'Mean':
+                cluster_aggregated = data_to_plot.groupby('cluster')[feature_cols].mean()
+            elif zscore_method == 'Median':
+                cluster_aggregated = data_to_plot.groupby('cluster')[feature_cols].median()
+            elif zscore_method == 'Max':
+                cluster_aggregated = data_to_plot.groupby('cluster')[feature_cols].max()
+            elif zscore_method == 'Min':
+                cluster_aggregated = data_to_plot.groupby('cluster')[feature_cols].min()
+            else:
+                cluster_aggregated = data_to_plot.groupby('cluster')[feature_cols].mean()  # Default to mean
+            print(f"[DEBUG PLOT] Cluster aggregated ({zscore_method}) shape: {cluster_aggregated.shape}")
             
             # Apply scaling to aggregated data
-            feature_data_scaled = self._apply_scaling(cluster_means, scaling_method)
+            feature_data_scaled = self._apply_scaling(cluster_aggregated, scaling_method)
             feature_data_scaled = feature_data_scaled.fillna(0)  # Handle any NaN from scaling
             print(f"[DEBUG PLOT] Scaled cluster means shape: {feature_data_scaled.shape}")
             
@@ -2532,7 +2544,7 @@ class CellClusteringDialog(QtWidgets.QDialog):
             scaled_feature_cols = list(feature_data_scaled.columns)
             
             # Create the cluster map visualization
-            self._create_cluster_map_visualization(feature_data_scaled, scaled_feature_cols, cluster_means.index)
+            self._create_cluster_map_visualization(feature_data_scaled, scaled_feature_cols, cluster_aggregated.index)
             return
             
         except Exception as e:
@@ -2549,6 +2561,11 @@ class CellClusteringDialog(QtWidgets.QDialog):
         orientation = getattr(self, 'cluster_map_orientation', 'portrait')
         is_landscape = (orientation == 'landscape')
         
+        # Get dendrogram setting
+        dendrogram_setting = getattr(self, 'cluster_map_dendrogram', 'Columns only')
+        show_row_dendro = dendrogram_setting in ['Both rows and columns', 'Rows only']
+        show_col_dendro = dendrogram_setting in ['Both rows and columns', 'Columns only']
+        
         # Prepare heatmap data (clusters as rows, features as columns)
         heatmap_data = cluster_data_scaled.values
         
@@ -2560,25 +2577,29 @@ class CellClusteringDialog(QtWidgets.QDialog):
         elif not np.issubdtype(heatmap_data.dtype, np.number):
             heatmap_data = heatmap_data.astype(float)
         
-        # Apply hierarchical clustering for feature ordering (optional, but helpful)
+        # Hierarchical clustering for features (rows) - always compute for ordering, but only show if requested
         from scipy.cluster.hierarchy import linkage, leaves_list
+        feature_linkage = None
         try:
-            row_linkage = linkage(heatmap_data.T, method='ward', metric='euclidean')
-            feature_indices = leaves_list(row_linkage)
+            feature_linkage = linkage(heatmap_data.T, method='ward', metric='euclidean')
+            feature_indices = leaves_list(feature_linkage)
             feature_cols_ordered = [feature_cols[i] for i in feature_indices]
             heatmap_data_ordered = heatmap_data[:, feature_indices]
         except Exception:
             # If clustering fails, use original order
             feature_cols_ordered = feature_cols
             heatmap_data_ordered = heatmap_data
+            feature_linkage = None
         
-        # Hierarchical clustering for clusters (to create dendrogram)
+        # Hierarchical clustering for clusters (columns) - only compute if needed
         cluster_ids_list = list(cluster_ids) if hasattr(cluster_ids, '__iter__') and not isinstance(cluster_ids, str) else [cluster_ids]
         n_clusters_total = len(cluster_ids_list)
         
-        # Cluster the clusters based on their mean expression profiles
         cluster_linkage = None
-        if n_clusters_total > 1:
+        cluster_order = cluster_ids_list
+        cluster_order_idx = list(range(len(cluster_ids_list)))
+        
+        if show_col_dendro and n_clusters_total > 1:
             try:
                 # Use ward linkage for cluster clustering
                 cluster_linkage = linkage(heatmap_data_ordered, method='ward', metric='euclidean')
@@ -2590,11 +2611,10 @@ class CellClusteringDialog(QtWidgets.QDialog):
                 cluster_order = sorted(cluster_ids_list)
                 cluster_order_idx = [cluster_ids_list.index(cid) for cid in cluster_order]
                 cluster_linkage = None
-        else:
-            # Single cluster - no dendrogram needed
-            cluster_order = cluster_ids_list
-            cluster_order_idx = [0] if cluster_ids_list else []
-            cluster_linkage = None
+        elif n_clusters_total > 1:
+            # No column dendrogram, but still order clusters
+            cluster_order = sorted(cluster_ids_list)
+            cluster_order_idx = [cluster_ids_list.index(cid) for cid in cluster_order]
         
         heatmap_data_final = heatmap_data_ordered[cluster_order_idx, :]
         
@@ -2602,58 +2622,65 @@ class CellClusteringDialog(QtWidgets.QDialog):
         if is_landscape:
             heatmap_data_final = heatmap_data_final.T
         
-        # Create layout - adjust based on orientation and dendrogram
-        has_dendro = (cluster_linkage is not None)
-        
+        # Create layout - adjust based on orientation and dendrogram settings
+        # Determine grid layout based on dendrogram options
         if is_landscape:
-            if has_dendro:
-                # Landscape: dendrogram on top, heatmap below, colorbar on right
+            # Landscape orientation: clusters on x-axis, features on y-axis
+            if show_row_dendro and show_col_dendro:
+                # Both dendrograms: row dendrogram on left, column dendrogram on top
+                gs = self.figure.add_gridspec(
+                    nrows=2, ncols=3,
+                    height_ratios=[0.15, 0.85],  # Column dendrogram, heatmap
+                    width_ratios=[0.15, 0.82, 0.03],  # Row dendrogram, heatmap area, colorbar
+                    hspace=0.02, wspace=0.02,
+                    left=0.05, right=0.98, top=0.95, bottom=0.12
+                )
+                row_dendro_row = 1
+                row_dendro_col = 0
+                col_dendro_row = 0
+                col_dendro_col = 1
+                heatmap_row = 1
+                heatmap_col = 1
+                cbar_row = 1
+                cbar_col = 2
+            elif show_col_dendro:
+                # Column dendrogram only: on top
                 gs = self.figure.add_gridspec(
                     nrows=2, ncols=2,
-                    height_ratios=[0.15, 0.85],  # Dendrogram, heatmap
-                    width_ratios=[0.97, 0.03],  # Heatmap area, colorbar (narrower)
+                    height_ratios=[0.15, 0.85],  # Column dendrogram, heatmap
+                    width_ratios=[0.97, 0.03],  # Heatmap area, colorbar
                     hspace=0.02, wspace=0.02,
                     left=0.12, right=0.98, top=0.95, bottom=0.12
                 )
-                dendro_row = 0
-                dendro_col = 0
+                col_dendro_row = 0
+                col_dendro_col = 0
                 heatmap_row = 1
                 heatmap_col = 0
                 cbar_row = 1
                 cbar_col = 1
-            else:
-                # Landscape: no dendrogram, heatmap and colorbar side by side
-                gs = self.figure.add_gridspec(
-                    nrows=1, ncols=2,
-                    width_ratios=[0.97, 0.03],  # Heatmap area, colorbar (narrower)
-                    wspace=0.02,
-                    left=0.12, right=0.98, top=0.95, bottom=0.12
-                )
-                heatmap_row = 0
-                heatmap_col = 0
-                cbar_row = 0
-                cbar_col = 1
-        else:
-            if has_dendro:
-                # Portrait: dendrogram on left, heatmap on right, colorbar on far right
-                # Move dendrogram further left to avoid overlapping with cluster names
+                row_dendro_row = None
+                row_dendro_col = None
+            elif show_row_dendro:
+                # Row dendrogram only: on left
                 gs = self.figure.add_gridspec(
                     nrows=1, ncols=3,
-                    width_ratios=[0.22, 0.75, 0.03],  # Dendrogram (wider), heatmap area, colorbar (narrower)
+                    width_ratios=[0.15, 0.82, 0.03],  # Row dendrogram, heatmap area, colorbar
                     wspace=0.02,
-                    left=0.05, right=0.98, top=0.95, bottom=0.12  # Move left margin further left
+                    left=0.05, right=0.98, top=0.95, bottom=0.12
                 )
-                dendro_row = 0
-                dendro_col = 0
+                row_dendro_row = 0
+                row_dendro_col = 0
                 heatmap_row = 0
                 heatmap_col = 1
                 cbar_row = 0
                 cbar_col = 2
+                col_dendro_row = None
+                col_dendro_col = None
             else:
-                # Portrait: no dendrogram, heatmap and colorbar side by side
+                # No dendrograms
                 gs = self.figure.add_gridspec(
                     nrows=1, ncols=2,
-                    width_ratios=[0.97, 0.03],  # Heatmap area, colorbar (narrower)
+                    width_ratios=[0.97, 0.03],  # Heatmap area, colorbar
                     wspace=0.02,
                     left=0.12, right=0.98, top=0.95, bottom=0.12
                 )
@@ -2661,18 +2688,125 @@ class CellClusteringDialog(QtWidgets.QDialog):
                 heatmap_col = 0
                 cbar_row = 0
                 cbar_col = 1
+                row_dendro_row = None
+                row_dendro_col = None
+                col_dendro_row = None
+                col_dendro_col = None
+        else:
+            # Portrait orientation: features on x-axis, clusters on y-axis
+            if show_row_dendro and show_col_dendro:
+                # Both dendrograms: row dendrogram on left, column dendrogram on top
+                gs = self.figure.add_gridspec(
+                    nrows=2, ncols=3,
+                    height_ratios=[0.15, 0.85],  # Column dendrogram, heatmap
+                    width_ratios=[0.15, 0.82, 0.03],  # Row dendrogram, heatmap area, colorbar
+                    hspace=0.02, wspace=0.02,
+                    left=0.05, right=0.98, top=0.95, bottom=0.12
+                )
+                row_dendro_row = 1
+                row_dendro_col = 0
+                col_dendro_row = 0
+                col_dendro_col = 1
+                heatmap_row = 1
+                heatmap_col = 1
+                cbar_row = 1
+                cbar_col = 2
+            elif show_col_dendro:
+                # Column dendrogram only: on left
+                gs = self.figure.add_gridspec(
+                    nrows=1, ncols=3,
+                    width_ratios=[0.22, 0.75, 0.03],  # Column dendrogram, heatmap area, colorbar
+                    wspace=0.02,
+                    left=0.05, right=0.98, top=0.95, bottom=0.12
+                )
+                col_dendro_row = 0
+                col_dendro_col = 0
+                heatmap_row = 0
+                heatmap_col = 1
+                cbar_row = 0
+                cbar_col = 2
+                row_dendro_row = None
+                row_dendro_col = None
+            elif show_row_dendro:
+                # Row dendrogram only: on top
+                gs = self.figure.add_gridspec(
+                    nrows=2, ncols=2,
+                    height_ratios=[0.15, 0.85],  # Row dendrogram, heatmap
+                    width_ratios=[0.97, 0.03],  # Heatmap area, colorbar
+                    hspace=0.02, wspace=0.02,
+                    left=0.12, right=0.98, top=0.95, bottom=0.12
+                )
+                row_dendro_row = 0
+                row_dendro_col = 0
+                heatmap_row = 1
+                heatmap_col = 0
+                cbar_row = 1
+                cbar_col = 1
+                col_dendro_row = None
+                col_dendro_col = None
+            else:
+                # No dendrograms
+                gs = self.figure.add_gridspec(
+                    nrows=1, ncols=2,
+                    width_ratios=[0.97, 0.03],  # Heatmap area, colorbar
+                    wspace=0.02,
+                    left=0.12, right=0.98, top=0.95, bottom=0.12
+                )
+                heatmap_row = 0
+                heatmap_col = 0
+                cbar_row = 0
+                cbar_col = 1
+                row_dendro_row = None
+                row_dendro_col = None
+                col_dendro_row = None
+                col_dendro_col = None
         
-        # Dendrogram for clusters
-        if cluster_linkage is not None:
-            ax_dendro = self.figure.add_subplot(gs[dendro_row, dendro_col])
-            
-            # Create dendrogram
+        # Row dendrogram (for features)
+        if show_row_dendro and feature_linkage is not None:
+            ax_row_dendro = self.figure.add_subplot(gs[row_dendro_row, row_dendro_col])
+            from scipy.cluster.hierarchy import dendrogram
+            if is_landscape:
+                # Vertical dendrogram on left
+                dendro_data = dendrogram(
+                    feature_linkage,
+                    ax=ax_row_dendro,
+                    orientation='left',
+                    labels=[self._get_feature_display_name(f) for f in feature_cols_ordered],
+                    leaf_rotation=0,
+                    leaf_font_size=8,
+                    no_plot=False,
+                    above_threshold_color='black',
+                    color_threshold=0
+                )
+            else:
+                # Horizontal dendrogram on top
+                dendro_data = dendrogram(
+                    feature_linkage,
+                    ax=ax_row_dendro,
+                    orientation='top',
+                    labels=[self._get_feature_display_name(f) for f in feature_cols_ordered],
+                    leaf_rotation=90,
+                    leaf_font_size=8,
+                    no_plot=False,
+                    above_threshold_color='black',
+                    color_threshold=0
+                )
+            ax_row_dendro.set_xticks([])
+            ax_row_dendro.set_yticks([])
+            ax_row_dendro.spines['top'].set_visible(False)
+            ax_row_dendro.spines['right'].set_visible(False)
+            ax_row_dendro.spines['bottom'].set_visible(False)
+            ax_row_dendro.spines['left'].set_visible(False)
+        
+        # Column dendrogram (for clusters)
+        if show_col_dendro and cluster_linkage is not None:
+            ax_col_dendro = self.figure.add_subplot(gs[col_dendro_row, col_dendro_col])
             from scipy.cluster.hierarchy import dendrogram
             if is_landscape:
                 # Horizontal dendrogram on top
                 dendro_data = dendrogram(
                     cluster_linkage,
-                    ax=ax_dendro,
+                    ax=ax_col_dendro,
                     orientation='top',
                     labels=[self._get_cluster_display_name(cid) for cid in cluster_order],
                     leaf_rotation=90,
@@ -2681,17 +2815,11 @@ class CellClusteringDialog(QtWidgets.QDialog):
                     above_threshold_color='black',
                     color_threshold=0
                 )
-                ax_dendro.set_xticks([])
-                ax_dendro.set_yticks([])
-                ax_dendro.spines['top'].set_visible(False)
-                ax_dendro.spines['right'].set_visible(False)
-                ax_dendro.spines['bottom'].set_visible(False)
-                ax_dendro.spines['left'].set_visible(False)
             else:
                 # Vertical dendrogram on left
                 dendro_data = dendrogram(
                     cluster_linkage,
-                    ax=ax_dendro,
+                    ax=ax_col_dendro,
                     orientation='left',
                     labels=[self._get_cluster_display_name(cid) for cid in cluster_order],
                     leaf_rotation=0,
@@ -2700,12 +2828,12 @@ class CellClusteringDialog(QtWidgets.QDialog):
                     above_threshold_color='black',
                     color_threshold=0
                 )
-                ax_dendro.set_xticks([])
-                ax_dendro.set_yticks([])
-                ax_dendro.spines['top'].set_visible(False)
-                ax_dendro.spines['right'].set_visible(False)
-                ax_dendro.spines['bottom'].set_visible(False)
-                ax_dendro.spines['left'].set_visible(False)
+            ax_col_dendro.set_xticks([])
+            ax_col_dendro.set_yticks([])
+            ax_col_dendro.spines['top'].set_visible(False)
+            ax_col_dendro.spines['right'].set_visible(False)
+            ax_col_dendro.spines['bottom'].set_visible(False)
+            ax_col_dendro.spines['left'].set_visible(False)
         
         # Main heatmap
         ax_heatmap = self.figure.add_subplot(gs[heatmap_row, heatmap_col])
@@ -6109,7 +6237,15 @@ class CellClusteringDialog(QtWidgets.QDialog):
         dlg = QtWidgets.QDialog(self)
         dlg.setWindowTitle("Annotate Phenotypes")
         v = QtWidgets.QVBoxLayout(dlg)
-        form = QtWidgets.QFormLayout()
+        
+        # Create scrollable area for the form
+        scroll_area = QtWidgets.QScrollArea()
+        scroll_area.setWidgetResizable(True)
+        scroll_area.setFrameShape(QtWidgets.QFrame.NoFrame)
+        
+        # Create widget to hold the form
+        form_widget = QtWidgets.QWidget()
+        form = QtWidgets.QFormLayout(form_widget)
         editors = {}
         for cid in unique_clusters:
             le = QtWidgets.QLineEdit()
@@ -6117,7 +6253,27 @@ class CellClusteringDialog(QtWidgets.QDialog):
                 le.setText(self.cluster_annotation_map[cid])
             form.addRow(f"Cluster {cid}", le)
             editors[cid] = le
-        v.addLayout(form)
+        
+        scroll_area.setWidget(form_widget)
+        
+        # Set max height to 90% of main window height
+        try:
+            # Use the parent dialog (CellClusteringDialog) height, or fall back to screen height
+            if hasattr(self, 'height') and self.height() > 0:
+                max_height = int(self.height() * 0.9)
+            else:
+                # Fallback to screen height
+                screen = QtWidgets.QApplication.primaryScreen()
+                if screen:
+                    max_height = int(screen.availableGeometry().height() * 0.9)
+                else:
+                    max_height = 800
+            scroll_area.setMaximumHeight(max_height)
+        except Exception:
+            scroll_area.setMaximumHeight(800)  # Fallback
+        
+        v.addWidget(scroll_area)
+        
         # (Load/Save removed)
         # LLM assist row
         llm_row = QtWidgets.QHBoxLayout()
@@ -6646,24 +6802,22 @@ class CellClusteringDialog(QtWidgets.QDialog):
             return
         
         try:
-            # Start with the original feature dataframe (all features)
-            output_df = self.feature_dataframe.copy()
+            # Start with only the rows that were included in clustering
+            # This ensures that if filters were applied (touches_edge, area, percentile, etc.),
+            # only the filtered rows are included in the output
+            output_df = self.feature_dataframe.loc[self.clustered_data.index].copy()
             
-            # Add cluster labels
+            # Add cluster labels (indices already match, so direct assignment)
             if self.clustered_data is not None and 'cluster' in self.clustered_data.columns:
-                # Align cluster data with feature dataframe by index
-                cluster_series = self.clustered_data['cluster'].reindex(output_df.index)
-                output_df['cluster'] = cluster_series
+                output_df['cluster'] = self.clustered_data['cluster'].values
             
             # Add cluster phenotype annotations if available
             if self.clustered_data is not None and 'cluster_phenotype' in self.clustered_data.columns:
-                phenotype_series = self.clustered_data['cluster_phenotype'].reindex(output_df.index)
-                output_df['cluster_phenotype'] = phenotype_series
+                output_df['cluster_phenotype'] = self.clustered_data['cluster_phenotype'].values
             
             # Add manual phenotype annotations if available
             if self.clustered_data is not None and 'manual_phenotype' in self.clustered_data.columns:
-                manual_series = self.clustered_data['manual_phenotype'].reindex(output_df.index)
-                output_df['manual_phenotype'] = manual_series
+                output_df['manual_phenotype'] = self.clustered_data['manual_phenotype'].values
             
             # Save to CSV
             output_df.to_csv(file_path, index=True)
@@ -8225,11 +8379,11 @@ class PhenotypeSuggestionDialog(QtWidgets.QDialog):
         form.addRow("Cohort/tissue context:", self.context_edit)
 
         self.model_combo = QtWidgets.QComboBox()
-        self.model_combo.addItems(["gpt-5", "gpt-5-mini", "gpt-5-nano", "gpt-4.1", "gpt-5.1"])
-        self.model_combo.setCurrentText("gpt-5.1")  # Set gpt-5.1 as default
+        self.model_combo.addItems(["gpt-5", "gpt-5-mini", "gpt-5-nano", "gpt-4.1", "gpt-5.2"])
+        self.model_combo.setCurrentText("gpt-5.2")  # Set gpt-5.2 as default
         form.addRow("Model:", self.model_combo)
 
-        # Reasoning level dropdown (only visible for gpt-5.1)
+        # Reasoning level dropdown (only visible for gpt-5.2)
         self.reasoning_combo = QtWidgets.QComboBox()
         self.reasoning_combo.addItems(["none", "low", "medium", "high"])
         self.reasoning_combo.setCurrentText("none")  # Set none as default
@@ -8297,7 +8451,7 @@ class PhenotypeSuggestionDialog(QtWidgets.QDialog):
         # Update reasoning level visibility when model changes
         def _update_reasoning_visibility():
             model = self.model_combo.currentText()
-            if model == "gpt-5.1":
+            if model == "gpt-5.2":
                 self._reasoning_container.show()
             else:
                 self._reasoning_container.hide()
@@ -8346,10 +8500,52 @@ class PhenotypeSuggestionDialog(QtWidgets.QDialog):
         self._suggestions = {}  # cluster_id -> parsed json
 
     def closeEvent(self, event):
-        """Handle dialog closing to preserve cache."""
+        """Handle dialog closing to preserve cache and apply suggestions."""
         # Ensure the current suggestions are cached for future use
         if self._cache_dict is not None and self._suggestions:
             self._cache_dict.update(self._suggestions)
+        
+        # Automatically apply suggestions when closing if they exist
+        # This ensures annotations persist even if user doesn't click "Apply Names"
+        if self._suggestions:
+            display_name_map = {}
+            backend_name_map = {}
+            # Prefer user-selected guess when available, otherwise use first suggestion
+            for cid, obj in self._suggestions.items():
+                # Ensure cid is an integer for consistent handling
+                cid_int = int(cid)
+                try:
+                    selected_idx = None
+                    grp = self._cluster_choice_groups.get(cid_int)
+                    if grp is not None:
+                        id_ = grp.checkedId()
+                        if id_ != -1:
+                            selected_idx = id_
+                    guesses = obj.get('phenotype_guesses') or []
+                    chosen = None
+                    if selected_idx is not None and 0 <= selected_idx < len(guesses):
+                        chosen = guesses[selected_idx]
+                    elif guesses:
+                        chosen = guesses[0]
+                    if chosen:
+                        name = str(chosen.get('name', '')).strip()
+                        if name:
+                            # Store human-readable name for display
+                            display_name_map[cid_int] = name
+                            
+                            # Create normalized name for backend CSV
+                            norm = name.replace(' ', '_')
+                            if norm.lower() == 't_cell':
+                                norm = 'T_cell'
+                            if 'macrophage' in norm.lower():
+                                norm = 'Myeloid_Macrophage'
+                            backend_name_map[cid_int] = norm
+                except Exception:
+                    continue
+            if display_name_map:
+                # Apply suggestions silently (no message box) when closing
+                self._apply_callback(display_name_map, backend_name_map)
+        
         event.accept()
 
     def _reset_progress_bar(self):
@@ -8553,6 +8749,15 @@ class PhenotypeSuggestionDialog(QtWidgets.QDialog):
         return cols
 
     def _base_marker_name(self, feature_name: str) -> str:
+        # First check if there's a custom feature label from the parent dialog
+        if self._parent_dialog and hasattr(self._parent_dialog, 'feature_label_map'):
+            if feature_name in self._parent_dialog.feature_label_map:
+                custom_label = self._parent_dialog.feature_label_map[feature_name]
+                # Strip trailing suffix from custom label if it exists
+                if '_' in custom_label:
+                    return custom_label.rsplit('_', 1)[0]
+                return custom_label
+        
         # Strip trailing suffix like _mean/_median/etc.
         if '_' in feature_name:
             return feature_name.rsplit('_', 1)[0]
@@ -8861,8 +9066,8 @@ class PhenotypeSuggestionDialog(QtWidgets.QDialog):
                 'max_output_tokens': data.get('max_tokens', 2000),
                 'input': input_payload
             }
-            # Only add reasoning parameter for gpt-5.1
-            if model_name == 'gpt-5.1':
+            # Only add reasoning parameter for gpt-5.2
+            if model_name == 'gpt-5.2':
                 reasoning_level = self.reasoning_combo.currentText()
                 if reasoning_level != 'none':
                     create_kwargs['reasoning'] = {'effort': reasoning_level}

@@ -68,6 +68,12 @@ class PlotConfigDialog(QtWidgets.QDialog):
         content_layout.setContentsMargins(5, 5, 5, 5)
         content_layout.setSpacing(8)
         
+        # Feature label customization button (available for all views) - moved to top
+        self.feature_labels_btn = QtWidgets.QPushButton("Customize Feature Labels...")
+        self.feature_labels_btn.setToolTip("Set custom display names for features in visualizations (e.g., 'Vimentin_mean' -> 'Mean Vimentin')")
+        self.feature_labels_btn.clicked.connect(self._open_feature_labels_dialog)
+        content_layout.addWidget(self.feature_labels_btn)
+        
         # Color-by control (UMAP/t-SNE only) - multi-select for faceted plotting
         # NOT shown for Heatmap (uses patient annotation bar instead)
         self.color_by_group = QtWidgets.QGroupBox("Color By (UMAP/t-SNE)")
@@ -277,6 +283,30 @@ class PlotConfigDialog(QtWidgets.QDialog):
         orientation_layout.addStretch()
         heatmap_layout.addLayout(orientation_layout)
         
+        # Dendrogram control (for Cluster Map only)
+        dendrogram_layout = QtWidgets.QHBoxLayout()
+        self.dendrogram_label = QtWidgets.QLabel("Dendrogram:")
+        dendrogram_layout.addWidget(self.dendrogram_label)
+        self.dendrogram_combo = QtWidgets.QComboBox()
+        self.dendrogram_combo.addItems(["Both rows and columns", "Rows only", "Columns only", "No dendrogram"])
+        self.dendrogram_combo.setCurrentText("Columns only")
+        self.dendrogram_combo.setToolTip("Show dendrogram for rows (features), columns (clusters), both, or none")
+        dendrogram_layout.addWidget(self.dendrogram_combo)
+        dendrogram_layout.addStretch()
+        heatmap_layout.addLayout(dendrogram_layout)
+        
+        # Z-score computation method (for Cluster Map only)
+        zscore_method_layout = QtWidgets.QHBoxLayout()
+        self.zscore_method_label = QtWidgets.QLabel("Cluster aggregation:")
+        zscore_method_layout.addWidget(self.zscore_method_label)
+        self.zscore_method_combo = QtWidgets.QComboBox()
+        self.zscore_method_combo.addItems(["Mean", "Median", "Max", "Min"])
+        self.zscore_method_combo.setCurrentText("Mean")
+        self.zscore_method_combo.setToolTip("How to compute each cluster's displayed value: mean, median, max, or min of individual cells")
+        zscore_method_layout.addWidget(self.zscore_method_combo)
+        zscore_method_layout.addStretch()
+        heatmap_layout.addLayout(zscore_method_layout)
+        
         self.heatmap_group.setLayout(heatmap_layout)
         content_layout.addWidget(self.heatmap_group)
 
@@ -367,12 +397,6 @@ class PlotConfigDialog(QtWidgets.QDialog):
         
         self.feature_selection_group.setLayout(feature_selection_layout)
         content_layout.addWidget(self.feature_selection_group)
-        
-        # Feature label customization button (available for all views)
-        self.feature_labels_btn = QtWidgets.QPushButton("Customize Feature Labels...")
-        self.feature_labels_btn.setToolTip("Set custom display names for features in visualizations (e.g., 'Vimentin_mean' -> 'Mean Vimentin')")
-        self.feature_labels_btn.clicked.connect(self._open_feature_labels_dialog)
-        content_layout.addWidget(self.feature_labels_btn)
 
         # Differential Expression settings
         self.de_group = QtWidgets.QGroupBox("Differential Expression Settings")
@@ -495,6 +519,18 @@ class PlotConfigDialog(QtWidgets.QDialog):
             self.orientation_label.setVisible(view == 'Cluster Map')
         if hasattr(self, 'orientation_combo'):
             self.orientation_combo.setVisible(view == 'Cluster Map')
+        
+        # Dendrogram control: Only for Cluster Map
+        if hasattr(self, 'dendrogram_label'):
+            self.dendrogram_label.setVisible(view == 'Cluster Map')
+        if hasattr(self, 'dendrogram_combo'):
+            self.dendrogram_combo.setVisible(view == 'Cluster Map')
+        
+        # Z-score computation method: Only for Cluster Map
+        if hasattr(self, 'zscore_method_label'):
+            self.zscore_method_label.setVisible(view == 'Cluster Map')
+        if hasattr(self, 'zscore_method_combo'):
+            self.zscore_method_combo.setVisible(view == 'Cluster Map')
         
         # Heatmap source: Only for Heatmap (not Cluster Map)
         if hasattr(self, 'heatmap_source_label'):
@@ -661,6 +697,22 @@ class PlotConfigDialog(QtWidgets.QDialog):
             orientation_text = "Portrait (Clusters on Y-axis)" if self.parent_dialog.cluster_map_orientation == 'portrait' else "Landscape (Clusters on X-axis)"
             if hasattr(self, 'orientation_combo'):
                 self.orientation_combo.setCurrentText(orientation_text)
+        
+        # Cluster Map dendrogram setting
+        if hasattr(self.parent_dialog, 'cluster_map_dendrogram'):
+            dendrogram_text = self.parent_dialog.cluster_map_dendrogram
+            if hasattr(self, 'dendrogram_combo'):
+                self.dendrogram_combo.setCurrentText(dendrogram_text)
+        elif hasattr(self, 'dendrogram_combo'):
+            self.dendrogram_combo.setCurrentText("Columns only")  # Default
+        
+        # Cluster Map z-score computation method
+        if hasattr(self.parent_dialog, 'cluster_map_zscore_method'):
+            zscore_method = self.parent_dialog.cluster_map_zscore_method
+            if hasattr(self, 'zscore_method_combo'):
+                self.zscore_method_combo.setCurrentText(zscore_method)
+        elif hasattr(self, 'zscore_method_combo'):
+            self.zscore_method_combo.setCurrentText("Mean")  # Default
         
         # Patient annotation - populate column options
         # Block signals to prevent triggering dialogs during population
@@ -869,10 +921,19 @@ class PlotConfigDialog(QtWidgets.QDialog):
                 self.parent_dialog.cluster_map_orientation = 'portrait'
             else:
                 self.parent_dialog.cluster_map_orientation = 'landscape'
-            # Refresh Cluster Map if it's the current view
-            if hasattr(self.parent_dialog, 'view_combo') and self.parent_dialog.view_combo.currentText() == 'Cluster Map':
-                if hasattr(self.parent_dialog, '_show_cluster_map'):
-                    self.parent_dialog._show_cluster_map()
+        
+        # Cluster Map dendrogram setting
+        if hasattr(self, 'dendrogram_combo'):
+            self.parent_dialog.cluster_map_dendrogram = self.dendrogram_combo.currentText()
+        
+        # Cluster Map z-score computation method
+        if hasattr(self, 'zscore_method_combo'):
+            self.parent_dialog.cluster_map_zscore_method = self.zscore_method_combo.currentText()
+        
+        # Refresh Cluster Map if it's the current view
+        if hasattr(self.parent_dialog, 'view_combo') and self.parent_dialog.view_combo.currentText() == 'Cluster Map':
+            if hasattr(self.parent_dialog, '_show_cluster_map'):
+                self.parent_dialog._show_cluster_map()
         
         # Patient annotation
         # Update the enabled state in parent dialog
