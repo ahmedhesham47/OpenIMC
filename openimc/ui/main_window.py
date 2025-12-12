@@ -21,6 +21,7 @@
 # This must be done at the very top, before any other imports
 import os
 import sys
+from pathlib import Path
 # Use direct assignment (not setdefault) to ensure it's set
 os.environ['DASK_DATAFRAME__QUERY_PLANNING'] = 'False'
 
@@ -38,9 +39,10 @@ except (ImportError, AttributeError) as e:
     print(f"[DEBUG] main_window.py: Could not configure dask: {e}")
     pass
 
-from typing import Dict, List, Optional, Tuple, Union
+from typing import Dict, List, Optional, Tuple, Union, Any
 import threading
 from concurrent.futures import ThreadPoolExecutor, Future
+from datetime import datetime
 
 import numpy as np
 import pandas as pd
@@ -163,6 +165,8 @@ from openimc.ui.dialogs.pixel_correlation_dialog import PixelCorrelationDialog
 from openimc.core import deconvolution
 from openimc.utils.logger import get_logger
 from openimc.ui.mask_manager import DynamicMaskManager
+from openimc.ui.state_manager import StateManager
+from openimc.ui.analysis_steps_exporter import AnalysisStepsExporter
 from openimc.ui.dialogs.display_settings_dialog import (
     get_masks_directory_preference, save_masks_directory_preference
 )
@@ -555,6 +559,8 @@ class MainWindow(QtWidgets.QMainWindow):
         self.unique_acq_to_original: Dict[str, str] = {}  # Maps unique acquisition ID to original ID
         self.acquisitions: List[AcquisitionInfo] = []
         self.current_acq_id: Optional[str] = None
+        # Session tracking for analysis steps export
+        self.session_start_time = datetime.now()
         # QC analysis results cache (persists until files change)
         self.qc_results_cache: Dict[str, Dict] = {}  # Maps file_set_id to QC results
         # Image cache and prefetching
@@ -1106,6 +1112,15 @@ class MainWindow(QtWidgets.QMainWindow):
             act_open.triggered.connect(self._open_dialog)
             act_load_features = file_menu.addAction("Load Feature File…")
             act_load_features.triggered.connect(self._load_feature_file)
+            file_menu.addSeparator()
+            
+            # Save/Load State
+            act_save_state = file_menu.addAction("Save State…")
+            act_save_state.triggered.connect(self._save_state)
+            act_load_state = file_menu.addAction("Load State…")
+            act_load_state.triggered.connect(self._load_state)
+            act_export_steps = file_menu.addAction("Export Analysis Steps…")
+            act_export_steps.triggered.connect(self._export_analysis_steps)
             file_menu.addSeparator()
             
             # Export submenu
@@ -5924,6 +5939,7 @@ class MainWindow(QtWidgets.QMainWindow):
         try:
             # Initialize CellSAM model once
             progress_dlg.update_progress(0, "Initializing DeepCell CellSAM", "Setting up model...")
+            QtWidgets.QApplication.processEvents()
             
             # Set API key from dialog
             api_key = dlg.get_cellsam_api_key()
@@ -5939,8 +5955,6 @@ class MainWindow(QtWidgets.QMainWindow):
                 )
                 return
             
-            # Model initialization is handled automatically by custom_cellsam
-            # The first call to cellsam_pipeline will create and cache the model
             if not _HAVE_CELLSAM:
                 progress_dlg.close()
                 QtWidgets.QMessageBox.critical(
@@ -5955,6 +5969,30 @@ class MainWindow(QtWidgets.QMainWindow):
             use_wsi = dlg.get_cellsam_use_wsi()
             low_contrast_enhancement = dlg.get_cellsam_low_contrast_enhancement()
             gauge_cell_size = dlg.get_cellsam_gauge_cell_size()
+            
+            # Pre-initialize the model to download weights if needed (prevents hanging during first segmentation)
+            # This ensures the model is loaded and weights are downloaded before processing acquisitions
+            progress_dlg.update_progress(5, "Initializing DeepCell CellSAM", "Loading model weights (this may take a moment on first use)...")
+            QtWidgets.QApplication.processEvents()
+            try:
+                from openimc.processing.custom_cellsam import _get_cached_model
+                # Pre-initialize the model - this will download weights if needed
+                # The download happens synchronously, but we show progress and process events
+                model = _get_cached_model(model_path=None, bbox_threshold=bbox_threshold)
+                progress_dlg.update_progress(10, "Initializing DeepCell CellSAM", "Model loaded successfully")
+                QtWidgets.QApplication.processEvents()
+            except Exception as e:
+                progress_dlg.close()
+                QtWidgets.QMessageBox.critical(
+                    self, "Model Initialization Failed",
+                    f"Failed to initialize CellSAM model:\n{str(e)}\n\n"
+                    "This may be due to:\n"
+                    "- Invalid API key\n"
+                    "- Network connectivity issues\n"
+                    "- Insufficient disk space for model weights\n\n"
+                    "Please check your API key and internet connection."
+                )
+                return
             
             # Process each acquisition sequentially
             successful_segmentations = 0
@@ -8464,6 +8502,11 @@ class MainWindow(QtWidgets.QMainWindow):
         self.clustering_dialog.setModal(False)
         # Prevent dialog from being deleted when closed, so we can reopen it
         self.clustering_dialog.setAttribute(Qt.WA_DeleteOnClose, False)
+        
+        # Restore saved clustering state if available
+        if hasattr(self, '_saved_clustering_state') and self._saved_clustering_state:
+            self._restore_clustering_state(self.clustering_dialog, self._saved_clustering_state)
+        
         self.clustering_dialog.show()
         
         # Connect to dialog's close event to update main window dataframes
@@ -8592,6 +8635,11 @@ class MainWindow(QtWidgets.QMainWindow):
         )
         self.simple_spatial_dialog.setModal(False)
         self.simple_spatial_dialog.setAttribute(Qt.WA_DeleteOnClose, False)
+        
+        # Restore saved spatial state if available
+        if hasattr(self, '_saved_spatial_state') and self._saved_spatial_state:
+            self._restore_spatial_state(self.simple_spatial_dialog, self._saved_spatial_state)
+        
         self.simple_spatial_dialog.show()
     
     def _open_advanced_spatial_dialog(self):
@@ -8681,6 +8729,11 @@ class MainWindow(QtWidgets.QMainWindow):
             return
         self.advanced_spatial_dialog.setModal(False)
         self.advanced_spatial_dialog.setAttribute(Qt.WA_DeleteOnClose, False)
+        
+        # Restore saved spatial state if available
+        if hasattr(self, '_saved_spatial_state') and self._saved_spatial_state:
+            self._restore_spatial_state(self.advanced_spatial_dialog, self._saved_spatial_state)
+        
         self.advanced_spatial_dialog.show()
     
     def _get_qc_file_set_id(self) -> str:
@@ -9545,6 +9598,1018 @@ class MainWindow(QtWidgets.QMainWindow):
                         "Success",
                         "Batch correction completed. Both original and batch-corrected features are now available in memory."
                     )
+    
+    def _save_state(self):
+        """Save complete application state to a folder."""
+        from PyQt5.QtWidgets import QFileDialog
+        
+        # Get save directory
+        state_dir = QFileDialog.getExistingDirectory(
+            self,
+            "Select Directory to Save State",
+            "",
+            QFileDialog.ShowDirsOnly | QFileDialog.DontResolveSymlinks
+        )
+        
+        if not state_dir:
+            return
+        
+        # Check if directory exists and is not empty
+        state_path = Path(state_dir)
+        if state_path.exists() and any(state_path.iterdir()):
+            reply = QtWidgets.QMessageBox.question(
+                self,
+                "Directory Not Empty",
+                f"The selected directory is not empty.\n\n"
+                f"Do you want to overwrite it?",
+                QtWidgets.QMessageBox.Yes | QtWidgets.QMessageBox.No,
+                QtWidgets.QMessageBox.No
+            )
+            if reply != QtWidgets.QMessageBox.Yes:
+                return
+        
+        # Collect state from main window
+        state_data = self._collect_state()
+        
+        # Save state
+        state_manager = StateManager()
+        success = state_manager.save_state(state_path, state_data, overwrite=True)
+        
+        if success:
+            QtWidgets.QMessageBox.information(
+                self,
+                "State Saved",
+                f"Application state saved successfully to:\n{state_path}"
+            )
+        else:
+            QtWidgets.QMessageBox.critical(
+                self,
+                "Save Error",
+                f"Failed to save application state to:\n{state_path}"
+            )
+    
+    def _load_state(self):
+        """Load complete application state from a folder."""
+        from PyQt5.QtWidgets import QFileDialog
+        
+        # Get load directory
+        state_dir = QFileDialog.getExistingDirectory(
+            self,
+            "Select Directory to Load State",
+            "",
+            QFileDialog.ShowDirsOnly | QFileDialog.DontResolveSymlinks
+        )
+        
+        if not state_dir:
+            return
+        
+        state_path = Path(state_dir)
+        if not (state_path / "state.json").exists():
+            QtWidgets.QMessageBox.warning(
+                self,
+                "Invalid State",
+                f"The selected directory does not contain a valid state file."
+            )
+            return
+        
+        # Confirm loading (will replace current state)
+        reply = QtWidgets.QMessageBox.question(
+            self,
+            "Load State",
+            f"Loading state will replace the current session.\n\n"
+            f"Do you want to continue?",
+            QtWidgets.QMessageBox.Yes | QtWidgets.QMessageBox.No,
+            QtWidgets.QMessageBox.No
+        )
+        if reply != QtWidgets.QMessageBox.Yes:
+            return
+        
+        # Load state
+        state_manager = StateManager()
+        loaded_state = state_manager.load_state(state_path)
+        
+        if loaded_state is None:
+            QtWidgets.QMessageBox.critical(
+                self,
+                "Load Error",
+                f"Failed to load application state from:\n{state_path}"
+            )
+            return
+        
+        # Restore state
+        try:
+            self._restore_state(loaded_state, state_path)
+            QtWidgets.QMessageBox.information(
+                self,
+                "State Loaded",
+                f"Application state loaded successfully from:\n{state_path}"
+            )
+        except Exception as e:
+            QtWidgets.QMessageBox.critical(
+                self,
+                "Restore Error",
+                f"Failed to restore application state:\n{str(e)}"
+            )
+            import traceback
+            traceback.print_exc()
+    
+    def _collect_state(self) -> Dict[str, Any]:
+        """Collect all state from the application for saving."""
+        state = {
+            "main_state": {},
+            "images": {},
+            "masks": {},
+            "features": {},
+            "analysis": {}
+        }
+        
+        # Main window state
+        main_state = {
+            "current_path": self.current_path,
+            "current_acq_id": self.current_acq_id,
+            "ometiff_channel_format": self.ometiff_channel_format,
+            "acq_to_file": self.acq_to_file,
+            "unique_acq_to_original": self.unique_acq_to_original,
+            "openimc_version": self._get_openimc_version(),
+            "save_timestamp": datetime.now().isoformat(),
+        }
+        
+        # Save acquisition info (serializable)
+        if self.acquisitions:
+            main_state["acquisitions"] = [
+                {
+                    "id": acq.id,
+                    "name": acq.name,
+                    "source_file": acq.source_file,
+                    "well": acq.well if hasattr(acq, 'well') else None,
+                    "channels": acq.channels if hasattr(acq, 'channels') else [],
+                }
+                for acq in self.acquisitions
+            ]
+        
+        state["main_state"] = main_state
+        
+        # Collect masks from mask_manager
+        if hasattr(self, 'mask_manager') and self.mask_manager:
+            masks = {}
+            acquisitions_info_dict = {}
+            all_mask_ids = self.mask_manager.get_all_mask_ids()
+            for acq_id in all_mask_ids:
+                try:
+                    mask = self.mask_manager.get_mask(acq_id)
+                    if mask is not None:
+                        masks[acq_id] = mask
+                    
+                    # Get acquisition info for proper naming
+                    acq_info = self._get_acquisition_info(acq_id)
+                    if acq_info:
+                        acquisitions_info_dict[acq_id] = acq_info
+                except Exception as e:
+                    print(f"Warning: Could not get mask for {acq_id}: {e}")
+                    continue
+            state["masks"] = masks
+            state["acquisitions_info"] = acquisitions_info_dict
+        
+        # Collect source files (.mcd files)
+        source_files = []
+        if self.current_path and os.path.exists(self.current_path):
+            if self.current_path.endswith('.mcd'):
+                source_files.append(self.current_path)
+        
+        # Also check acq_to_file for additional source files
+        if hasattr(self, 'acq_to_file') and self.acq_to_file:
+            for file_path in set(self.acq_to_file.values()):
+                if file_path and os.path.exists(file_path) and file_path.endswith('.mcd'):
+                    if file_path not in source_files:
+                        source_files.append(file_path)
+        
+        state["source_files"] = source_files
+        
+        # Collect features
+        features = {}
+        if self.feature_dataframe is not None and not self.feature_dataframe.empty:
+            features["original"] = self.feature_dataframe
+        if self.batch_corrected_dataframe is not None and not self.batch_corrected_dataframe.empty:
+            features["batch_corrected"] = self.batch_corrected_dataframe
+        state["features"] = features
+        
+        # Collect analysis module states
+        analysis_state = {}
+        
+        # Feature extraction parameters
+        if hasattr(self, 'feature_extraction_config') and self.feature_extraction_config:
+            analysis_state["feature_extraction"] = {
+                "config": self.feature_extraction_config,
+                "normalization_config": self.feature_extraction_config.get('normalization_config'),
+            }
+        
+        # QC Analysis state
+        if hasattr(self, 'qc_results_cache') and self.qc_results_cache:
+            analysis_state["qc_analysis"] = self.qc_results_cache
+        
+        # Clustering state
+        if hasattr(self, 'clustering_dialog') and self.clustering_dialog is not None:
+            clustering_state = self._collect_clustering_state()
+            if clustering_state:
+                analysis_state["clustering"] = clustering_state
+        
+        # Spatial Analysis state (check both simple and advanced)
+        spatial_state = self._collect_spatial_state()
+        if spatial_state:
+            analysis_state["spatial"] = spatial_state
+        
+        # Batch Correction state
+        batch_correction_state = self._collect_batch_correction_state()
+        if batch_correction_state:
+            analysis_state["batch_correction"] = batch_correction_state
+        
+        # Pixel Correlation state (if dialog exists and has results)
+        # Note: Pixel correlation results are typically not persistent
+        
+        # Deconvolution state (if any)
+        # Note: Deconvolution results are typically saved to files
+        
+        state["analysis"] = analysis_state
+        
+        return state
+    
+    def _collect_clustering_state(self) -> Optional[Dict[str, Any]]:
+        """Collect clustering dialog state including all parameters."""
+        if not hasattr(self, 'clustering_dialog') or self.clustering_dialog is None:
+            return None
+        
+        dlg = self.clustering_dialog
+        state = {}
+        
+        # Collect key state from clustering dialog
+        if hasattr(dlg, 'cluster_labels') and dlg.cluster_labels is not None:
+            state["cluster_labels"] = dlg.cluster_labels
+        
+        if hasattr(dlg, 'clustered_data') and dlg.clustered_data is not None:
+            # Save clustered data as DataFrame reference (will be saved separately)
+            state["has_clustered_data"] = True
+        
+        if hasattr(dlg, 'normalization_config') and dlg.normalization_config:
+            state["normalization_config"] = dlg.normalization_config
+        
+        if hasattr(dlg, 'cluster_annotation_map') and dlg.cluster_annotation_map:
+            state["cluster_annotation_map"] = dlg.cluster_annotation_map
+        
+        # Collect clustering method and parameters
+        if hasattr(dlg, 'last_clustering_method'):
+            state["clustering_method"] = dlg.last_clustering_method
+        
+        if hasattr(dlg, 'last_clustering_params'):
+            state["clustering_parameters"] = dlg.last_clustering_params
+        
+        if hasattr(dlg, 'last_features_used'):
+            state["features_used"] = dlg.last_features_used
+        
+        # Collect filter settings (excluded cells, area filters, etc.)
+        if hasattr(dlg, 'filter_settings') and dlg.filter_settings is not None:
+            state["filter_settings"] = dlg.filter_settings
+        
+        # Collect scaling method (z-score/mad/none)
+        if hasattr(dlg, 'clustering_scaling_method') and dlg.clustering_scaling_method:
+            state["clustering_scaling_method"] = dlg.clustering_scaling_method
+        
+        # Collect custom names
+        if hasattr(dlg, 'feature_label_map') and dlg.feature_label_map:
+            state["feature_label_map"] = dlg.feature_label_map
+        
+        if hasattr(dlg, 'patient_annotation_map') and dlg.patient_annotation_map:
+            state["patient_annotation_map"] = dlg.patient_annotation_map
+        
+        if hasattr(dlg, 'cluster_backend_names') and dlg.cluster_backend_names:
+            state["cluster_backend_names"] = dlg.cluster_backend_names
+        
+        # Collect original cluster assignments (before merging)
+        if hasattr(dlg, 'original_cluster_assignments') and dlg.original_cluster_assignments is not None:
+            state["original_cluster_assignments"] = dlg.original_cluster_assignments
+        
+        # Collect plot settings
+        if hasattr(dlg, 'cluster_map_orientation'):
+            state["cluster_map_orientation"] = dlg.cluster_map_orientation
+        
+        if hasattr(dlg, 'cluster_map_dendrogram'):
+            state["cluster_map_dendrogram"] = dlg.cluster_map_dendrogram
+        
+        if hasattr(dlg, 'cluster_map_zscore_method'):
+            state["cluster_map_zscore_method"] = dlg.cluster_map_zscore_method
+        
+        # Collect patient annotation settings
+        if hasattr(dlg, 'patient_annotation_column'):
+            state["patient_annotation_column"] = dlg.patient_annotation_column
+        
+        if hasattr(dlg, 'patient_annotation_enabled'):
+            state["patient_annotation_enabled"] = dlg.patient_annotation_enabled
+        
+        if hasattr(dlg, 'patient_legend_label'):
+            state["patient_legend_label"] = dlg.patient_legend_label
+        
+        return state if state else None
+    
+    def _collect_spatial_state(self) -> Optional[Dict[str, Any]]:
+        """Collect spatial analysis dialog state (both Simple and Advanced)."""
+        # Check both simple and advanced spatial dialogs
+        simple_dlg = getattr(self, 'simple_spatial_dialog', None)
+        advanced_dlg = getattr(self, 'advanced_spatial_dialog', None)
+        
+        # Legacy check for spatial_dialog
+        legacy_dlg = getattr(self, 'spatial_dialog', None)
+        
+        # Determine which dialog to use (prefer simple, then advanced, then legacy)
+        dlg = simple_dlg or advanced_dlg or legacy_dlg
+        
+        if dlg is None:
+            return None
+        
+        state = {}
+        dialog_type = "simple" if simple_dlg else ("advanced" if advanced_dlg else "legacy")
+        state["dialog_type"] = dialog_type
+        
+        # Common state for both Simple and Advanced
+        if hasattr(dlg, 'cluster_annotation_map') and dlg.cluster_annotation_map:
+            state["cluster_annotation_map"] = dlg.cluster_annotation_map
+        
+        # Simple Spatial Analysis specific state
+        if dialog_type == "simple":
+            # Graph data
+            if hasattr(dlg, 'edge_df') and dlg.edge_df is not None and not dlg.edge_df.empty:
+                state["has_edge_df"] = True  # Will be saved as DataFrame separately if needed
+            
+            # Graph metadata
+            if hasattr(dlg, 'metadata') and dlg.metadata:
+                state["metadata"] = dlg.metadata
+            
+            # Cell ID mappings (convert to serializable format)
+            if hasattr(dlg, 'cell_id_to_gid') and dlg.cell_id_to_gid:
+                state["cell_id_to_gid"] = {f"{k[0]}_{k[1]}": v for k, v in dlg.cell_id_to_gid.items()}
+            
+            if hasattr(dlg, 'gid_to_cell_id') and dlg.gid_to_cell_id:
+                state["gid_to_cell_id"] = {str(k): list(v) for k, v in dlg.gid_to_cell_id.items()}
+            
+            # Analysis results DataFrames (flags indicate if they exist)
+            if hasattr(dlg, 'cluster_summary_df') and dlg.cluster_summary_df is not None:
+                state["has_cluster_summary_df"] = True
+            
+            if hasattr(dlg, 'enrichment_df') and dlg.enrichment_df is not None:
+                state["has_enrichment_df"] = True
+            
+            if hasattr(dlg, 'distance_df') and dlg.distance_df is not None:
+                state["has_distance_df"] = True
+            
+            # Analysis flags
+            if hasattr(dlg, 'enrichment_analysis_run'):
+                state["enrichment_analysis_run"] = dlg.enrichment_analysis_run
+            
+            if hasattr(dlg, 'distance_analysis_run'):
+                state["distance_analysis_run"] = dlg.distance_analysis_run
+            
+            if hasattr(dlg, 'spatial_viz_run'):
+                state["spatial_viz_run"] = dlg.spatial_viz_run
+            
+            if hasattr(dlg, 'community_analysis_run'):
+                state["community_analysis_run"] = dlg.community_analysis_run
+            
+            # Source file filters
+            if hasattr(dlg, 'selected_source_files') and dlg.selected_source_files:
+                state["selected_source_files"] = list(dlg.selected_source_files)
+            
+            if hasattr(dlg, 'available_source_files') and dlg.available_source_files:
+                state["available_source_files"] = list(dlg.available_source_files)
+            
+            # Random seed for reproducibility
+            if hasattr(dlg, 'rng_seed'):
+                state["rng_seed"] = dlg.rng_seed
+            
+            # Spatial visualization cache (may be large, save flag only)
+            if hasattr(dlg, 'spatial_viz_cache') and dlg.spatial_viz_cache:
+                state["has_spatial_viz_cache"] = True
+        
+        # Advanced Spatial Analysis specific state
+        elif dialog_type == "advanced":
+            # Analysis status
+            if hasattr(dlg, 'analysis_status') and dlg.analysis_status:
+                state["analysis_status"] = dlg.analysis_status
+            
+            # Processed ROIs info (without full AnnData objects)
+            if hasattr(dlg, 'processed_rois') and dlg.processed_rois:
+                state["processed_rois"] = {
+                    roi_id: {
+                        "graph_built": info.get("graph_built", False),
+                        "analyses": info.get("analyses", [])
+                    }
+                    for roi_id, info in dlg.processed_rois.items()
+                }
+            
+            # Aggregated results (may contain DataFrames)
+            if hasattr(dlg, 'aggregated_results') and dlg.aggregated_results:
+                state["aggregated_results"] = dlg.aggregated_results
+            
+            # Graph built flag
+            if hasattr(dlg, 'spatial_graph_built'):
+                state["spatial_graph_built"] = dlg.spatial_graph_built
+            
+            # AnnData cache exists flag (actual objects too large to save)
+            if hasattr(dlg, 'anndata_cache') and dlg.anndata_cache:
+                state["has_anndata_cache"] = True
+                state["anndata_cache_rois"] = list(dlg.anndata_cache.keys())
+        
+        return state if state else None
+    
+    def _collect_batch_correction_state(self) -> Optional[Dict[str, Any]]:
+        """Collect batch correction state including custom grouping and metadata files."""
+        # Batch correction dialog is typically modal and closed after use,
+        # but we can save the state from the last correction if available
+        state = {}
+        
+        # Check if batch corrected dataframe exists (indicates correction was done)
+        if hasattr(self, 'batch_corrected_dataframe') and self.batch_corrected_dataframe is not None:
+            state["has_batch_corrected_data"] = True
+        
+        # Note: Custom grouping and metadata files are typically not persisted
+        # across sessions as they're dialog-specific. However, if we need to save them,
+        # we would need to store them in MainWindow when the dialog is accepted.
+        # For now, we'll save a flag that batch correction was applied.
+        
+        return state if state else None
+    
+    def _restore_batch_correction_state(self, state: Dict[str, Any]):
+        """Restore batch correction state."""
+        # Batch correction state is primarily the corrected dataframe,
+        # which is already restored in _restore_state when loading features.
+        # Custom grouping and metadata files would need to be restored if we
+        # decide to persist them in the future.
+        pass
+    
+    def _restore_state(self, loaded_state: Dict[str, Any], state_path: Path):
+        """Restore application state from loaded data."""
+        # Restore main window state
+        main_state = loaded_state.get("main_window", {})
+        
+        # Load .mcd files from images folder if they exist
+        source_files = main_state.get("source_files", [])
+        images_dir = state_path / "images"
+        
+        if source_files and images_dir.exists():
+            # Load all .mcd files found in the images folder
+            mcd_files = []
+            for filename in source_files:
+                mcd_path = images_dir / filename
+                if mcd_path.exists() and mcd_path.suffix.lower() == '.mcd':
+                    mcd_files.append(str(mcd_path))
+            
+            if mcd_files:
+                # Close existing loaders first
+                self._close_all_loaders()
+                
+                # Clear canvas completely before loading to ensure proper redraw
+                self.canvas.fig.clear()
+                self.canvas.draw()
+                
+                # Load all MCD files using the same logic as _load_multiple_mcd_files
+                # Track all acquisitions and their source files
+                all_acquisitions = []
+                file_channel_sets = {}  # Maps file path to set of all channels in that file
+                
+                # Clear image cache to avoid collisions with old cache entries
+                with self._cache_lock:
+                    self.image_cache.clear()
+                
+                # Load each MCD file
+                for mcd_file in mcd_files:
+                    if not os.path.isfile(mcd_file):
+                        print(f"Warning: Skipping invalid path: {mcd_file}")
+                        continue
+                    
+                    if not mcd_file.lower().endswith('.mcd'):
+                        print(f"Warning: Skipping non-MCD file: {mcd_file}")
+                        continue
+                    
+                    try:
+                        loader = MCDLoader()
+                        loader.open(mcd_file)
+                        self.mcd_loaders[mcd_file] = loader
+                        
+                        # Get acquisitions for this file
+                        file_acqs = loader.list_acquisitions(source_file=mcd_file)
+                        
+                        # Create unique acquisition IDs by incorporating file identifier
+                        # Use a hash of the file path to create a short unique identifier
+                        import hashlib
+                        file_hash = hashlib.md5(mcd_file.encode()).hexdigest()[:8]
+                        file_id = f"file_{file_hash}"
+                        
+                        # Track channels for mismatch detection (union of all channels in this file)
+                        file_channels = set()
+                        for acq in file_acqs:
+                            # Create unique acquisition ID by combining original ID with file identifier
+                            unique_acq_id = f"{acq.id}__{file_id}"
+                            
+                            # Create new AcquisitionInfo with unique ID
+                            from openimc.data.mcd_loader import AcquisitionInfo
+                            unique_acq = AcquisitionInfo(
+                                id=unique_acq_id,
+                                name=acq.name,
+                                well=acq.well,
+                                size=acq.size,
+                                channels=acq.channels,
+                                channel_metals=acq.channel_metals,
+                                channel_labels=acq.channel_labels,
+                                metadata=acq.metadata,
+                                source_file=acq.source_file
+                            )
+                            all_acquisitions.append(unique_acq)
+                            
+                            file_channels.update(acq.channels)
+                            self.acq_to_file[unique_acq_id] = mcd_file
+                            self.unique_acq_to_original[unique_acq_id] = acq.id  # Store mapping from unique to original ID
+                        file_channel_sets[mcd_file] = file_channels
+                        
+                    except Exception as e:
+                        print(f"Warning: Could not load MCD file {mcd_file}: {e}")
+                        import traceback
+                        traceback.print_exc()
+                        continue
+                
+                if not all_acquisitions:
+                    QtWidgets.QMessageBox.critical(self, "No acquisitions", "No acquisitions could be loaded from the saved state files.")
+                    return
+                
+                # Check for channel mismatches (compare channels per file)
+                channel_sets_list = list(file_channel_sets.values())
+                self._check_channel_mismatches(channel_sets_list, list(file_channel_sets.keys()))
+                
+                # Update state
+                self.acquisitions = all_acquisitions
+                self.current_path = mcd_files[0] if mcd_files else None
+                
+                # Set main loader to first file for backward compatibility
+                if mcd_files and mcd_files[0] in self.mcd_loaders:
+                    self.loader = self.mcd_loaders[mcd_files[0]]
+                
+                # Update window title
+                if len(mcd_files) == 1:
+                    stem = os.path.splitext(os.path.basename(mcd_files[0]))[0]
+                    self.setWindowTitle(f"OpenIMC - {stem} (MCD)")
+                else:
+                    self.setWindowTitle(f"OpenIMC - {len(mcd_files)} MCD files")
+                
+                # Clear canvas completely before loading new files to ensure proper redraw
+                self.canvas.fig.clear()
+                self.canvas.draw()
+                
+                # Update acquisition combo box with file names (same as _load_multiple_mcd_files)
+                self.acq_combo.clear()
+                for ai in self.acquisitions:
+                    file_name = os.path.basename(ai.source_file) if ai.source_file else "Unknown"
+                    # Use well name if available, otherwise use acquisition name
+                    label = ai.well if ai.well else ai.name
+                    label += f" [{file_name}]"
+                    self.acq_combo.addItem(label, ai.id)
+                
+                if self.acquisitions:
+                    self._populate_channels(self.acquisitions[0].id)
+                    # For initial file load, if no channels were pre-selected, select DNA1 if it exists, otherwise first channel
+                    if not self._selected_channels() and self.channel_list.count() > 0:
+                        # Look for channel containing DNA1 first
+                        dna1_item = None
+                        for i in range(self.channel_list.count()):
+                            item = self.channel_list.item(i)
+                            if "DNA1" in item.text():
+                                dna1_item = item
+                                break
+                        
+                        # Select DNA1 if found, otherwise select first channel
+                        if dna1_item:
+                            dna1_item.setCheckState(Qt.Checked)
+                        else:
+                            item = self.channel_list.item(0)
+                            item.setCheckState(Qt.Checked)
+                    
+                    # Display the selected images
+                    self._view_selected()
+        
+        # Restore file paths and acquisition info
+        if "current_path" in main_state and not self.current_path:
+            # Fallback if files weren't loaded above
+            self.current_path = main_state["current_path"]
+        
+        # Restore masks (do this after acquisitions are loaded so we can match them properly)
+        # Use the same matching logic as _load_segmentation_masks for consistency
+        masks = loaded_state.get("masks", {})
+        if masks and hasattr(self, 'mask_manager') and self.acquisitions:
+            # Get saved acquisition info from state to help with matching
+            saved_acquisitions = main_state.get("acquisitions", [])
+            saved_acq_map = {acq.get("id"): acq for acq in saved_acquisitions}
+            
+            for saved_acq_id, mask in masks.items():
+                # Try to find matching acquisition using multiple strategies
+                acq_info = None
+                restored_acq_id = None
+                
+                # Get saved acquisition info if available
+                saved_acq_data = saved_acq_map.get(saved_acq_id, {})
+                saved_well = saved_acq_data.get("well")
+                saved_name = saved_acq_data.get("name")
+                saved_source_file = saved_acq_data.get("source_file")
+                
+                # Strategy 1: Try exact match with saved acquisition ID (works if IDs match exactly)
+                acq_info = self._get_acquisition_info(saved_acq_id)
+                if acq_info:
+                    restored_acq_id = saved_acq_id
+                else:
+                    # Strategy 2: Match by source file + well/name (same as base app logic)
+                    # This is the most reliable for multiple MCD files
+                    for ai in self.acquisitions:
+                        if not ai.source_file:
+                            continue
+                        
+                        # Match by source file first (most reliable for multi-file)
+                        source_matches = False
+                        if saved_source_file:
+                            # Compare source files (handle both full paths and basenames)
+                            saved_source_basename = os.path.basename(saved_source_file)
+                            current_source_basename = os.path.basename(ai.source_file)
+                            if saved_source_basename == current_source_basename:
+                                source_matches = True
+                        else:
+                            # If no saved source file, try to match by checking if saved_acq_id references this file
+                            if saved_acq_id in self.acq_to_file:
+                                if self.acq_to_file[saved_acq_id] == ai.source_file:
+                                    source_matches = True
+                        
+                        if source_matches:
+                            # Now match by well or name
+                            if saved_well and ai.well and saved_well == ai.well:
+                                acq_info = ai
+                                restored_acq_id = ai.id
+                                break
+                            elif saved_name and ai.name and saved_name == ai.name:
+                                acq_info = ai
+                                restored_acq_id = ai.id
+                                break
+                            elif not saved_well and not saved_name:
+                                # If no well/name saved, match by original ID if available
+                                if saved_acq_id in self.unique_acq_to_original:
+                                    original_id = self.unique_acq_to_original.get(ai.id)
+                                    if original_id and original_id == self.unique_acq_to_original[saved_acq_id]:
+                                        acq_info = ai
+                                        restored_acq_id = ai.id
+                                        break
+                    
+                    # Strategy 3: Try matching by extracting base ID from unique ID format
+                    if not acq_info and '__file_' in saved_acq_id:
+                        base_id = saved_acq_id.split('__file_')[0]
+                        # Try to find acquisition with matching original ID
+                        for ai in self.acquisitions:
+                            if ai.id in self.unique_acq_to_original:
+                                original_id = self.unique_acq_to_original[ai.id]
+                                if original_id == base_id:
+                                    # Also verify source file matches if available
+                                    if not saved_source_file or (ai.source_file and os.path.basename(ai.source_file) == os.path.basename(saved_source_file)):
+                                        acq_info = ai
+                                        restored_acq_id = ai.id
+                                        break
+                    
+                    # Strategy 4: Try matching by well/name alone (fallback)
+                    if not acq_info:
+                        for ai in self.acquisitions:
+                            if saved_well and ai.well and saved_well == ai.well:
+                                acq_info = ai
+                                restored_acq_id = ai.id
+                                break
+                            elif saved_name and ai.name and saved_name == ai.name:
+                                acq_info = ai
+                                restored_acq_id = ai.id
+                                break
+                
+                # If we found acquisition info, set the mask
+                if acq_info and restored_acq_id:
+                    # Set acquisition info in the mask manager dict cache (same as base app)
+                    self.segmentation_masks.set_acq_info(restored_acq_id, acq_info)
+                    
+                    # Set mask in mask_manager using the correct acquisition ID
+                    self.mask_manager.set_mask(restored_acq_id, mask, save_to_disk=True, acq_info=acq_info)
+                    
+                    # Clear colors for this acquisition so they get regenerated (same as base app)
+                    if restored_acq_id in self.segmentation_colors:
+                        del self.segmentation_colors[restored_acq_id]
+                else:
+                    # Fallback: try to store with saved ID (might work if format matches)
+                    print(f"Warning: Could not match mask for saved_acq_id={saved_acq_id} to any acquisition")
+            
+            # Update segmentation overlay text after restoring masks
+            if self.current_acq_id:
+                self._update_segmentation_overlay_text()
+                
+                # If masks exist for current acquisition and overlay is enabled, refresh display
+                if self.current_acq_id in self.segmentation_masks:
+                    # Make sure overlay mode widget is visible if overlay is enabled
+                    if hasattr(self, 'segmentation_overlay_mode_widget'):
+                        if self.segmentation_overlay:
+                            self.segmentation_overlay_mode_widget.setVisible(True)
+                    
+                    # Refresh display if overlay is enabled to show the masks
+                    if self.segmentation_overlay:
+                        self.preserve_zoom = True
+                        self._view_selected()
+        
+        # Restore features
+        features = loaded_state.get("features", {})
+        if "original" in features:
+            self.feature_dataframe = features["original"]
+        if "batch_corrected" in features:
+            self.batch_corrected_dataframe = features["batch_corrected"]
+        
+        # Restore analysis module states
+        analysis = loaded_state.get("analysis", {})
+        
+        # Restore QC analysis state
+        if "qc_analysis" in analysis:
+            if not hasattr(self, 'qc_results_cache'):
+                self.qc_results_cache = {}
+            self.qc_results_cache.update(analysis["qc_analysis"])
+        
+        # Restore clustering state
+        if "clustering" in analysis:
+            clustering_state = analysis["clustering"]
+            # Note: Clustering dialog will be restored when opened
+            # Store state for later restoration
+            if not hasattr(self, '_saved_clustering_state'):
+                self._saved_clustering_state = {}
+            self._saved_clustering_state = clustering_state
+        
+        # Restore spatial analysis state
+        if "spatial" in analysis:
+            spatial_state = analysis["spatial"]
+            # Store state for later restoration
+            if not hasattr(self, '_saved_spatial_state'):
+                self._saved_spatial_state = {}
+            self._saved_spatial_state = spatial_state
+        
+        # Restore batch correction state
+        if "batch_correction" in analysis:
+            batch_correction_state = analysis["batch_correction"]
+            self._restore_batch_correction_state(batch_correction_state)
+        
+        # Update UI to reflect loaded state
+        if self.feature_dataframe is not None:
+            # Enable buttons that depend on features
+            if hasattr(self, 'clustering_btn'):
+                self.clustering_btn.setEnabled(True)
+            if hasattr(self, 'spatial_btn'):
+                self.spatial_btn.setEnabled(True)
+            if hasattr(self, 'batch_correction_btn'):
+                self.batch_correction_btn.setEnabled(True)
+    
+    def _restore_clustering_state(self, dialog, state: Dict[str, Any]):
+        """Restore clustering dialog state including all parameters."""
+        try:
+            # Restore cluster labels if available
+            if "cluster_labels" in state and state["cluster_labels"] is not None:
+                if hasattr(dialog, 'cluster_labels'):
+                    dialog.cluster_labels = state["cluster_labels"]
+            
+            # Restore normalization config
+            if "normalization_config" in state and state["normalization_config"]:
+                if hasattr(dialog, 'normalization_config'):
+                    dialog.normalization_config = state["normalization_config"]
+            
+            # Restore cluster annotation map
+            if "cluster_annotation_map" in state and state["cluster_annotation_map"]:
+                if hasattr(dialog, 'cluster_annotation_map'):
+                    dialog.cluster_annotation_map = state["cluster_annotation_map"]
+            
+            # Restore filter settings (excluded cells, area filters, etc.)
+            if "filter_settings" in state and state["filter_settings"] is not None:
+                if hasattr(dialog, 'filter_settings'):
+                    dialog.filter_settings = state["filter_settings"]
+            
+            # Restore scaling method (z-score/mad/none)
+            if "clustering_scaling_method" in state and state["clustering_scaling_method"]:
+                if hasattr(dialog, 'clustering_scaling_method'):
+                    dialog.clustering_scaling_method = state["clustering_scaling_method"]
+            
+            # Restore custom names
+            if "feature_label_map" in state and state["feature_label_map"]:
+                if hasattr(dialog, 'feature_label_map'):
+                    dialog.feature_label_map = state["feature_label_map"]
+            
+            if "patient_annotation_map" in state and state["patient_annotation_map"]:
+                if hasattr(dialog, 'patient_annotation_map'):
+                    dialog.patient_annotation_map = state["patient_annotation_map"]
+            
+            if "cluster_backend_names" in state and state["cluster_backend_names"]:
+                if hasattr(dialog, 'cluster_backend_names'):
+                    dialog.cluster_backend_names = state["cluster_backend_names"]
+            
+            # Restore original cluster assignments (before merging)
+            if "original_cluster_assignments" in state and state["original_cluster_assignments"] is not None:
+                if hasattr(dialog, 'original_cluster_assignments'):
+                    dialog.original_cluster_assignments = state["original_cluster_assignments"]
+            
+            # Restore plot settings
+            if "cluster_map_orientation" in state:
+                if hasattr(dialog, 'cluster_map_orientation'):
+                    dialog.cluster_map_orientation = state["cluster_map_orientation"]
+            
+            if "cluster_map_dendrogram" in state:
+                if hasattr(dialog, 'cluster_map_dendrogram'):
+                    dialog.cluster_map_dendrogram = state["cluster_map_dendrogram"]
+            
+            if "cluster_map_zscore_method" in state:
+                if hasattr(dialog, 'cluster_map_zscore_method'):
+                    dialog.cluster_map_zscore_method = state["cluster_map_zscore_method"]
+            
+            # Restore patient annotation settings
+            if "patient_annotation_column" in state:
+                if hasattr(dialog, 'patient_annotation_column'):
+                    dialog.patient_annotation_column = state["patient_annotation_column"]
+            
+            if "patient_annotation_enabled" in state:
+                if hasattr(dialog, 'patient_annotation_enabled'):
+                    dialog.patient_annotation_enabled = state["patient_annotation_enabled"]
+            
+            if "patient_legend_label" in state:
+                if hasattr(dialog, 'patient_legend_label'):
+                    dialog.patient_legend_label = state["patient_legend_label"]
+            
+            # Restore clustering method and parameters (for reference)
+            if "clustering_method" in state:
+                if hasattr(dialog, 'last_clustering_method'):
+                    dialog.last_clustering_method = state["clustering_method"]
+            
+            if "clustering_parameters" in state:
+                if hasattr(dialog, 'last_clustering_params'):
+                    dialog.last_clustering_params = state["clustering_parameters"]
+            
+            if "features_used" in state:
+                if hasattr(dialog, 'last_features_used'):
+                    dialog.last_features_used = state["features_used"]
+            
+            # Note: Clustered data will be regenerated when needed
+            # The cluster labels and all settings are the key state that needs to be restored
+        except Exception as e:
+            print(f"Warning: Could not fully restore clustering state: {e}")
+            import traceback
+            traceback.print_exc()
+    
+    def _restore_spatial_state(self, dialog, state: Dict[str, Any]):
+        """Restore spatial analysis dialog state (both Simple and Advanced)."""
+        try:
+            dialog_type = state.get("dialog_type", "legacy")
+            
+            # Common state for both Simple and Advanced
+            if "cluster_annotation_map" in state and state["cluster_annotation_map"]:
+                if hasattr(dialog, 'cluster_annotation_map'):
+                    dialog.cluster_annotation_map = state["cluster_annotation_map"]
+            
+            # Simple Spatial Analysis specific restoration
+            if dialog_type == "simple":
+                # Restore metadata
+                if "metadata" in state and state["metadata"]:
+                    if hasattr(dialog, 'metadata'):
+                        dialog.metadata = state["metadata"]
+                
+                # Restore cell ID mappings
+                if "cell_id_to_gid" in state and state["cell_id_to_gid"]:
+                    if hasattr(dialog, 'cell_id_to_gid'):
+                        # Convert back from serialized format
+                        # Format: "roi_id_cell_id" -> (roi_id, cell_id)
+                        try:
+                            dialog.cell_id_to_gid = {}
+                            for k, v in state["cell_id_to_gid"].items():
+                                parts = k.split('_', 1)
+                                if len(parts) == 2:
+                                    dialog.cell_id_to_gid[(parts[0], int(parts[1]))] = v
+                        except Exception as e:
+                            print(f"Warning: Could not restore cell_id_to_gid: {e}")
+                
+                if "gid_to_cell_id" in state and state["gid_to_cell_id"]:
+                    if hasattr(dialog, 'gid_to_cell_id'):
+                        # Convert back from serialized format
+                        # Format: "gid" -> [roi_id, cell_id]
+                        try:
+                            dialog.gid_to_cell_id = {}
+                            for k, v in state["gid_to_cell_id"].items():
+                                if isinstance(v, list) and len(v) == 2:
+                                    dialog.gid_to_cell_id[int(k)] = (v[0], int(v[1]))
+                        except Exception as e:
+                            print(f"Warning: Could not restore gid_to_cell_id: {e}")
+                
+                # Restore analysis flags
+                if "enrichment_analysis_run" in state:
+                    if hasattr(dialog, 'enrichment_analysis_run'):
+                        dialog.enrichment_analysis_run = state["enrichment_analysis_run"]
+                
+                if "distance_analysis_run" in state:
+                    if hasattr(dialog, 'distance_analysis_run'):
+                        dialog.distance_analysis_run = state["distance_analysis_run"]
+                
+                if "spatial_viz_run" in state:
+                    if hasattr(dialog, 'spatial_viz_run'):
+                        dialog.spatial_viz_run = state["spatial_viz_run"]
+                
+                if "community_analysis_run" in state:
+                    if hasattr(dialog, 'community_analysis_run'):
+                        dialog.community_analysis_run = state["community_analysis_run"]
+                
+                # Restore source file filters
+                if "selected_source_files" in state and state["selected_source_files"]:
+                    if hasattr(dialog, 'selected_source_files'):
+                        dialog.selected_source_files = set(state["selected_source_files"])
+                
+                if "available_source_files" in state and state["available_source_files"]:
+                    if hasattr(dialog, 'available_source_files'):
+                        dialog.available_source_files = set(state["available_source_files"])
+                
+                # Restore random seed
+                if "rng_seed" in state:
+                    if hasattr(dialog, 'rng_seed'):
+                        dialog.rng_seed = state["rng_seed"]
+            
+            # Advanced Spatial Analysis specific restoration
+            elif dialog_type == "advanced":
+                # Restore analysis status
+                if "analysis_status" in state and state["analysis_status"]:
+                    if hasattr(dialog, 'analysis_status'):
+                        dialog.analysis_status = state["analysis_status"]
+                
+                # Restore processed ROIs info
+                if "processed_rois" in state and state["processed_rois"]:
+                    if hasattr(dialog, 'processed_rois'):
+                        dialog.processed_rois = state["processed_rois"]
+                
+                # Restore aggregated results
+                if "aggregated_results" in state and state["aggregated_results"]:
+                    if hasattr(dialog, 'aggregated_results'):
+                        dialog.aggregated_results = state["aggregated_results"]
+                
+                # Restore graph built flag
+                if "spatial_graph_built" in state:
+                    if hasattr(dialog, 'spatial_graph_built'):
+                        dialog.spatial_graph_built = state["spatial_graph_built"]
+            
+            # Note: DataFrames (edge_df, enrichment_df, distance_df, etc.) and AnnData objects
+            # will need to be regenerated from the feature dataframe when the dialog is used.
+            # The flags and metadata are the key state that needs to be restored.
+        except Exception as e:
+            print(f"Warning: Could not fully restore spatial state: {e}")
+            import traceback
+            traceback.print_exc()
+    
+    def _export_analysis_steps(self):
+        """Export analysis steps to a text file."""
+        from PyQt5.QtWidgets import QFileDialog
+        
+        # Get save path
+        output_path, _ = QFileDialog.getSaveFileName(
+            self,
+            "Export Analysis Steps",
+            "analysis_steps.txt",
+            "Text Files (*.txt);;All Files (*)"
+        )
+        
+        if not output_path:
+            return
+        
+        # Export using the exporter
+        exporter = AnalysisStepsExporter()
+        success = exporter.export_from_main_window(self, output_path)
+        
+        if success:
+            QtWidgets.QMessageBox.information(
+                self,
+                "Export Complete",
+                f"Analysis steps exported successfully to:\n{output_path}"
+            )
+        else:
+            QtWidgets.QMessageBox.warning(
+                self,
+                "Export Failed",
+                f"Failed to export analysis steps.\n\n"
+                f"Make sure you have performed some analysis operations that are logged."
+            )
+    
+    def _get_openimc_version(self) -> str:
+        """Get OpenIMC version information."""
+        try:
+            import openimc
+            if hasattr(openimc, '__version__'):
+                return openimc.__version__
+        except:
+            pass
+        
+        try:
+            # Try to get from pyproject.toml or setup.py
+            import pkg_resources
+            return pkg_resources.get_distribution("openimc").version
+        except:
+            pass
+        
+        return "Unknown"
 
 
 

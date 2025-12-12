@@ -279,12 +279,10 @@ class ConditionROIWidget(QtWidgets.QWidget):
         # Store all items for filtering
         all_acq_items = []
         for acq_info in acquisitions:
-            # Build display name with well/ROI name
-            display_name = acq_info.name
-            if hasattr(acq_info, 'well') and acq_info.well:
-                display_name = f"{acq_info.well} - {acq_info.name}"
-            if hasattr(acq_info, 'source_file') and acq_info.source_file:
-                display_name += f" ({os.path.basename(acq_info.source_file)})"
+            # Use same format as main window: well [file_name] or name [file_name]
+            file_name = os.path.basename(acq_info.source_file) if hasattr(acq_info, 'source_file') and acq_info.source_file else "Unknown"
+            display_name = acq_info.well if (hasattr(acq_info, 'well') and acq_info.well) else acq_info.name
+            display_name += f" [{file_name}]"
             item = QtWidgets.QListWidgetItem(display_name)
             item.setData(QtCore.Qt.UserRole, acq_info)
             acq_list.addItem(item)
@@ -472,12 +470,10 @@ class PixelCorrelationDialog(QtWidgets.QDialog):
         # Store all items for filtering
         all_acq_items = []
         for acq_info in acquisitions:
-            # Build display name with well/ROI name
-            display_name = acq_info.name
-            if hasattr(acq_info, 'well') and acq_info.well:
-                display_name = f"{acq_info.well} - {acq_info.name}"
-            if hasattr(acq_info, 'source_file') and acq_info.source_file:
-                display_name += f" ({os.path.basename(acq_info.source_file)})"
+            # Use same format as main window: well [file_name] or name [file_name]
+            file_name = os.path.basename(acq_info.source_file) if hasattr(acq_info, 'source_file') and acq_info.source_file else "Unknown"
+            display_name = acq_info.well if (hasattr(acq_info, 'well') and acq_info.well) else acq_info.name
+            display_name += f" [{file_name}]"
             item = QtWidgets.QListWidgetItem(display_name)
             item.setData(QtCore.Qt.UserRole, acq_info)
             acq_list.addItem(item)

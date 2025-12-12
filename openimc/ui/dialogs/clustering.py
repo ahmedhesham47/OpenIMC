@@ -7478,12 +7478,19 @@ class ClusterExplorerDialog(QtWidgets.QDialog):
                                 cropped_rgb[:, :, c] *= cropped_mask
                             
                             # Create image widget with source file and well name
+                            # Use same format as main window: well [file_name] or name [file_name]
                             source_file = cell_data.get('source_file', 'Unknown')
                             well_name = cell_data.get('well', cell_data.get('source_well', 'Unknown'))
                             # Clean up source_file to just the filename without path
                             if source_file and source_file != 'Unknown':
                                 source_file = os.path.basename(str(source_file))
-                            label = f"{source_file} - {well_name}" if well_name and well_name != 'Unknown' else source_file
+                            else:
+                                source_file = "Unknown"
+                            # Use well if available, otherwise use source_file as name
+                            if well_name and well_name != 'Unknown':
+                                label = f"{well_name} [{source_file}]"
+                            else:
+                                label = source_file
                             img_widget = self._create_image_widget(cropped_rgb, label, is_rgb=True)
                             grid_layout.addWidget(img_widget, i // 4, i % 4)
                             
@@ -7962,7 +7969,11 @@ class ClusterExplorerDialog(QtWidgets.QDialog):
         if hasattr(parent_window, 'acquisitions'):
             for acq in parent_window.acquisitions:
                 if acq.id == acq_id:
-                    return acq.name
+                    # Use same format as main window: well [file_name] or name [file_name]
+                    import os
+                    file_name = os.path.basename(acq.source_file) if hasattr(acq, 'source_file') and acq.source_file else "Unknown"
+                    label = acq.well if (hasattr(acq, 'well') and acq.well) else acq.name
+                    return f"{label} [{file_name}]"
         return acq_id
 
     def _get_cluster_label(self, cluster_id):

@@ -389,8 +389,11 @@ class GenerateSpilloverMatrixDialog(QtWidgets.QDialog):
             id_item.setFlags(id_item.flags() & ~Qt.ItemIsEditable)
             self.mapping_table.setItem(i, 0, id_item)
             
-            # Use well name if available, otherwise use acquisition name
+            # Use same format as main window: well [file_name] or name [file_name]
+            import os
+            file_name = os.path.basename(acq.source_file) if hasattr(acq, 'source_file') and acq.source_file else "Unknown"
             display_name = acq.well if acq.well else acq.name
+            display_name += f" [{file_name}]"
             name_item = QtWidgets.QTableWidgetItem(display_name)
             name_item.setFlags(name_item.flags() & ~Qt.ItemIsEditable)
             # Store well in data role for detection

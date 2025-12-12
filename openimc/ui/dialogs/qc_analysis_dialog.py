@@ -330,9 +330,16 @@ class QCAnalysisDialog(QtWidgets.QDialog):
         self.mode_combo = QtWidgets.QComboBox()
         self.mode_combo.addItems(["Pixel-level", "Cell-level"])
         
-        # Check if masks exist
+        # Check if masks exist and set default mode
         has_masks = self._check_masks_exist()
-        if not has_masks:
+        if has_masks:
+            # Set cell-level as default if masks are available
+            self.mode_combo.setCurrentIndex(1)  # Cell-level
+            self.analysis_mode = "cell"
+        else:
+            # Set pixel-level as default if no masks
+            self.mode_combo.setCurrentIndex(0)  # Pixel-level
+            self.analysis_mode = "pixel"
             self.mode_combo.setItemText(1, "Cell-level (No masks available)")
             self.mode_combo.model().item(1).setEnabled(False)
         
@@ -480,9 +487,11 @@ class QCAnalysisDialog(QtWidgets.QDialog):
             return
         
         for acq in self.parent_window.acquisitions:
-            label = f"{acq.name}"
-            if acq.well:
-                label += f" ({acq.well})"
+            # Use same format as main window: well [file_name] or name [file_name]
+            import os
+            file_name = os.path.basename(acq.source_file) if hasattr(acq, 'source_file') and acq.source_file else "Unknown"
+            label = acq.well if acq.well else acq.name
+            label += f" [{file_name}]"
             self.acq_combo.addItem(label, acq.id)
         
     def _on_mode_changed(self):
@@ -525,19 +534,45 @@ class QCAnalysisDialog(QtWidgets.QDialog):
                 return
             acquisitions = [acq_info]
         
-        # Check if cell-level analysis is requested but no masks available
+        # For cell-level analysis, filter out acquisitions without masks
         if self.analysis_mode == "cell":
-            missing_masks = []
+            acquisitions_with_masks = []
+            acquisitions_without_masks = []
             for acq in acquisitions:
-                if acq.id not in self.parent_window.segmentation_masks:
-                    missing_masks.append(acq.name)
-            if missing_masks:
+                if acq.id in self.parent_window.segmentation_masks:
+                    acquisitions_with_masks.append(acq)
+                else:
+                    acquisitions_without_masks.append(acq)
+            
+            if not acquisitions_with_masks:
                 QtWidgets.QMessageBox.warning(
                     self,
                     "No Masks Available",
-                    f"Segmentation masks not found for: {', '.join(missing_masks)}. Please segment cells first."
+                    "No segmentation masks found for the selected acquisition(s).\n"
+                    "Please segment cells first before running cell-level QC analysis."
                 )
                 return
+            
+            if acquisitions_without_masks:
+                # Show informative message about which acquisitions will be skipped
+                skipped_names = [acq.well if acq.well else acq.name for acq in acquisitions_without_masks]
+                if len(skipped_names) == 1:
+                    skipped_msg = f"Acquisition '{skipped_names[0]}' will be skipped (no mask available)."
+                else:
+                    skipped_msg = f"{len(skipped_names)} acquisitions will be skipped (no masks available): {', '.join(skipped_names[:5])}"
+                    if len(skipped_names) > 5:
+                        skipped_msg += f" and {len(skipped_names) - 5} more"
+                
+                QtWidgets.QMessageBox.information(
+                    self,
+                    "Cell-Level QC Analysis",
+                    f"Cell-level QC analysis will only process acquisitions with segmentation masks.\n\n"
+                    f"{skipped_msg}\n\n"
+                    f"Processing {len(acquisitions_with_masks)} acquisition(s) with masks."
+                )
+            
+            # Use only acquisitions with masks
+            acquisitions = acquisitions_with_masks
         
         # Get number of workers
         num_workers = self.workers_spin.value()
@@ -634,7 +669,7 @@ class QCAnalysisDialog(QtWidgets.QDialog):
             total_tasks = len(tasks)
             total_channels = sum(len(acq_info.channels) for acq_info in acquisitions if acq_info.channels)
             
-            # Use ProcessPoolExecutor for true parallelization
+            # Use multiprocessing for true parallelization
             # Use spawn method to ensure isolation from other multiprocessing operations
             if num_workers > 1 and total_tasks > 1:
                 ctx = mp.get_context('spawn')  # Use spawn to avoid conflicts with feature extraction
@@ -645,87 +680,93 @@ class QCAnalysisDialog(QtWidgets.QDialog):
                         future = pool.apply_async(_qc_process_acquisition_worker, (task,))
                         futures.append(future)
                     
-                    # Collect results as they complete (for better progress updates)
+                    # Collect results more efficiently - use get() with timeout instead of busy-waiting
                     completed = 0
-                    processed_futures = set()
                     channels_processed = 0
                     
-                    while completed < total_tasks:
-                        # Check each future to see if it's ready
-                        for i, future in enumerate(futures):
-                            if i in processed_futures:
-                                continue
-                            
-                            # Check if ready (non-blocking)
-                            if future.ready():
-                                try:
-                                    acquisition_results = future.get(timeout=0.1)
-                                    print(f"[QC DEBUG] Got results from task {i}: {len(acquisition_results) if acquisition_results else 0} results")
-                                    if acquisition_results:
-                                        results.extend(acquisition_results)
-                                        channels_processed += len(acquisition_results)
-                                        print(f"[QC DEBUG] Total results so far: {len(results)}")
-                                    else:
-                                        print(f"[QC DEBUG] WARNING: Task {i} returned no results")
-                                    completed += 1
-                                    processed_futures.add(i)
-                                    
-                                    # Update progress immediately
-                                    progress = int((completed / total_tasks) * 100)
-                                    progress_dlg.update_progress(
-                                        progress,
-                                        f"Processing {num_workers} acquisitions in parallel...",
-                                        f"Processed {completed}/{total_tasks} acquisitions ({channels_processed} channels)"
-                                    )
-                                    QtWidgets.QApplication.processEvents()
-                                except Exception as e:
-                                    # Handle errors
-                                    print(f"[QC DEBUG] ERROR getting results from task {i}: {e}")
-                                    import traceback
-                                    traceback.print_exc()
-                                    completed += 1
-                                    processed_futures.add(i)
-                                    progress = int((completed / total_tasks) * 100)
-                                    progress_dlg.update_progress(
-                                        progress,
-                                        f"Processing {num_workers} acquisitions in parallel...",
-                                        f"Processed {completed}/{total_tasks} acquisitions..."
-                                    )
-                                    QtWidgets.QApplication.processEvents()
+                    # Process futures in order, but with timeout to allow UI updates
+                    for i, future in enumerate(futures):
+                        if progress_dlg.is_cancelled():
+                            pool.terminate()
+                            pool.join()
+                            break
                         
-                        # Small delay to avoid busy-waiting and allow UI to update
-                        if completed < total_tasks:
-                            QtCore.QThread.msleep(50)  # 50ms delay for smoother UI updates
+                        try:
+                            # Get result with timeout - this blocks until ready or timeout
+                            # Use a reasonable timeout (30 seconds per acquisition)
+                            acquisition_results = future.get(timeout=30)
+                            print(f"[QC DEBUG] Got results from task {i}: {len(acquisition_results) if acquisition_results else 0} results")
+                            if acquisition_results:
+                                results.extend(acquisition_results)
+                                channels_processed += len(acquisition_results)
+                                print(f"[QC DEBUG] Total results so far: {len(results)}")
+                            else:
+                                print(f"[QC DEBUG] WARNING: Task {i} returned no results")
+                            completed += 1
+                            
+                            # Update progress immediately
+                            progress = int((completed / total_tasks) * 100)
+                            progress_dlg.update_progress(
+                                progress,
+                                f"Processing {num_workers} acquisitions in parallel...",
+                                f"Processed {completed}/{total_tasks} acquisitions ({channels_processed} channels)"
+                            )
+                            QtWidgets.QApplication.processEvents()
+                        except mp.TimeoutError:
+                            # Timeout - task is taking too long, skip for now and collect later
+                            print(f"[QC DEBUG] WARNING: Task {i} timed out, will collect later")
+                            continue
+                        except Exception as e:
+                            # Handle errors
+                            print(f"[QC DEBUG] ERROR getting results from task {i}: {e}")
+                            import traceback
+                            traceback.print_exc()
+                            completed += 1
+                            progress = int((completed / total_tasks) * 100)
+                            progress_dlg.update_progress(
+                                progress,
+                                f"Processing {num_workers} acquisitions in parallel...",
+                                f"Processed {completed}/{total_tasks} acquisitions..."
+                            )
                             QtWidgets.QApplication.processEvents()
                     
-                    # Final update to ensure all are processed
+                    # Collect any remaining results that timed out or weren't collected
                     if completed < total_tasks:
-                        # Collect any remaining results
                         for i, future in enumerate(futures):
-                            if i not in processed_futures:
-                                try:
-                                    acquisition_results = future.get(timeout=5)
-                                    if acquisition_results:
-                                        results.extend(acquisition_results)
-                                        channels_processed += len(acquisition_results)
-                                    completed += 1
-                                except Exception:
-                                    completed += 1
-                        
-                        # Final progress update
-                        progress_dlg.update_progress(
-                            100,
-                            f"Processing {num_workers} acquisitions in parallel...",
-                            f"Processed {completed}/{total_tasks} acquisitions ({channels_processed} channels)"
-                        )
-                        QtWidgets.QApplication.processEvents()
-                    else:
-                        progress_dlg.update_progress(
-                            100,
-                            f"Processing {num_workers} acquisitions in parallel...",
-                            f"Processed {completed}/{total_tasks} acquisitions ({channels_processed} channels)"
-                        )
-                        QtWidgets.QApplication.processEvents()
+                            if i < completed:  # Already processed
+                                continue
+                            try:
+                                acquisition_results = future.get(timeout=60)  # Longer timeout for remaining tasks
+                                if acquisition_results:
+                                    results.extend(acquisition_results)
+                                    channels_processed += len(acquisition_results)
+                                completed += 1
+                                
+                                # Update progress
+                                progress = int((completed / total_tasks) * 100)
+                                progress_dlg.update_progress(
+                                    progress,
+                                    f"Processing {num_workers} acquisitions in parallel...",
+                                    f"Processed {completed}/{total_tasks} acquisitions ({channels_processed} channels)"
+                                )
+                                QtWidgets.QApplication.processEvents()
+                            except Exception:
+                                completed += 1
+                                progress = int((completed / total_tasks) * 100)
+                                progress_dlg.update_progress(
+                                    progress,
+                                    f"Processing {num_workers} acquisitions in parallel...",
+                                    f"Processed {completed}/{total_tasks} acquisitions..."
+                                )
+                                QtWidgets.QApplication.processEvents()
+                    
+                    # Final progress update
+                    progress_dlg.update_progress(
+                        100,
+                        f"Processing {num_workers} acquisitions in parallel...",
+                        f"Processed {completed}/{total_tasks} acquisitions ({channels_processed} channels)"
+                    )
+                    QtWidgets.QApplication.processEvents()
             else:
                 # Single-threaded processing
                 channels_processed = 0

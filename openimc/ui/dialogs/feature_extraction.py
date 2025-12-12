@@ -481,14 +481,11 @@ class FeatureExtractionDialog(QtWidgets.QDialog):
         self.acq_list.clear()
         for acq in self.acquisitions:
             if acq.id in self.segmentation_masks:
-                # Show source file name if available
+                # Use same format as main window: well [file_name] or name [file_name]
                 import os
-                file_name = os.path.basename(acq.source_file) if hasattr(acq, 'source_file') and acq.source_file else None
-                label = f"{acq.name}"
-                if acq.well:
-                    label += f" (Well: {acq.well})"
-                if file_name:
-                    label += f" [{file_name}]"
+                file_name = os.path.basename(acq.source_file) if hasattr(acq, 'source_file') and acq.source_file else "Unknown"
+                label = acq.well if acq.well else acq.name
+                label += f" [{file_name}]"
                 item = QtWidgets.QListWidgetItem(label)
                 item.setData(Qt.UserRole, acq.id)
                 self.acq_list.addItem(item)

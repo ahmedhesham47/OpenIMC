@@ -51,7 +51,8 @@ class DynamicComparisonDialog(QtWidgets.QDialog):
         self.resize(int(screen.width() * 0.8), int(screen.height() * 0.8))
         
         self.acqs = acqs
-        self.loader = loader
+        self.loader = loader  # Keep for backward compatibility (single file case)
+        self.parent_window = parent  # Store parent window to access loader methods for multiple files
         self.selected_acquisitions = []
         self.current_channel = None
         
@@ -84,6 +85,22 @@ class DynamicComparisonDialog(QtWidgets.QDialog):
         
         # Start with empty selection - user must select acquisitions of interest
 
+    def _get_loader_for_acquisition(self, acq_id: str):
+        """Get the appropriate loader for a given acquisition ID (handles multiple .mcd files)."""
+        if self.parent_window and hasattr(self.parent_window, '_get_loader_for_acquisition'):
+            loader = self.parent_window._get_loader_for_acquisition(acq_id)
+            if loader is not None:
+                return loader
+        # Fallback to single loader (for single file case)
+        return self.loader
+    
+    def _get_original_acq_id(self, acq_id: str) -> str:
+        """Get the original acquisition ID from a unique ID (for multi-file support)."""
+        if self.parent_window and hasattr(self.parent_window, '_get_original_acq_id'):
+            return self.parent_window._get_original_acq_id(acq_id)
+        # Fallback: return as-is (for single file case)
+        return acq_id
+
     def _create_ui(self):
         layout = QtWidgets.QVBoxLayout(self)
         
@@ -107,7 +124,11 @@ class DynamicComparisonDialog(QtWidgets.QDialog):
         self.available_acq_list = QtWidgets.QListWidget()
         self.available_acq_list.setMaximumHeight(120)
         for ai in self.acqs:
-            label = f"{ai.name}" + (f" ({ai.well})" if ai.well else "")
+            # Use same format as main window: well [file_name] or name [file_name]
+            import os
+            file_name = os.path.basename(ai.source_file) if hasattr(ai, 'source_file') and ai.source_file else "Unknown"
+            label = ai.well if ai.well else ai.name
+            label += f" [{file_name}]"
             item = QtWidgets.QListWidgetItem(label)
             item.setData(Qt.UserRole, ai.id)
             self.available_acq_list.addItem(item)
@@ -449,7 +470,12 @@ class DynamicComparisonDialog(QtWidgets.QDialog):
                         key = (acq, ch_name)
                         if key in self.image_cache:
                             return self.image_cache[key]
-                        arr = self.loader.get_image(acq, ch_name)
+                        # Get correct loader and original acquisition ID for multiple .mcd files
+                        loader = self._get_loader_for_acquisition(acq)
+                        original_acq_id = self._get_original_acq_id(acq)
+                        if loader is None:
+                            return None
+                        arr = loader.get_image(original_acq_id, ch_name)
                         self.image_cache[key] = arr
                         self._manage_cache_size()
                         return arr
@@ -486,7 +512,12 @@ class DynamicComparisonDialog(QtWidgets.QDialog):
                                 else:
                                     # compute global across selected acquisitions for this channel
                                     try:
-                                        imgs = [self.loader.get_image(aq, channel_name) for aq in self.selected_acquisitions]
+                                        imgs = []
+                                        for aq in self.selected_acquisitions:
+                                            loader = self._get_loader_for_acquisition(aq)
+                                            original_acq_id = self._get_original_acq_id(aq)
+                                            if loader is not None:
+                                                imgs.append(loader.get_image(original_acq_id, channel_name))
                                         selected_scaling_channel = self.scaling_channel_combo.currentText()
                                         # Only apply arcsinh if this is the selected scaling channel and arcsinh is enabled
                                         if self.arcsinh_chk.isChecked() and channel_name == selected_scaling_channel and not link_contrast:
@@ -604,7 +635,12 @@ class DynamicComparisonDialog(QtWidgets.QDialog):
                                     else:
                                         # Calculate global range for this channel
                                         try:
-                                            imgs = [self.loader.get_image(aq, channel_name) for aq in self.selected_acquisitions]
+                                            imgs = []
+                                            for aq in self.selected_acquisitions:
+                                                loader = self._get_loader_for_acquisition(aq)
+                                                original_acq_id = self._get_original_acq_id(aq)
+                                                if loader is not None:
+                                                    imgs.append(loader.get_image(original_acq_id, channel_name))
                                             # Don't apply arcsinh to non-selected channels
                                             ch_min = float(min(np.min(im) for im in imgs))
                                             ch_max = float(max(np.max(im) for im in imgs))
@@ -673,7 +709,12 @@ class DynamicComparisonDialog(QtWidgets.QDialog):
                     if key in self.image_cache:
                         img = self.image_cache[key]
                     else:
-                        img = self.loader.get_image(acq_id, channel)
+                        # Get correct loader and original acquisition ID for multiple .mcd files
+                        loader = self._get_loader_for_acquisition(acq_id)
+                        original_acq_id = self._get_original_acq_id(acq_id)
+                        if loader is None:
+                            continue
+                        img = loader.get_image(original_acq_id, channel)
                         self.image_cache[key] = img
                         self._manage_cache_size()
                     images.append(img)
@@ -951,16 +992,16 @@ class DynamicComparisonDialog(QtWidgets.QDialog):
                 del self.image_cache[key]
     
     def _get_acquisition_subtitle(self, acq_id: str) -> str:
-        """Get acquisition subtitle showing well/description instead of acquisition number."""
+        """Get acquisition subtitle showing well/description and file name."""
         acq_info = next((ai for ai in self.acqs if ai.id == acq_id), None)
         if not acq_info:
             return "Unknown"
         
-        # Use well if available, otherwise use name (which might be more descriptive)
-        if acq_info.well:
-            return f"{acq_info.well}"
-        else:
-            return acq_info.name
+        # Use same format as main window: well [file_name] or name [file_name]
+        import os
+        file_name = os.path.basename(acq_info.source_file) if hasattr(acq_info, 'source_file') and acq_info.source_file else "Unknown"
+        label = acq_info.well if acq_info.well else acq_info.name
+        return f"{label} [{file_name}]"
 
     def _on_comparison_scaling_toggled(self):
         """Handle custom scaling checkbox toggle in comparison mode."""
@@ -996,7 +1037,12 @@ class DynamicComparisonDialog(QtWidgets.QDialog):
             else:
                 # compute from current selection
                 try:
-                    imgs = [self.loader.get_image(aq, ch) for aq in self.selected_acquisitions]
+                    imgs = []
+                    for aq in self.selected_acquisitions:
+                        loader = self._get_loader_for_acquisition(aq)
+                        original_acq_id = self._get_original_acq_id(aq)
+                        if loader is not None:
+                            imgs.append(loader.get_image(original_acq_id, ch))
                     # Only apply arcsinh to the currently selected scaling channel
                     if self.arcsinh_chk.isChecked() and ch == self.scaling_channel_combo.currentText():
                         imgs = [arcsinh_normalize(im, self.arcsinh_cofactor.value()) for im in imgs]
@@ -1097,7 +1143,12 @@ class DynamicComparisonDialog(QtWidgets.QDialog):
                     return
                 
                 # Get all images for this channel
-                imgs = [self.loader.get_image(aq, channel) for aq in self.selected_acquisitions]
+                imgs = []
+                for aq in self.selected_acquisitions:
+                    loader = self._get_loader_for_acquisition(aq)
+                    original_acq_id = self._get_original_acq_id(aq)
+                    if loader is not None:
+                        imgs.append(loader.get_image(original_acq_id, channel))
                 # Apply arcsinh to get the transformed range
                 transformed_imgs = [arcsinh_normalize(im, self.arcsinh_cofactor.value()) for im in imgs]
                 vmin = float(min(np.min(im) for im in transformed_imgs))
@@ -1123,7 +1174,11 @@ class DynamicComparisonDialog(QtWidgets.QDialog):
                     return
                 
                 # Get image for this acquisition and channel
-                img = self.loader.get_image(current_acq_id, channel)
+                loader = self._get_loader_for_acquisition(current_acq_id)
+                original_acq_id = self._get_original_acq_id(current_acq_id)
+                if loader is None:
+                    return
+                img = loader.get_image(original_acq_id, channel)
                 # Apply arcsinh to get the transformed range
                 transformed_img = arcsinh_normalize(img, self.arcsinh_cofactor.value())
                 vmin = float(np.min(transformed_img))
@@ -1157,7 +1212,12 @@ class DynamicComparisonDialog(QtWidgets.QDialog):
                     return
                 
                 # Get all images for this channel (without arcsinh transformation)
-                imgs = [self.loader.get_image(aq, channel) for aq in self.selected_acquisitions]
+                imgs = []
+                for aq in self.selected_acquisitions:
+                    loader = self._get_loader_for_acquisition(aq)
+                    original_acq_id = self._get_original_acq_id(aq)
+                    if loader is not None:
+                        imgs.append(loader.get_image(original_acq_id, channel))
                 vmin = float(min(np.min(im) for im in imgs))
                 vmax = float(max(np.max(im) for im in imgs))
                 
@@ -1177,7 +1237,11 @@ class DynamicComparisonDialog(QtWidgets.QDialog):
                     return
                 
                 # Get image for this acquisition and channel (without arcsinh transformation)
-                img = self.loader.get_image(current_acq_id, channel)
+                loader = self._get_loader_for_acquisition(current_acq_id)
+                original_acq_id = self._get_original_acq_id(current_acq_id)
+                if loader is None:
+                    return
+                img = loader.get_image(original_acq_id, channel)
                 vmin = float(np.min(img))
                 vmax = float(np.max(img))
                 
@@ -1230,8 +1294,11 @@ class DynamicComparisonDialog(QtWidgets.QDialog):
             # Get all images to determine range
             images = []
             for acq_id in self.selected_acquisitions:
-                img = self.loader.get_image(acq_id, channel)
-                images.append(img)
+                loader = self._get_loader_for_acquisition(acq_id)
+                original_acq_id = self._get_original_acq_id(acq_id)
+                if loader is not None:
+                    img = loader.get_image(original_acq_id, channel)
+                    images.append(img)
             
             if images:
                 # Calculate global range across all images
@@ -1255,8 +1322,11 @@ class DynamicComparisonDialog(QtWidgets.QDialog):
             try:
                 images = []
                 for acq_id in self.selected_acquisitions:
-                    img = self.loader.get_image(acq_id, channel)
-                    images.append(img)
+                    loader = self._get_loader_for_acquisition(acq_id)
+                    original_acq_id = self._get_original_acq_id(acq_id)
+                    if loader is not None:
+                        img = loader.get_image(original_acq_id, channel)
+                        images.append(img)
                 
                 if images:
                     all_pixels = np.concatenate([img.flatten() for img in images])
@@ -1274,7 +1344,11 @@ class DynamicComparisonDialog(QtWidgets.QDialog):
                 return
             
             try:
-                img = self.loader.get_image(current_acq_id, channel)
+                loader = self._get_loader_for_acquisition(current_acq_id)
+                original_acq_id = self._get_original_acq_id(current_acq_id)
+                if loader is None:
+                    return
+                img = loader.get_image(original_acq_id, channel)
                 min_val = float(np.percentile(img, 1))
                 max_val = float(np.percentile(img, 99))
                 
@@ -1295,8 +1369,11 @@ class DynamicComparisonDialog(QtWidgets.QDialog):
             try:
                 images = []
                 for acq_id in self.selected_acquisitions:
-                    img = self.loader.get_image(acq_id, channel)
-                    images.append(img)
+                    loader = self._get_loader_for_acquisition(acq_id)
+                    original_acq_id = self._get_original_acq_id(acq_id)
+                    if loader is not None:
+                        img = loader.get_image(original_acq_id, channel)
+                        images.append(img)
                 
                 if images:
                     global_min = min(np.min(img) for img in images)
@@ -1313,7 +1390,11 @@ class DynamicComparisonDialog(QtWidgets.QDialog):
                 return
             
             try:
-                img = self.loader.get_image(current_acq_id, channel)
+                loader = self._get_loader_for_acquisition(current_acq_id)
+                original_acq_id = self._get_original_acq_id(current_acq_id)
+                if loader is None:
+                    return
+                img = loader.get_image(original_acq_id, channel)
                 min_val = float(np.min(img))
                 max_val = float(np.max(img))
                 
@@ -1383,7 +1464,11 @@ class DynamicComparisonDialog(QtWidgets.QDialog):
         for acq_id in self.selected_acquisitions:
             acq_info = next((ai for ai in self.acqs if ai.id == acq_id), None)
             if acq_info:
-                label = f"{acq_info.name}" + (f" ({acq_info.well})" if acq_info.well else "")
+                # Use same format as main window: well [file_name] or name [file_name]
+                import os
+                file_name = os.path.basename(acq_info.source_file) if hasattr(acq_info, 'source_file') and acq_info.source_file else "Unknown"
+                label = acq_info.well if acq_info.well else acq_info.name
+                label += f" [{file_name}]"
                 self.image_combo.addItem(label, acq_id)
         
         # Select first image if available
@@ -1425,7 +1510,11 @@ class DynamicComparisonDialog(QtWidgets.QDialog):
             # Use default range (image's own min/max)
             try:
                 channel = ch
-                img = self.loader.get_image(current_acq_id, channel)
+                loader = self._get_loader_for_acquisition(current_acq_id)
+                original_acq_id = self._get_original_acq_id(current_acq_id)
+                if loader is None:
+                    return
+                img = loader.get_image(original_acq_id, channel)
                 min_val = float(np.min(img))
                 max_val = float(np.max(img))
             except Exception as e:
@@ -1488,7 +1577,12 @@ class DynamicComparisonDialog(QtWidgets.QDialog):
                 ai = next((a for a in self.acqs if a.id == acq_id), None)
                 channels = ai.channels if ai else []
                 # Load all channels at once for this acquisition
-                stack = self.loader.get_all_channels(acq_id)
+                # Get correct loader and original acquisition ID for multiple .mcd files
+                loader = self._get_loader_for_acquisition(acq_id)
+                original_acq_id = self._get_original_acq_id(acq_id)
+                if loader is None:
+                    continue
+                stack = loader.get_all_channels(original_acq_id)
                 for idx, ch_name in enumerate(channels):
                     try:
                         self.image_cache[(acq_id, ch_name)] = stack[..., idx]

@@ -871,12 +871,10 @@ class DeconvolutionDialog(QtWidgets.QDialog):
             return
         
         for acq in self.acquisitions:
-            # Build display name
-            display_name = acq.name
-            if hasattr(acq, 'well') and acq.well:
-                display_name = f"{acq.well} - {acq.name}"
-            if hasattr(acq, 'source_file') and acq.source_file:
-                display_name += f" ({os.path.basename(acq.source_file)})"
+            # Use same format as main window: well [file_name] or name [file_name]
+            file_name = os.path.basename(acq.source_file) if hasattr(acq, 'source_file') and acq.source_file else "Unknown"
+            display_name = acq.well if (hasattr(acq, 'well') and acq.well) else acq.name
+            display_name += f" [{file_name}]"
             
             item = QtWidgets.QListWidgetItem(display_name)
             item.setData(QtCore.Qt.UserRole, acq.id)
