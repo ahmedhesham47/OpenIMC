@@ -9880,6 +9880,9 @@ class MainWindow(QtWidgets.QMainWindow):
         if hasattr(dlg, 'patient_annotation_map') and dlg.patient_annotation_map:
             state["patient_annotation_map"] = dlg.patient_annotation_map
         
+        if hasattr(dlg, 'patient_cohort_map') and dlg.patient_cohort_map:
+            state["patient_cohort_map"] = dlg.patient_cohort_map
+        
         if hasattr(dlg, 'cluster_backend_names') and dlg.cluster_backend_names:
             state["cluster_backend_names"] = dlg.cluster_backend_names
         
@@ -10400,6 +10403,10 @@ class MainWindow(QtWidgets.QMainWindow):
             if "patient_annotation_map" in state and state["patient_annotation_map"]:
                 if hasattr(dialog, 'patient_annotation_map'):
                     dialog.patient_annotation_map = state["patient_annotation_map"]
+            
+            if "patient_cohort_map" in state and state["patient_cohort_map"]:
+                if hasattr(dialog, 'patient_cohort_map'):
+                    dialog.patient_cohort_map = state["patient_cohort_map"]
             
             if "cluster_backend_names" in state and state["cluster_backend_names"]:
                 if hasattr(dialog, 'cluster_backend_names'):

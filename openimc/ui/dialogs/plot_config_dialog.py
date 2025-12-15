@@ -722,9 +722,9 @@ class PlotConfigDialog(QtWidgets.QDialog):
         # Populate column combo directly from dataframe
         self.patient_annotation_column_combo.clear()
         if hasattr(self.parent_dialog, 'feature_dataframe') and self.parent_dialog.feature_dataframe is not None:
-            # Priority order: source_file, batch_group, source_well, then metadata columns
+            # Priority order: source_file, batch_group, source_well, cohort, then metadata columns
             available_columns = []
-            for col in ['source_file', 'batch_group', 'source_well']:
+            for col in ['source_file', 'batch_group', 'source_well', 'cohort']:
                 if col in self.parent_dialog.feature_dataframe.columns:
                     available_columns.append(col)
             
@@ -840,7 +840,7 @@ class PlotConfigDialog(QtWidgets.QDialog):
             # Check if parent dialog has patient annotation columns
             if hasattr(self.parent_dialog, 'feature_dataframe') and self.parent_dialog.feature_dataframe is not None:
                 # Check for standard columns
-                for col in ['source_file', 'batch_group', 'source_well']:
+                for col in ['source_file', 'batch_group', 'source_well', 'cohort']:
                     if col in self.parent_dialog.feature_dataframe.columns:
                         has_patient_col = True
                         break

@@ -128,9 +128,9 @@ def _get_vivid_colors(n):
 
 def _get_patient_colors(n):
     """
-    Generate n distinct colors for patient/source annotation.
-    Uses a different color palette than clusters (Set3, Pastel1, Pastel2) to ensure
-    patient annotations are visually distinct from cluster colors.
+    Generate n distinct high-contrast colors for patient/source annotation.
+    Uses vibrant, high-contrast color palettes to ensure patient annotations
+    are visually distinct and easily distinguishable.
     
     Args:
         n: Number of colors needed
@@ -140,32 +140,40 @@ def _get_patient_colors(n):
     """
     colors = []
     
-    # Use Set3, Pastel1, Pastel2 for first 36 colors (different from tab20 used for clusters)
-    if n <= 12:
-        colors = plt.cm.Set3(np.linspace(0, 1, n))
-    elif n <= 24:
+    # Use high-contrast color palettes: tab20, tab20c, Set1, Set2, Dark2
+    # These provide much better contrast than pastel colors
+    if n <= 20:
+        # tab20 provides 20 high-contrast colors
+        colors = plt.cm.tab20(np.linspace(0, 1, n))
+    elif n <= 40:
+        # Combine tab20 and tab20c for 40 colors
         colors = np.vstack([
-            plt.cm.Set3(np.linspace(0, 1, 12)),
-            plt.cm.Pastel1(np.linspace(0, 1, n - 12))
+            plt.cm.tab20(np.linspace(0, 1, 20)),
+            plt.cm.tab20c(np.linspace(0, 1, n - 20))
         ])
-    elif n <= 36:
+    elif n <= 56:
+        # Add Set1 (9 colors) and Set2 (8 colors) for more variety
         colors = np.vstack([
-            plt.cm.Set3(np.linspace(0, 1, 12)),
-            plt.cm.Pastel1(np.linspace(0, 1, 9)),
-            plt.cm.Pastel2(np.linspace(0, 1, n - 21))
+            plt.cm.tab20(np.linspace(0, 1, 20)),
+            plt.cm.tab20c(np.linspace(0, 1, 20)),
+            plt.cm.Set1(np.linspace(0, 1, min(9, n - 40))),
+            plt.cm.Set2(np.linspace(0, 1, min(8, max(0, n - 49))))
         ])
     else:
-        # For more than 36 colors, use Set3/Pastel series + hsv for the rest
+        # For more than 56 colors, use all available high-contrast palettes + hsv
         colors = np.vstack([
-            plt.cm.Set3(np.linspace(0, 1, 12)),
-            plt.cm.Pastel1(np.linspace(0, 1, 9)),
-            plt.cm.Pastel2(np.linspace(0, 1, 8))
+            plt.cm.tab20(np.linspace(0, 1, 20)),
+            plt.cm.tab20c(np.linspace(0, 1, 20)),
+            plt.cm.Set1(np.linspace(0, 1, 9)),
+            plt.cm.Set2(np.linspace(0, 1, 8)),
+            plt.cm.Dark2(np.linspace(0, 1, 8))
         ])
-        # Use hsv colormap for additional colors, with different range than cluster colors
-        remaining = n - 29
-        # Use a different hue range to ensure distinction from cluster colors
-        hsv_colors = plt.cm.hsv(np.linspace(0.15, 0.85, remaining))
-        colors = np.vstack([colors, hsv_colors])
+        # Use hsv colormap for additional colors with high saturation
+        remaining = n - 65
+        if remaining > 0:
+            # Use full saturation HSV colors for maximum contrast
+            hsv_colors = plt.cm.hsv(np.linspace(0, 1, remaining))
+            colors = np.vstack([colors, hsv_colors])
     
     return colors
 
@@ -205,13 +213,16 @@ class CellClusteringDialog(QtWidgets.QDialog):
         self.original_cluster_assignments = None  # Store original cluster assignments before merging
         self.clustering_scaling_method = None  # Store scaling method used for clustering
         self.patient_annotation_map = {}  # Store custom patient/source file labels
+        self.patient_cohort_map = {}  # Store patient -> cohort mapping (e.g., {'patient1': 'cohort_A', 'patient2': 'cohort_A'})
+        self.cohort_colors = {}  # Store cohort -> color mapping (will be auto-generated)
+        self.use_cohort_coloring = False  # Toggle for using cohort coloring vs individual coloring
         self.feature_label_map = {}  # Store custom feature labels for y-axis ticks (friendly names)
         self.patient_legend_label = 'Patient/Source'  # Custom label for patient annotation legend
         # Initialize patient annotation column with default priority (source_file, batch_group, source_well, then metadata columns)
         self.patient_annotation_column = None
         if self.feature_dataframe is not None:
             # First check standard columns
-            for col in ['source_file', 'batch_group', 'source_well']:
+            for col in ['source_file', 'batch_group', 'source_well', 'cohort']:
                 if col in self.feature_dataframe.columns:
                     self.patient_annotation_column = col
                     break
@@ -248,6 +259,10 @@ class CellClusteringDialog(QtWidgets.QDialog):
         self._setup_plot()
         self._on_clustering_type_changed()  # Initialize UI state
         self._on_leiden_mode_changed()  # Initialize Leiden mode state
+        
+        # Write cohorts to features if they exist (after UI is created so method is available)
+        if self.patient_cohort_map:
+            self._write_cohorts_to_features()
         
         # Check if cluster columns exist and auto-draw heatmap if they do
         self._check_and_auto_draw_heatmap()
@@ -597,6 +612,14 @@ class CellClusteringDialog(QtWidgets.QDialog):
         # Keep combo for backward compatibility but hide it
         self.color_by_combo = QtWidgets.QComboBox()
         self.color_by_combo.setVisible(False)
+        
+        # Cohort coloring toggle (only show if cohorts exist)
+        self.use_cohort_checkbox = QtWidgets.QCheckBox("Use cohort coloring")
+        self.use_cohort_checkbox.setToolTip("When enabled, patients/batch groups assigned to cohorts will share colors. When disabled, each patient/batch group gets its own color.")
+        self.use_cohort_checkbox.setChecked(False)
+        self.use_cohort_checkbox.stateChanged.connect(self._on_cohort_coloring_changed)
+        self.use_cohort_checkbox.setVisible(False)  # Hidden by default, shown when cohorts exist
+        viz_layout.addWidget(self.use_cohort_checkbox)
 
         # Point size control (UMAP/t-SNE only)
         self.point_size_label = QtWidgets.QLabel("Point size:")
@@ -644,9 +667,24 @@ class CellClusteringDialog(QtWidgets.QDialog):
             'acquisition_name', 'well', 'acquisition_id'
         ]
         available_group_cols = [c for c in candidate_cols if c in self.feature_dataframe.columns]
-        # Add source_file explicitly if it exists
-        if 'source_file' in self.feature_dataframe.columns and 'source_file' not in available_group_cols:
-            available_group_cols.insert(0, 'source_file')
+        
+        # Build priority columns list in order (all should be options, not replacements)
+        priority_cols = []
+        if 'source_file' in self.feature_dataframe.columns:
+            priority_cols.append('source_file')
+        if 'batch_group' in self.feature_dataframe.columns:
+            priority_cols.append('batch_group')
+        if 'cohort' in self.feature_dataframe.columns:
+            priority_cols.append('cohort')
+        if 'source_well' in self.feature_dataframe.columns:
+            priority_cols.append('source_well')
+        
+        # Add priority columns at the beginning, avoiding duplicates
+        # Insert in reverse order so they appear in the correct priority order
+        for col in reversed(priority_cols):
+            if col not in available_group_cols:
+                available_group_cols.insert(0, col)
+        
         # Add source_file_acquisition_id if both source_file and acquisition_id exist
         if 'source_file' in self.feature_dataframe.columns and 'acquisition_id' in self.feature_dataframe.columns:
             # Create merged column if it doesn't exist
@@ -2013,7 +2051,7 @@ class CellClusteringDialog(QtWidgets.QDialog):
             patient_col = self.patient_annotation_column
         else:
             # Default priority order
-            for col in ['source_file', 'batch_group', 'source_well']:
+            for col in ['source_file', 'batch_group', 'source_well', 'cohort']:
                 if col in self.feature_dataframe.columns:
                     patient_col = col
                     break
@@ -2202,7 +2240,7 @@ class CellClusteringDialog(QtWidgets.QDialog):
             patient_col = self.patient_annotation_column
         else:
             # Default priority order
-            for col in ['source_file', 'batch_group', 'source_well']:
+            for col in ['source_file', 'batch_group', 'source_well', 'cohort']:
                 if col in data_to_plot.columns:
                     patient_col = col
                     break
@@ -2213,6 +2251,8 @@ class CellClusteringDialog(QtWidgets.QDialog):
         # Prepare patient annotation data if enabled
         patient_values_reordered = None
         patient_color_map = {}
+        cohort_color_map = {}
+        use_cohorts = False
         if show_patient_annotation:
             # Get patient annotation values from selected column and reorder to match column clustering
             patient_values = data_to_plot[patient_col].values
@@ -2221,17 +2261,63 @@ class CellClusteringDialog(QtWidgets.QDialog):
             # Get unique patient values
             unique_patients = sorted([f for f in data_to_plot[patient_col].unique() if pd.notna(f)])
             
-            # Create color mapping for patients (use different palette than clusters)
-            patient_colors_raw = _get_patient_colors(len(unique_patients))
-            for i, patient_file in enumerate(unique_patients):
-                color = patient_colors_raw[i]
-                if len(color) == 4:
-                    rgb = tuple(color[:3])
-                elif len(color) == 3:
-                    rgb = tuple(color)
-                else:
-                    rgb = (color[0], color[1], color[2])
-                patient_color_map[patient_file] = rgb
+            # Check if cohorts are defined and cohort coloring is enabled
+            cohorts_used = set()
+            if self.use_cohort_coloring:
+                for patient in unique_patients:
+                    if patient in self.patient_cohort_map:
+                        cohorts_used.add(self.patient_cohort_map[patient])
+            
+            if cohorts_used:
+                # Use cohort-based coloring
+                use_cohorts = True
+                unique_cohorts = sorted(cohorts_used)
+                
+                # Generate colors for cohorts
+                cohort_colors_raw = _get_patient_colors(len(unique_cohorts))
+                for i, cohort_name in enumerate(unique_cohorts):
+                    color = cohort_colors_raw[i]
+                    if len(color) == 4:
+                        rgb = tuple(color[:3])
+                    elif len(color) == 3:
+                        rgb = tuple(color)
+                    else:
+                        rgb = (color[0], color[1], color[2])
+                    cohort_color_map[cohort_name] = rgb
+                    self.cohort_colors[cohort_name] = rgb
+                
+                # Map patients to cohort colors (or individual colors if not in cohort)
+                unassigned_patients = [p for p in unique_patients if p not in self.patient_cohort_map]
+                if unassigned_patients:
+                    # Generate colors for unassigned patients
+                    unassigned_colors_raw = _get_patient_colors(len(unassigned_patients))
+                    for i, patient_file in enumerate(unassigned_patients):
+                        color = unassigned_colors_raw[i]
+                        if len(color) == 4:
+                            rgb = tuple(color[:3])
+                        elif len(color) == 3:
+                            rgb = tuple(color)
+                        else:
+                            rgb = (color[0], color[1], color[2])
+                        patient_color_map[patient_file] = rgb
+                
+                # Create mapping: patient -> color (via cohort if assigned)
+                for patient_file in unique_patients:
+                    if patient_file in self.patient_cohort_map:
+                        cohort = self.patient_cohort_map[patient_file]
+                        patient_color_map[patient_file] = cohort_color_map[cohort]
+            else:
+                # Use individual patient colors (original behavior)
+                patient_colors_raw = _get_patient_colors(len(unique_patients))
+                for i, patient_file in enumerate(unique_patients):
+                    color = patient_colors_raw[i]
+                    if len(color) == 4:
+                        rgb = tuple(color[:3])
+                    elif len(color) == 3:
+                        rgb = tuple(color)
+                    else:
+                        rgb = (color[0], color[1], color[2])
+                    patient_color_map[patient_file] = rgb
             
             # Create reordered patient colors for annotation bar
             patient_colors_rgb = [patient_color_map.get(val, (0.8, 0.8, 0.8)) for val in patient_values_reordered]
@@ -2378,17 +2464,42 @@ class CellClusteringDialog(QtWidgets.QDialog):
             ax_patient_legend.axis('off')
             if show_legend:
                 patient_legend_elements = []
-                for patient_file in sorted(patient_color_map.keys()):
-                    color = patient_color_map[patient_file]
-                    # Use custom patient label (helper function handles custom labels and defaults)
-                    label = self._get_patient_display_name(patient_file)
-                    patient_legend_elements.append(plt.Rectangle((0,0),1,1, facecolor=color, label=label, edgecolor='black', linewidth=0.5))
+                if use_cohorts and cohort_color_map:
+                    # Show cohorts in legend instead of individual patients
+                    for cohort_name in sorted(cohort_color_map.keys()):
+                        color = cohort_color_map[cohort_name]
+                        # Get list of patients in this cohort for display
+                        patients_in_cohort = [p for p in unique_patients if p in self.patient_cohort_map and self.patient_cohort_map[p] == cohort_name]
+                        if patients_in_cohort:
+                            # Show cohort name with patient count or list
+                            if len(patients_in_cohort) <= 3:
+                                patient_labels = [self._get_patient_display_name(p) for p in patients_in_cohort]
+                                label = f"{cohort_name} ({', '.join(patient_labels)})"
+                            else:
+                                label = f"{cohort_name} ({len(patients_in_cohort)} patients)"
+                            patient_legend_elements.append(plt.Rectangle((0,0),1,1, facecolor=color, label=label, edgecolor='black', linewidth=0.5))
+                    
+                    # Also show unassigned patients if any
+                    unassigned_patients = [p for p in unique_patients if p not in self.patient_cohort_map]
+                    for patient_file in sorted(unassigned_patients):
+                        if patient_file in patient_color_map:
+                            color = patient_color_map[patient_file]
+                            label = self._get_patient_display_name(patient_file)
+                            patient_legend_elements.append(plt.Rectangle((0,0),1,1, facecolor=color, label=label, edgecolor='black', linewidth=0.5))
+                else:
+                    # Show individual patients (original behavior)
+                    for patient_file in sorted(patient_color_map.keys()):
+                        color = patient_color_map[patient_file]
+                        # Use custom patient label (helper function handles custom labels and defaults)
+                        label = self._get_patient_display_name(patient_file)
+                        patient_legend_elements.append(plt.Rectangle((0,0),1,1, facecolor=color, label=label, edgecolor='black', linewidth=0.5))
                 
                 if patient_legend_elements:
                     # Use configurable legend font size
                     legend_fontsize = getattr(self, 'legend_fontsize', 8)
+                    legend_title = 'Cohorts' if use_cohorts and cohort_color_map else self.patient_legend_label
                     ax_patient_legend.legend(handles=patient_legend_elements, loc='upper left', frameon=True, fontsize=legend_fontsize, 
-                                            title=self.patient_legend_label, title_fontsize=legend_fontsize + 1)
+                                            title=legend_title, title_fontsize=legend_fontsize + 1)
             
             # Cluster legend below
             ax_cluster_legend = self.figure.add_subplot(legend_gs[1])
@@ -3599,36 +3710,250 @@ class CellClusteringDialog(QtWidgets.QDialog):
                 source_files = self.feature_dataframe['source_file'].values[valid_mask]
             unique_files = sorted([f for f in np.unique(source_files) if pd.notna(f)])
             if len(unique_files) > 0:
-                # Use patient colors palette (different from cluster colors)
-                patient_colors_raw = _get_patient_colors(len(unique_files))
-                file_color_map = {file_name: patient_colors_raw[i] for i, file_name in enumerate(unique_files)}
-                handles = []
-                labels = []
-                for file_name in unique_files:
-                    mask = source_files == file_name
-                    if np.any(mask):  # Only add if there are points for this file
-                        sc = ax.scatter(tsne_embedding_filtered[mask, 0], tsne_embedding_filtered[mask, 1],
-                                        c=[file_color_map[file_name]],
-                                        alpha=point_alpha, s=point_size, edgecolors='none')
-                        # Create custom legend handle with fixed size
-                        color = file_color_map[file_name]
+                # Check if cohorts are defined and cohort coloring is enabled
+                cohorts_used = set()
+                if self.use_cohort_coloring:
+                    for file_name in unique_files:
+                        if file_name in self.patient_cohort_map:
+                            cohorts_used.add(self.patient_cohort_map[file_name])
+                
+                if cohorts_used:
+                    # Use cohort-based coloring
+                    unique_cohorts = sorted(cohorts_used)
+                    cohort_colors_raw = _get_patient_colors(len(unique_cohorts))
+                    cohort_color_map = {}
+                    for i, cohort_name in enumerate(unique_cohorts):
+                        color = cohort_colors_raw[i]
                         if len(color) == 4:
                             rgb = tuple(color[:3])
                         elif len(color) == 3:
                             rgb = tuple(color)
                         else:
                             rgb = (color[0], color[1], color[2])
-                        handle = Line2D([0], [0], marker='o', color='none', markerfacecolor=rgb,
-                                       markeredgecolor='none', markersize=6, alpha=point_alpha)
-                        handles.append(handle)
-                        # Use custom patient label if available
-                        labels.append(self._get_patient_display_name(file_name))
+                        cohort_color_map[cohort_name] = rgb
+                        self.cohort_colors[cohort_name] = rgb
+                    
+                    # Map files to cohort colors
+                    file_color_map = {}
+                    unassigned_files = [f for f in unique_files if f not in self.patient_cohort_map]
+                    if unassigned_files:
+                        unassigned_colors_raw = _get_patient_colors(len(unassigned_files))
+                        for i, file_name in enumerate(unassigned_files):
+                            color = unassigned_colors_raw[i]
+                            if len(color) == 4:
+                                rgb = tuple(color[:3])
+                            elif len(color) == 3:
+                                rgb = tuple(color)
+                            else:
+                                rgb = (color[0], color[1], color[2])
+                            file_color_map[file_name] = rgb
+                    
+                    for file_name in unique_files:
+                        if file_name in self.patient_cohort_map:
+                            cohort = self.patient_cohort_map[file_name]
+                            file_color_map[file_name] = cohort_color_map[cohort]
+                    
+                    # Plot by cohort
+                    handles = []
+                    labels = []
+                    # Plot cohorts first
+                    for cohort_name in unique_cohorts:
+                        cohort_files = [f for f in unique_files if f in self.patient_cohort_map and self.patient_cohort_map[f] == cohort_name]
+                        if cohort_files:
+                            combined_mask = np.zeros(len(source_files), dtype=bool)
+                            for file_name in cohort_files:
+                                combined_mask |= (source_files == file_name)
+                            combined_mask = combined_mask[valid_mask]
+                            if np.any(combined_mask):
+                                color = cohort_color_map[cohort_name]
+                                sc = ax.scatter(tsne_embedding_filtered[combined_mask, 0], tsne_embedding_filtered[combined_mask, 1],
+                                                c=[color], alpha=point_alpha, s=point_size, edgecolors='none')
+                                handle = Line2D([0], [0], marker='o', color='none', markerfacecolor=color,
+                                             markeredgecolor='none', markersize=6, alpha=point_alpha)
+                                handles.append(handle)
+                                if len(cohort_files) <= 3:
+                                    patient_labels = [self._get_patient_display_name(f) for f in cohort_files]
+                                    labels.append(f"{cohort_name} ({', '.join(patient_labels)})")
+                                else:
+                                    labels.append(f"{cohort_name} ({len(cohort_files)} patients)")
+                    
+                    # Plot unassigned patients
+                    for file_name in unassigned_files:
+                        mask = (source_files == file_name)
+                        mask = mask[valid_mask]
+                        if np.any(mask):
+                            color = file_color_map[file_name]
+                            sc = ax.scatter(tsne_embedding_filtered[mask, 0], tsne_embedding_filtered[mask, 1],
+                                            c=[color], alpha=point_alpha, s=point_size, edgecolors='none')
+                            handle = Line2D([0], [0], marker='o', color='none', markerfacecolor=color,
+                                         markeredgecolor='none', markersize=6, alpha=point_alpha)
+                            handles.append(handle)
+                            labels.append(self._get_patient_display_name(file_name))
+                    
+                    legend_title = 'Cohorts'
+                else:
+                    # Use individual patient colors (original behavior)
+                    patient_colors_raw = _get_patient_colors(len(unique_files))
+                    file_color_map = {file_name: patient_colors_raw[i] for i, file_name in enumerate(unique_files)}
+                    handles = []
+                    labels = []
+                    for file_name in unique_files:
+                        mask = source_files == file_name
+                        mask = mask[valid_mask]
+                        if np.any(mask):  # Only add if there are points for this file
+                            sc = ax.scatter(tsne_embedding_filtered[mask, 0], tsne_embedding_filtered[mask, 1],
+                                            c=[file_color_map[file_name]],
+                                            alpha=point_alpha, s=point_size, edgecolors='none')
+                            # Create custom legend handle with fixed size
+                            color = file_color_map[file_name]
+                            if len(color) == 4:
+                                rgb = tuple(color[:3])
+                            elif len(color) == 3:
+                                rgb = tuple(color)
+                            else:
+                                rgb = (color[0], color[1], color[2])
+                            handle = Line2D([0], [0], marker='o', color='none', markerfacecolor=rgb,
+                                           markeredgecolor='none', markersize=6, alpha=point_alpha)
+                            handles.append(handle)
+                            # Use custom patient label if available
+                            labels.append(self._get_patient_display_name(file_name))
+                    legend_title = self.patient_legend_label
+                
                 # Place legend inside axes to avoid clipping - ensure it's visible
                 if handles and labels:
-                    legend = ax.legend(handles, labels, loc='best', frameon=True, fontsize=8, title=self.patient_legend_label)
+                    legend = ax.legend(handles, labels, loc='best', frameon=True, fontsize=8, title=legend_title)
                     legend.set_visible(True)
             else:
                 # Fallback if no source files
+                ax.scatter(tsne_embedding_filtered[:, 0], tsne_embedding_filtered[:, 1], c='blue', alpha=point_alpha, s=point_size, edgecolors='none')
+        elif color_by == 'Batch Group' and 'batch_group' in self.feature_dataframe.columns:
+            # Filter out dropped clusters (cluster 0) for batch group coloring
+            if hasattr(self, 'tsne_index') and self.tsne_index is not None:
+                cluster_labels_series = self.clustered_data['cluster']
+                cluster_labels = cluster_labels_series.reindex(self.tsne_index).values
+            else:
+                cluster_labels = self.clustered_data['cluster'].values
+            valid_mask = cluster_labels != 0
+            tsne_embedding_filtered = self.tsne_embedding[valid_mask]
+            
+            # Color by batch group to visualize batch effects (using custom patient labels and cohorts)
+            if hasattr(self, 'tsne_index') and self.tsne_index is not None:
+                batch_group_series = self.feature_dataframe.loc[self.tsne_index, 'batch_group']
+                batch_groups = batch_group_series.values[valid_mask]
+            else:
+                batch_groups = self.feature_dataframe['batch_group'].values[valid_mask]
+            unique_groups = sorted([f for f in np.unique(batch_groups) if pd.notna(f)])
+            if len(unique_groups) > 0:
+                # Check if cohorts are defined for batch groups and cohort coloring is enabled
+                cohorts_used = set()
+                if self.use_cohort_coloring:
+                    for group_name in unique_groups:
+                        if group_name in self.patient_cohort_map:
+                            cohorts_used.add(self.patient_cohort_map[group_name])
+                
+                if cohorts_used:
+                    # Use cohort-based coloring
+                    unique_cohorts = sorted(cohorts_used)
+                    cohort_colors_raw = _get_patient_colors(len(unique_cohorts))
+                    cohort_color_map = {}
+                    for i, cohort_name in enumerate(unique_cohorts):
+                        color = cohort_colors_raw[i]
+                        if len(color) == 4:
+                            rgb = tuple(color[:3])
+                        elif len(color) == 3:
+                            rgb = tuple(color)
+                        else:
+                            rgb = (color[0], color[1], color[2])
+                        cohort_color_map[cohort_name] = rgb
+                        self.cohort_colors[cohort_name] = rgb
+                    
+                    # Map batch groups to cohort colors
+                    group_color_map = {}
+                    unassigned_groups = [g for g in unique_groups if g not in self.patient_cohort_map]
+                    if unassigned_groups:
+                        unassigned_colors_raw = _get_patient_colors(len(unassigned_groups))
+                        for i, group_name in enumerate(unassigned_groups):
+                            color = unassigned_colors_raw[i]
+                            if len(color) == 4:
+                                rgb = tuple(color[:3])
+                            elif len(color) == 3:
+                                rgb = tuple(color)
+                            else:
+                                rgb = (color[0], color[1], color[2])
+                            group_color_map[group_name] = rgb
+                    
+                    for group_name in unique_groups:
+                        if group_name in self.patient_cohort_map:
+                            cohort = self.patient_cohort_map[group_name]
+                            group_color_map[group_name] = cohort_color_map[cohort]
+                    
+                    # Plot by cohort
+                    handles = []
+                    labels = []
+                    # Plot cohorts first
+                    for cohort_name in unique_cohorts:
+                        cohort_groups = [g for g in unique_groups if g in self.patient_cohort_map and self.patient_cohort_map[g] == cohort_name]
+                        if cohort_groups:
+                            combined_mask = np.zeros(len(batch_groups), dtype=bool)
+                            for group_name in cohort_groups:
+                                combined_mask |= (batch_groups == group_name)
+                            if np.any(combined_mask):
+                                color = cohort_color_map[cohort_name]
+                                sc = ax.scatter(tsne_embedding_filtered[combined_mask, 0], tsne_embedding_filtered[combined_mask, 1],
+                                                c=[color], alpha=point_alpha, s=point_size, edgecolors='none')
+                                handle = Line2D([0], [0], marker='o', color='none', markerfacecolor=color,
+                                             markeredgecolor='none', markersize=6, alpha=point_alpha)
+                                handles.append(handle)
+                                if len(cohort_groups) <= 3:
+                                    labels.append(f"{cohort_name} ({', '.join(cohort_groups)})")
+                                else:
+                                    labels.append(f"{cohort_name} ({len(cohort_groups)} groups)")
+                    
+                    # Plot unassigned groups
+                    for group_name in unassigned_groups:
+                        mask = (batch_groups == group_name)
+                        if np.any(mask):
+                            color = group_color_map[group_name]
+                            sc = ax.scatter(tsne_embedding_filtered[mask, 0], tsne_embedding_filtered[mask, 1],
+                                            c=[color], alpha=point_alpha, s=point_size, edgecolors='none')
+                            handle = Line2D([0], [0], marker='o', color='none', markerfacecolor=color,
+                                         markeredgecolor='none', markersize=6, alpha=point_alpha)
+                            handles.append(handle)
+                            labels.append(str(group_name))
+                    
+                    legend_title = 'Cohorts'
+                else:
+                    # Use individual batch group colors (original behavior)
+                    group_colors_raw = _get_patient_colors(len(unique_groups))
+                    group_color_map = {group_name: group_colors_raw[i] for i, group_name in enumerate(unique_groups)}
+                    handles = []
+                    labels = []
+                    for group_name in unique_groups:
+                        mask = batch_groups == group_name
+                        if np.any(mask):  # Only add if there are points for this group
+                            sc = ax.scatter(tsne_embedding_filtered[mask, 0], tsne_embedding_filtered[mask, 1],
+                                            c=[group_color_map[group_name]],
+                                            alpha=point_alpha, s=point_size, edgecolors='none')
+                            # Create custom legend handle with fixed size
+                            color = group_color_map[group_name]
+                            if len(color) == 4:
+                                rgb = tuple(color[:3])
+                            elif len(color) == 3:
+                                rgb = tuple(color)
+                            else:
+                                rgb = (color[0], color[1], color[2])
+                            handle = Line2D([0], [0], marker='o', color='none', markerfacecolor=rgb,
+                                           markeredgecolor='none', markersize=6, alpha=point_alpha)
+                            handles.append(handle)
+                            labels.append(str(group_name))
+                    legend_title = 'Batch Group'
+                
+                # Place legend inside axes to avoid clipping - ensure it's visible
+                if handles and labels:
+                    legend = ax.legend(handles, labels, loc='best', frameon=True, fontsize=8, title=legend_title)
+                    legend.set_visible(True)
+            else:
+                # Fallback if no batch groups
                 ax.scatter(tsne_embedding_filtered[:, 0], tsne_embedding_filtered[:, 1], c='blue', alpha=point_alpha, s=point_size, edgecolors='none')
         elif color_by == 'Phenotype' and self.clustered_data is not None and 'cluster_phenotype' in self.clustered_data.columns:
             # Filter out dropped clusters (cluster 0) for phenotype coloring
@@ -3916,6 +4241,10 @@ class CellClusteringDialog(QtWidgets.QDialog):
         if hasattr(self, 'color_by_listwidget'):
             self.color_by_listwidget.setVisible(view in ['UMAP', 't-SNE'])
         self.color_by_combo.setVisible(False)  # Keep hidden for backward compatibility
+        # Show cohort checkbox only for UMAP/t-SNE and if cohorts exist
+        if hasattr(self, 'use_cohort_checkbox'):
+            has_cohorts = bool(self.patient_cohort_map)
+            self.use_cohort_checkbox.setVisible(view in ['UMAP', 't-SNE'] and has_cohorts)
         # Point size and alpha visible only for UMAP and t-SNE
         if hasattr(self, 'point_size_label'):
             self.point_size_label.setVisible(view in ['UMAP', 't-SNE'])
@@ -4347,36 +4676,242 @@ class CellClusteringDialog(QtWidgets.QDialog):
                 source_files = self.feature_dataframe['source_file'].values[valid_mask]
             unique_files = sorted([f for f in np.unique(source_files) if pd.notna(f)])
             if len(unique_files) > 0:
-                # Use patient colors palette (different from cluster colors)
-                patient_colors_raw = _get_patient_colors(len(unique_files))
-                file_color_map = {file_name: patient_colors_raw[i] for i, file_name in enumerate(unique_files)}
-                handles = []
-                labels = []
-                for file_name in unique_files:
-                    mask = source_files == file_name
-                    if np.any(mask):  # Only add if there are points for this file
-                        sc = ax.scatter(umap_embedding_filtered[mask, 0], umap_embedding_filtered[mask, 1],
-                                        c=[file_color_map[file_name]],
-                                        alpha=point_alpha, s=point_size, edgecolors='none')
-                        # Create custom legend handle with fixed size
-                        color = file_color_map[file_name]
+                # Check if cohorts are defined and cohort coloring is enabled
+                cohorts_used = set()
+                if self.use_cohort_coloring:
+                    for file_name in unique_files:
+                        if file_name in self.patient_cohort_map:
+                            cohorts_used.add(self.patient_cohort_map[file_name])
+                
+                if cohorts_used:
+                    # Use cohort-based coloring
+                    unique_cohorts = sorted(cohorts_used)
+                    cohort_colors_raw = _get_patient_colors(len(unique_cohorts))
+                    cohort_color_map = {}
+                    for i, cohort_name in enumerate(unique_cohorts):
+                        color = cohort_colors_raw[i]
                         if len(color) == 4:
                             rgb = tuple(color[:3])
                         elif len(color) == 3:
                             rgb = tuple(color)
                         else:
                             rgb = (color[0], color[1], color[2])
-                        handle = Line2D([0], [0], marker='o', color='none', markerfacecolor=rgb,
-                                       markeredgecolor='none', markersize=6, alpha=point_alpha)
-                        handles.append(handle)
-                        # Use custom patient label if available
-                        labels.append(self._get_patient_display_name(file_name))
+                        cohort_color_map[cohort_name] = rgb
+                        self.cohort_colors[cohort_name] = rgb
+                    
+                    # Map files to cohort colors
+                    file_color_map = {}
+                    unassigned_files = [f for f in unique_files if f not in self.patient_cohort_map]
+                    if unassigned_files:
+                        unassigned_colors_raw = _get_patient_colors(len(unassigned_files))
+                        for i, file_name in enumerate(unassigned_files):
+                            color = unassigned_colors_raw[i]
+                            if len(color) == 4:
+                                rgb = tuple(color[:3])
+                            elif len(color) == 3:
+                                rgb = tuple(color)
+                            else:
+                                rgb = (color[0], color[1], color[2])
+                            file_color_map[file_name] = rgb
+                    
+                    for file_name in unique_files:
+                        if file_name in self.patient_cohort_map:
+                            cohort = self.patient_cohort_map[file_name]
+                            file_color_map[file_name] = cohort_color_map[cohort]
+                    
+                    # Plot by cohort
+                    handles = []
+                    labels = []
+                    # Plot cohorts first
+                    for cohort_name in unique_cohorts:
+                        cohort_files = [f for f in unique_files if f in self.patient_cohort_map and self.patient_cohort_map[f] == cohort_name]
+                        if cohort_files:
+                            combined_mask = np.zeros(len(source_files), dtype=bool)
+                            for file_name in cohort_files:
+                                combined_mask |= (source_files == file_name)
+                            combined_mask = combined_mask[valid_mask]
+                            if np.any(combined_mask):
+                                color = cohort_color_map[cohort_name]
+                                sc = ax.scatter(umap_embedding_filtered[combined_mask, 0], umap_embedding_filtered[combined_mask, 1],
+                                                c=[color], alpha=point_alpha, s=point_size, edgecolors='none')
+                                handle = Line2D([0], [0], marker='o', color='none', markerfacecolor=color,
+                                             markeredgecolor='none', markersize=6, alpha=point_alpha)
+                                handles.append(handle)
+                                if len(cohort_files) <= 3:
+                                    patient_labels = [self._get_patient_display_name(f) for f in cohort_files]
+                                    labels.append(f"{cohort_name} ({', '.join(patient_labels)})")
+                                else:
+                                    labels.append(f"{cohort_name} ({len(cohort_files)} patients)")
+                    
+                    # Plot unassigned patients
+                    for file_name in unassigned_files:
+                        mask = (source_files == file_name)
+                        mask = mask[valid_mask]
+                        if np.any(mask):
+                            color = file_color_map[file_name]
+                            sc = ax.scatter(umap_embedding_filtered[mask, 0], umap_embedding_filtered[mask, 1],
+                                            c=[color], alpha=point_alpha, s=point_size, edgecolors='none')
+                            handle = Line2D([0], [0], marker='o', color='none', markerfacecolor=color,
+                                         markeredgecolor='none', markersize=6, alpha=point_alpha)
+                            handles.append(handle)
+                            labels.append(self._get_patient_display_name(file_name))
+                    
+                    legend_title = 'Cohorts'
+                else:
+                    # Use individual patient colors (original behavior)
+                    patient_colors_raw = _get_patient_colors(len(unique_files))
+                    file_color_map = {file_name: patient_colors_raw[i] for i, file_name in enumerate(unique_files)}
+                    handles = []
+                    labels = []
+                    for file_name in unique_files:
+                        mask = source_files == file_name
+                        mask = mask[valid_mask]
+                        if np.any(mask):  # Only add if there are points for this file
+                            sc = ax.scatter(umap_embedding_filtered[mask, 0], umap_embedding_filtered[mask, 1],
+                                            c=[file_color_map[file_name]],
+                                            alpha=point_alpha, s=point_size, edgecolors='none')
+                            # Create custom legend handle with fixed size
+                            color = file_color_map[file_name]
+                            if len(color) == 4:
+                                rgb = tuple(color[:3])
+                            elif len(color) == 3:
+                                rgb = tuple(color)
+                            else:
+                                rgb = (color[0], color[1], color[2])
+                            handle = Line2D([0], [0], marker='o', color='none', markerfacecolor=rgb,
+                                           markeredgecolor='none', markersize=6, alpha=point_alpha)
+                            handles.append(handle)
+                            # Use custom patient label if available
+                            labels.append(self._get_patient_display_name(file_name))
+                    legend_title = self.patient_legend_label
+                
                 # Place legend inside axes to avoid clipping - ensure it's visible
                 if show_legend and handles and labels:
-                    legend = ax.legend(handles, labels, loc='best', frameon=True, fontsize=8, title=self.patient_legend_label)
+                    legend = ax.legend(handles, labels, loc='best', frameon=True, fontsize=8, title=legend_title)
                     legend.set_visible(True)
             else:
                 # Fallback if no source files
+                ax.scatter(umap_embedding_filtered[:, 0], umap_embedding_filtered[:, 1], c='blue', alpha=point_alpha, s=point_size, edgecolors='none')
+        elif color_by == 'Batch Group' and 'batch_group' in self.feature_dataframe.columns:
+            # Use pre-computed filtered data
+            # Color by batch group to visualize batch effects (using custom patient labels and cohorts)
+            if hasattr(self, 'umap_index') and self.umap_index is not None:
+                batch_group_series = self.feature_dataframe.loc[self.umap_index, 'batch_group']
+                batch_groups = batch_group_series.values[valid_mask]
+            else:
+                batch_groups = self.feature_dataframe['batch_group'].values[valid_mask]
+            unique_groups = sorted([f for f in np.unique(batch_groups) if pd.notna(f)])
+            if len(unique_groups) > 0:
+                # Check if cohorts are defined for batch groups and cohort coloring is enabled
+                cohorts_used = set()
+                if self.use_cohort_coloring:
+                    for group_name in unique_groups:
+                        if group_name in self.patient_cohort_map:
+                            cohorts_used.add(self.patient_cohort_map[group_name])
+                
+                if cohorts_used:
+                    # Use cohort-based coloring
+                    unique_cohorts = sorted(cohorts_used)
+                    cohort_colors_raw = _get_patient_colors(len(unique_cohorts))
+                    cohort_color_map = {}
+                    for i, cohort_name in enumerate(unique_cohorts):
+                        color = cohort_colors_raw[i]
+                        if len(color) == 4:
+                            rgb = tuple(color[:3])
+                        elif len(color) == 3:
+                            rgb = tuple(color)
+                        else:
+                            rgb = (color[0], color[1], color[2])
+                        cohort_color_map[cohort_name] = rgb
+                        self.cohort_colors[cohort_name] = rgb
+                    
+                    # Map batch groups to cohort colors
+                    group_color_map = {}
+                    unassigned_groups = [g for g in unique_groups if g not in self.patient_cohort_map]
+                    if unassigned_groups:
+                        unassigned_colors_raw = _get_patient_colors(len(unassigned_groups))
+                        for i, group_name in enumerate(unassigned_groups):
+                            color = unassigned_colors_raw[i]
+                            if len(color) == 4:
+                                rgb = tuple(color[:3])
+                            elif len(color) == 3:
+                                rgb = tuple(color)
+                            else:
+                                rgb = (color[0], color[1], color[2])
+                            group_color_map[group_name] = rgb
+                    
+                    for group_name in unique_groups:
+                        if group_name in self.patient_cohort_map:
+                            cohort = self.patient_cohort_map[group_name]
+                            group_color_map[group_name] = cohort_color_map[cohort]
+                    
+                    # Plot by cohort
+                    handles = []
+                    labels = []
+                    # Plot cohorts first
+                    for cohort_name in unique_cohorts:
+                        cohort_groups = [g for g in unique_groups if g in self.patient_cohort_map and self.patient_cohort_map[g] == cohort_name]
+                        if cohort_groups:
+                            combined_mask = np.zeros(len(batch_groups), dtype=bool)
+                            for group_name in cohort_groups:
+                                combined_mask |= (batch_groups == group_name)
+                            if np.any(combined_mask):
+                                color = cohort_color_map[cohort_name]
+                                sc = ax.scatter(umap_embedding_filtered[combined_mask, 0], umap_embedding_filtered[combined_mask, 1],
+                                                c=[color], alpha=point_alpha, s=point_size, edgecolors='none')
+                                handle = Line2D([0], [0], marker='o', color='none', markerfacecolor=color,
+                                             markeredgecolor='none', markersize=6, alpha=point_alpha)
+                                handles.append(handle)
+                                if len(cohort_groups) <= 3:
+                                    labels.append(f"{cohort_name} ({', '.join(cohort_groups)})")
+                                else:
+                                    labels.append(f"{cohort_name} ({len(cohort_groups)} groups)")
+                    
+                    # Plot unassigned groups
+                    for group_name in unassigned_groups:
+                        mask = (batch_groups == group_name)
+                        if np.any(mask):
+                            color = group_color_map[group_name]
+                            sc = ax.scatter(umap_embedding_filtered[mask, 0], umap_embedding_filtered[mask, 1],
+                                            c=[color], alpha=point_alpha, s=point_size, edgecolors='none')
+                            handle = Line2D([0], [0], marker='o', color='none', markerfacecolor=color,
+                                         markeredgecolor='none', markersize=6, alpha=point_alpha)
+                            handles.append(handle)
+                            labels.append(str(group_name))
+                    
+                    legend_title = 'Cohorts'
+                else:
+                    # Use individual batch group colors (original behavior)
+                    group_colors_raw = _get_patient_colors(len(unique_groups))
+                    group_color_map = {group_name: group_colors_raw[i] for i, group_name in enumerate(unique_groups)}
+                    handles = []
+                    labels = []
+                    for group_name in unique_groups:
+                        mask = batch_groups == group_name
+                        if np.any(mask):  # Only add if there are points for this group
+                            sc = ax.scatter(umap_embedding_filtered[mask, 0], umap_embedding_filtered[mask, 1],
+                                            c=[group_color_map[group_name]],
+                                            alpha=point_alpha, s=point_size, edgecolors='none')
+                            # Create custom legend handle with fixed size
+                            color = group_color_map[group_name]
+                            if len(color) == 4:
+                                rgb = tuple(color[:3])
+                            elif len(color) == 3:
+                                rgb = tuple(color)
+                            else:
+                                rgb = (color[0], color[1], color[2])
+                            handle = Line2D([0], [0], marker='o', color='none', markerfacecolor=rgb,
+                                           markeredgecolor='none', markersize=6, alpha=point_alpha)
+                            handles.append(handle)
+                            labels.append(str(group_name))
+                    legend_title = 'Batch Group'
+                
+                # Place legend inside axes to avoid clipping - ensure it's visible
+                if show_legend and handles and labels:
+                    legend = ax.legend(handles, labels, loc='best', frameon=True, fontsize=8, title=legend_title)
+                    legend.set_visible(True)
+            else:
+                # Fallback if no batch groups
                 ax.scatter(umap_embedding_filtered[:, 0], umap_embedding_filtered[:, 1], c='blue', alpha=point_alpha, s=point_size, edgecolors='none')
         elif color_by == 'Phenotype' and self.clustered_data is not None and 'cluster_phenotype' in self.clustered_data.columns:
             # Use pre-computed filtered data
@@ -4410,6 +4945,53 @@ class CellClusteringDialog(QtWidgets.QDialog):
                 labels.append(str(phenotype))
             if show_legend:
                 ax.legend(handles, labels, loc='best', frameon=True, fontsize=8, title='Phenotype')
+        elif color_by == 'Cohorts' and 'cohort' in self.feature_dataframe.columns:
+            # Use pre-computed filtered data
+            # Color by cohort
+            if hasattr(self, 'umap_index') and self.umap_index is not None:
+                cohort_series = self.feature_dataframe.loc[self.umap_index, 'cohort']
+                cohorts = cohort_series.fillna('Unassigned').values[valid_mask]
+            else:
+                cohorts = self.feature_dataframe['cohort'].fillna('Unassigned').values[valid_mask]
+            unique_cohorts = sorted([c for c in np.unique(cohorts) if pd.notna(c) and c != ''])
+            if len(unique_cohorts) > 0:
+                cohort_colors_raw = _get_patient_colors(len(unique_cohorts))
+                cohort_color_map = {}
+                for i, cohort_name in enumerate(unique_cohorts):
+                    color = cohort_colors_raw[i]
+                    if len(color) == 4:
+                        rgb = tuple(color[:3])
+                    elif len(color) == 3:
+                        rgb = tuple(color)
+                    else:
+                        rgb = (color[0], color[1], color[2])
+                    cohort_color_map[cohort_name] = rgb
+                    self.cohort_colors[cohort_name] = rgb
+                
+                handles = []
+                labels = []
+                for cohort_name in unique_cohorts:
+                    mask = cohorts == cohort_name
+                    if np.any(mask):
+                        sc = ax.scatter(umap_embedding_filtered[mask, 0], umap_embedding_filtered[mask, 1],
+                                        c=[cohort_color_map[cohort_name]],
+                                        alpha=point_alpha, s=point_size, edgecolors='none')
+                        color = cohort_color_map[cohort_name]
+                        if len(color) == 4:
+                            rgb = tuple(color[:3])
+                        elif len(color) == 3:
+                            rgb = tuple(color)
+                        else:
+                            rgb = (color[0], color[1], color[2])
+                        handle = Line2D([0], [0], marker='o', color='none', markerfacecolor=rgb,
+                                       markeredgecolor='none', markersize=6, alpha=point_alpha)
+                        handles.append(handle)
+                        labels.append(str(cohort_name) if cohort_name != 'Unassigned' else 'Unassigned')
+                if show_legend and handles and labels:
+                    legend = ax.legend(handles, labels, loc='best', frameon=True, fontsize=8, title='Cohorts')
+                    legend.set_visible(True)
+            else:
+                ax.scatter(umap_embedding_filtered[:, 0], umap_embedding_filtered[:, 1], c='blue', alpha=point_alpha, s=point_size, edgecolors='none')
         elif color_by == 'Manual Phenotype' and 'manual_phenotype' in self.feature_dataframe.columns:
             # Use pre-computed filtered data
             # Color by manual phenotype
@@ -4703,6 +5285,10 @@ class CellClusteringDialog(QtWidgets.QDialog):
         if 'manual_phenotype' in self.feature_dataframe.columns:
             if 'Manual Phenotype' not in options:
                 options.append('Manual Phenotype')
+        # Add Cohorts if cohorts exist
+        if 'cohort' in self.feature_dataframe.columns and self.feature_dataframe['cohort'].notna().any():
+            if 'Cohorts' not in options:
+                options.append('Cohorts')
         
         # Add items to list widget
         for option in options:
@@ -6571,6 +7157,12 @@ class CellClusteringDialog(QtWidgets.QDialog):
             editors[value] = le
         v.addLayout(form)
         
+        # Add cohort management button
+        cohort_btn = QtWidgets.QPushButton("Manage Cohorts...")
+        cohort_btn.setToolTip("Group patients into cohorts. Patients in the same cohort will share the same color.")
+        cohort_btn.clicked.connect(lambda: self._open_cohort_management_dialog(unique_values))
+        v.addWidget(cohort_btn)
+        
         btns = QtWidgets.QHBoxLayout()
         ok = QtWidgets.QPushButton("Apply")
         cancel = QtWidgets.QPushButton("Cancel")
@@ -6602,6 +7194,264 @@ class CellClusteringDialog(QtWidgets.QDialog):
                 # Refresh t-SNE plot to update patient labels in legend
                 self._create_tsne_plot()
             QtWidgets.QMessageBox.information(self, "Labels Applied", "Patient labels have been applied.")
+
+    def _open_cohort_management_dialog(self, unique_values):
+        """Open a dialog to manage patient cohorts (grouping patients)."""
+        dlg = QtWidgets.QDialog(self)
+        dlg.setWindowTitle("Manage Patient Cohorts")
+        dlg.resize(800, 600)
+        
+        main_layout = QtWidgets.QVBoxLayout(dlg)
+        
+        # Instructions
+        instruction = QtWidgets.QLabel(
+            "Create cohorts to group patients together. Patients in the same cohort will share the same color. "
+            "Patients not assigned to any cohort will use individual colors."
+        )
+        instruction.setWordWrap(True)
+        main_layout.addWidget(instruction)
+        
+        # Split into two columns: cohorts on left, patients on right
+        splitter = QtWidgets.QSplitter(QtCore.Qt.Horizontal)
+        
+        # Left side: Cohort management
+        cohort_widget = QtWidgets.QWidget()
+        cohort_layout = QtWidgets.QVBoxLayout(cohort_widget)
+        
+        cohort_label = QtWidgets.QLabel("Cohorts:")
+        cohort_layout.addWidget(cohort_label)
+        
+        # Cohort list with add/delete buttons
+        cohort_list_widget = QtWidgets.QListWidget()
+        cohort_list_widget.setSelectionMode(QtWidgets.QAbstractItemView.SingleSelection)
+        
+        # Populate existing cohorts
+        existing_cohorts = set()
+        for patient in unique_values:
+            if patient in self.patient_cohort_map:
+                existing_cohorts.add(self.patient_cohort_map[patient])
+        
+        for cohort_name in sorted(existing_cohorts):
+            cohort_list_widget.addItem(cohort_name)
+        
+        cohort_layout.addWidget(cohort_list_widget)
+        
+        # Buttons for cohort management
+        cohort_btn_layout = QtWidgets.QHBoxLayout()
+        add_cohort_btn = QtWidgets.QPushButton("Add Cohort")
+        delete_cohort_btn = QtWidgets.QPushButton("Delete Cohort")
+        cohort_btn_layout.addWidget(add_cohort_btn)
+        cohort_btn_layout.addWidget(delete_cohort_btn)
+        cohort_layout.addLayout(cohort_btn_layout)
+        
+        splitter.addWidget(cohort_widget)
+        
+        # Right side: Patient assignment
+        patient_widget = QtWidgets.QWidget()
+        patient_layout = QtWidgets.QVBoxLayout(patient_widget)
+        
+        patient_label = QtWidgets.QLabel("Patients:")
+        patient_layout.addWidget(patient_label)
+        
+        # Patient list (checkboxes for multi-select)
+        patient_list_widget = QtWidgets.QListWidget()
+        patient_list_widget.setSelectionMode(QtWidgets.QAbstractItemView.ExtendedSelection)
+        
+        # Populate patients with their current cohort assignment
+        for value in unique_values:
+            item = QtWidgets.QListWidgetItem(str(value))
+            if value in self.patient_cohort_map:
+                cohort = self.patient_cohort_map[value]
+                item.setText(f"{value} → {cohort}")
+            patient_list_widget.addItem(item)
+        
+        patient_layout.addWidget(patient_list_widget)
+        
+        # Buttons for patient assignment
+        assign_btn_layout = QtWidgets.QHBoxLayout()
+        assign_to_cohort_btn = QtWidgets.QPushButton("Assign Selected to Cohort")
+        remove_from_cohort_btn = QtWidgets.QPushButton("Remove from Cohort")
+        assign_btn_layout.addWidget(assign_to_cohort_btn)
+        assign_btn_layout.addWidget(remove_from_cohort_btn)
+        patient_layout.addLayout(assign_btn_layout)
+        
+        splitter.addWidget(patient_widget)
+        
+        # Set splitter sizes (equal)
+        splitter.setSizes([400, 400])
+        main_layout.addWidget(splitter)
+        
+        # Store reference to list widgets for callbacks
+        dlg.cohort_list = cohort_list_widget
+        dlg.patient_list = patient_list_widget
+        
+        # Add cohort callback
+        def add_cohort():
+            text, ok = QtWidgets.QInputDialog.getText(dlg, "New Cohort", "Cohort name:")
+            if ok and text.strip():
+                cohort_name = text.strip()
+                if cohort_list_widget.findItems(cohort_name, QtCore.Qt.MatchExactly):
+                    QtWidgets.QMessageBox.warning(dlg, "Duplicate", f"Cohort '{cohort_name}' already exists.")
+                    return
+                cohort_list_widget.addItem(cohort_name)
+                cohort_list_widget.setCurrentItem(cohort_list_widget.item(cohort_list_widget.count() - 1))
+        
+        # Delete cohort callback
+        def delete_cohort():
+            current_item = cohort_list_widget.currentItem()
+            if not current_item:
+                QtWidgets.QMessageBox.warning(dlg, "No Selection", "Please select a cohort to delete.")
+                return
+            
+            cohort_name = current_item.text()
+            reply = QtWidgets.QMessageBox.question(
+                dlg, "Confirm Delete",
+                f"Delete cohort '{cohort_name}'? Patients in this cohort will be unassigned.",
+                QtWidgets.QMessageBox.Yes | QtWidgets.QMessageBox.No
+            )
+            if reply == QtWidgets.QMessageBox.Yes:
+                # Remove cohort from all patients
+                for i in range(patient_list_widget.count()):
+                    item = patient_list_widget.item(i)
+                    patient_value = unique_values[i]
+                    if patient_value in self.patient_cohort_map and self.patient_cohort_map[patient_value] == cohort_name:
+                        self.patient_cohort_map.pop(patient_value, None)
+                        # Update display
+                        item.setText(str(patient_value))
+                
+                # Remove from list
+                row = cohort_list_widget.row(current_item)
+                cohort_list_widget.takeItem(row)
+        
+        # Assign patients to cohort callback
+        def assign_to_cohort():
+            current_cohort_item = cohort_list_widget.currentItem()
+            selected_patient_items = patient_list_widget.selectedItems()
+            
+            if not current_cohort_item:
+                QtWidgets.QMessageBox.warning(dlg, "No Cohort Selected", "Please select a cohort first.")
+                return
+            
+            if not selected_patient_items:
+                QtWidgets.QMessageBox.warning(dlg, "No Patients Selected", "Please select one or more patients.")
+                return
+            
+            cohort_name = current_cohort_item.text()
+            
+            for patient_item in selected_patient_items:
+                row = patient_list_widget.row(patient_item)
+                patient_value = unique_values[row]
+                self.patient_cohort_map[patient_value] = cohort_name
+                # Update display
+                patient_item.setText(f"{patient_value} → {cohort_name}")
+        
+        # Remove patients from cohort callback
+        def remove_from_cohort():
+            selected_patient_items = patient_list_widget.selectedItems()
+            
+            if not selected_patient_items:
+                QtWidgets.QMessageBox.warning(dlg, "No Patients Selected", "Please select one or more patients.")
+                return
+            
+            for patient_item in selected_patient_items:
+                row = patient_list_widget.row(patient_item)
+                patient_value = unique_values[row]
+                if patient_value in self.patient_cohort_map:
+                    self.patient_cohort_map.pop(patient_value)
+                    # Update display
+                    patient_item.setText(str(patient_value))
+        
+        # Connect buttons
+        add_cohort_btn.clicked.connect(add_cohort)
+        delete_cohort_btn.clicked.connect(delete_cohort)
+        assign_to_cohort_btn.clicked.connect(assign_to_cohort)
+        remove_from_cohort_btn.clicked.connect(remove_from_cohort)
+        
+        # Dialog buttons
+        btn_layout = QtWidgets.QHBoxLayout()
+        ok_btn = QtWidgets.QPushButton("OK")
+        cancel_btn = QtWidgets.QPushButton("Cancel")
+        ok_btn.clicked.connect(dlg.accept)
+        cancel_btn.clicked.connect(dlg.reject)
+        btn_layout.addStretch()
+        btn_layout.addWidget(ok_btn)
+        btn_layout.addWidget(cancel_btn)
+        main_layout.addLayout(btn_layout)
+        
+        if dlg.exec_() == QtWidgets.QDialog.Accepted:
+            # Cohorts are already updated in self.patient_cohort_map via callbacks
+            # Write cohorts to features column
+            self._write_cohorts_to_features()
+            # Refresh color-by options to include Cohorts
+            self._populate_color_by_options()
+            # Refresh group-by combo to include cohort option
+            if hasattr(self, 'group_by_combo'):
+                current_selection = self.group_by_combo.currentText()
+                self.group_by_combo.clear()
+                candidate_cols = [
+                    'roi', 'ROI', 'slide', 'Slide', 'condition', 'Condition',
+                    'acquisition_name', 'well', 'acquisition_id'
+                ]
+                available_group_cols = [c for c in candidate_cols if c in self.feature_dataframe.columns]
+                
+                # Build priority columns list in order (all should be options, not replacements)
+                priority_cols = []
+                if 'source_file' in self.feature_dataframe.columns:
+                    priority_cols.append('source_file')
+                if 'batch_group' in self.feature_dataframe.columns:
+                    priority_cols.append('batch_group')
+                if 'cohort' in self.feature_dataframe.columns:
+                    priority_cols.append('cohort')
+                if 'source_well' in self.feature_dataframe.columns:
+                    priority_cols.append('source_well')
+                
+                # Add priority columns at the beginning, avoiding duplicates
+                for col in reversed(priority_cols):
+                    if col not in available_group_cols:
+                        available_group_cols.insert(0, col)
+                
+                # Add source_file_acquisition_id if both source_file and acquisition_id exist
+                if 'source_file' in self.feature_dataframe.columns and 'acquisition_id' in self.feature_dataframe.columns:
+                    if 'source_file_acquisition_id' not in self.feature_dataframe.columns:
+                        self.feature_dataframe = self.feature_dataframe.assign(
+                            source_file_acquisition_id=(
+                                self.feature_dataframe['source_file'].astype(str) + '_' + 
+                                self.feature_dataframe['acquisition_id'].astype(str)
+                            )
+                        )
+                    if 'source_file_acquisition_id' not in available_group_cols:
+                        available_group_cols.insert(0, 'source_file_acquisition_id')
+                if not available_group_cols:
+                    available_group_cols = ['acquisition_name'] if 'acquisition_name' in self.feature_dataframe.columns else []
+                
+                # Add metadata columns for grouping
+                metadata_cols = self._get_metadata_columns(self.feature_dataframe)
+                if metadata_cols:
+                    if available_group_cols:
+                        available_group_cols.extend(metadata_cols)
+                    else:
+                        available_group_cols = metadata_cols
+                
+                for col in available_group_cols:
+                    self.group_by_combo.addItem(col)
+                
+                # Restore selection if it still exists, otherwise keep default
+                if current_selection and current_selection in available_group_cols:
+                    self.group_by_combo.setCurrentText(current_selection)
+            
+            # Update cohort checkbox visibility
+            if hasattr(self, 'use_cohort_checkbox'):
+                has_cohorts = bool(self.patient_cohort_map)
+                view = self.view_combo.currentText() if hasattr(self, 'view_combo') else 'Heatmap'
+                self.use_cohort_checkbox.setVisible(view in ['UMAP', 't-SNE'] and has_cohorts)
+            # Refresh plots if needed
+            view = self.view_combo.currentText() if hasattr(self, 'view_combo') else 'Heatmap'
+            if view == 'Heatmap' and hasattr(self, 'patient_annotation_checkbox') and self.patient_annotation_checkbox.isChecked():
+                self._show_heatmap()
+            elif view == 'UMAP' and self.umap_embedding is not None:
+                self._create_umap_plot()
+            elif view == 't-SNE' and self.tsne_embedding is not None:
+                self._create_tsne_plot()
 
     def _open_plot_config_dialog(self):
         """Open the plot configuration dialog."""
@@ -6699,8 +7549,12 @@ class CellClusteringDialog(QtWidgets.QDialog):
         exclude_cols = {
             'label', 'cell_id', 'acquisition_id', 'acquisition_name', 'acquisition_label',
             'well', 'cluster', 'source_file', 'source_well', 'source_file_acquisition_id',
-            'centroid_x', 'centroid_y', 'batch_group', 'cluster_phenotype', 'cluster_id'
+            'centroid_x', 'centroid_y', 'batch_group', 'cluster_phenotype', 'cluster_id',
+            'cohort'  # Cohort column (if written to features)
         }
+        
+        # Also filter out pandas index columns like "Unnamed: 0"
+        exclude_patterns = ['Unnamed:', 'unnamed:']
         
         # Identify feature columns (intensity and morphology)
         feature_cols = set()
@@ -6715,11 +7569,54 @@ class CellClusteringDialog(QtWidgets.QDialog):
                         'aspect_ratio', 'bbox_area_um2', 'touches_border', 'touches_edge', 'holes_count']:
                 feature_cols.add(col)
         
-        # Metadata columns are everything else
-        metadata_cols = [col for col in df.columns 
-                        if col not in exclude_cols and col not in feature_cols]
+        # Metadata columns are everything else (excluding index columns)
+        metadata_cols = []
+        for col in df.columns:
+            if col in exclude_cols or col in feature_cols:
+                continue
+            # Filter out pandas index columns like "Unnamed: 0"
+            if any(pattern in str(col).lower() for pattern in ['unnamed:']):
+                continue
+            metadata_cols.append(col)
         
         return sorted(metadata_cols)
+
+    def _write_cohorts_to_features(self):
+        """Write cohort assignments to a 'cohort' column in the feature dataframe."""
+        if not self.patient_cohort_map:
+            # Remove cohort column if no cohorts exist
+            if 'cohort' in self.feature_dataframe.columns:
+                self.feature_dataframe = self.feature_dataframe.drop(columns=['cohort'])
+            return
+        
+        # Determine which column to use for cohort mapping
+        # Try patient annotation column first, then source_file, batch_group, source_well
+        mapping_col = None
+        if hasattr(self, 'patient_annotation_column') and self.patient_annotation_column:
+            mapping_col = self.patient_annotation_column
+        else:
+            for col in ['source_file', 'batch_group', 'source_well']:
+                if col in self.feature_dataframe.columns:
+                    mapping_col = col
+                    break
+        
+        if mapping_col and mapping_col in self.feature_dataframe.columns:
+            # Map cohorts to feature dataframe
+            self.feature_dataframe['cohort'] = self.feature_dataframe[mapping_col].map(
+                lambda x: self.patient_cohort_map.get(x, '')
+            ).fillna('')
+
+    def _on_cohort_coloring_changed(self, state: int):
+        """Handle cohort coloring checkbox state change."""
+        self.use_cohort_coloring = (state == 2)  # 2 = checked
+        # Refresh current view
+        view = self.view_combo.currentText() if hasattr(self, 'view_combo') else 'Heatmap'
+        if view == 'UMAP' and self.umap_embedding is not None:
+            self._create_umap_plot()
+        elif view == 't-SNE' and self.tsne_embedding is not None:
+            self._create_tsne_plot()
+        elif view == 'Heatmap' and hasattr(self, 'patient_annotation_checkbox') and self.patient_annotation_checkbox.isChecked():
+            self._show_heatmap()
 
     def _apply_cluster_annotations(self):
         """Apply current annotation map to clustered_data and feature_dataframe as 'cluster_phenotype'."""
@@ -8482,6 +9379,7 @@ class PhenotypeSuggestionDialog(QtWidgets.QDialog):
         btns.addStretch()
         btns.addWidget(self.run_btn)
         btns.addWidget(self.apply_btn)
+        btns.addWidget(self.export_btn)
         btns.addWidget(close_btn)
         layout.addLayout(btns)
 
@@ -8505,16 +9403,29 @@ class PhenotypeSuggestionDialog(QtWidgets.QDialog):
         # Holds QButtonGroup per cluster for selection
         self._cluster_choice_groups = {}
         
+        # Initialize suggestions dict - will be populated from cache or new results
+        self._suggestions = {}  # cluster_id -> parsed json
+        
         # Check for cached results and display them immediately
         self._check_and_display_cached_results()
-
-        self._suggestions = {}  # cluster_id -> parsed json
+        
+        # Export button (initially hidden, shown after LLM runs)
+        self.export_btn = QtWidgets.QPushButton("Export LLM Results")
+        self.export_btn.setEnabled(False)
+        self.export_btn.clicked.connect(self._export_llm_results)
+        self.export_btn.hide()  # Hidden until results are available
 
     def closeEvent(self, event):
         """Handle dialog closing to preserve cache and apply suggestions."""
         # Ensure the current suggestions are cached for future use
+        # Use integer keys consistently for cache storage
         if self._cache_dict is not None and self._suggestions:
-            self._cache_dict.update(self._suggestions)
+            # Convert any string keys to integers for consistency
+            cache_update = {}
+            for cid, result in self._suggestions.items():
+                cid_int = int(cid) if isinstance(cid, str) else cid
+                cache_update[cid_int] = result
+            self._cache_dict.update(cache_update)
         
         # Automatically apply suggestions when closing if they exist
         # This ensures annotations persist even if user doesn't click "Apply Names"
@@ -8572,28 +9483,38 @@ class PhenotypeSuggestionDialog(QtWidgets.QDialog):
         if not self._cache_dict:
             return
             
-        # Check if we have cached results for all current clusters
+        # Check if we have cached results for current clusters
+        # Use integer keys consistently for both cache lookup and storage
         cached_results = {}
         for cid in self._cluster_ids:
             # Convert cluster ID to int for consistent comparison
             cid_int = int(cid)
-            # Check both the original cid and converted int version
-            if cid in self._cache_dict:
-                cached_results[cid] = self._cache_dict[cid]
-            elif cid_int in self._cache_dict:
-                cached_results[cid] = self._cache_dict[cid_int]
+            # Check both the original cid (string) and converted int version
+            if cid_int in self._cache_dict:
+                cached_results[cid_int] = self._cache_dict[cid_int]
+            elif cid in self._cache_dict:
+                # If found with string key, convert to int for consistency
+                cached_results[cid_int] = self._cache_dict[cid]
         
-        # If we have cached results for all clusters, display them
-        if cached_results and len(cached_results) == len(self._cluster_ids):
+        # If we have cached results for any clusters, display them
+        if cached_results:
             # Store the cached results in _suggestions so they can be applied
-            self._suggestions = cached_results.copy()
+            # Use integer keys consistently
+            self._suggestions.update(cached_results)
             self._render_choices(cached_results)
             self.apply_btn.setEnabled(True)
-            # Disable the run button since we already have results
-            self.run_btn.setEnabled(False)
-            self.run_btn.setText("Results Cached - Re-run to refresh")
-        else:
-            pass
+            self.export_btn.setEnabled(True)
+            self.export_btn.show()
+            # If we have results for all clusters, disable run button
+            if len(cached_results) == len(self._cluster_ids):
+                self.run_btn.setEnabled(False)
+                self.run_btn.setText("Results Cached - Re-run to refresh")
+            else:
+                # Partial cache - allow re-running but show that some results are cached
+                self.run_btn.setEnabled(True)
+                cached_count = len(cached_results)
+                total_count = len(self._cluster_ids)
+                self.run_btn.setText(f"Run Suggestion ({cached_count}/{total_count} cached)")
 
     def _apply(self):
         display_name_map = {}
@@ -8636,6 +9557,50 @@ class PhenotypeSuggestionDialog(QtWidgets.QDialog):
             if self._cache_dict is not None and self._suggestions:
                 self._cache_dict.update(self._suggestions)
             QtWidgets.QMessageBox.information(self, "Applied", f"Applied {len(display_name_map)} suggested names.")
+
+    def _export_llm_results(self):
+        """Export LLM results to a JSON file."""
+        if not self._suggestions:
+            QtWidgets.QMessageBox.warning(self, "No Results", "No LLM results available to export.")
+            return
+        
+        # Prepare export data - convert integer keys to strings for JSON compatibility
+        export_data = {}
+        for cid_int, result in self._suggestions.items():
+            # Convert cluster_id to string for JSON export
+            export_result = result.copy()
+            export_result['cluster_id'] = str(cid_int)
+            export_data[str(cid_int)] = export_result
+        
+        # Open file dialog to select save location
+        file_path, _ = QtWidgets.QFileDialog.getSaveFileName(
+            self,
+            "Export LLM Results",
+            "",
+            "JSON Files (*.json);;All Files (*)"
+        )
+        
+        if file_path:
+            try:
+                # Ensure .json extension
+                if not file_path.endswith('.json'):
+                    file_path += '.json'
+                
+                # Write JSON with pretty formatting
+                with open(file_path, 'w', encoding='utf-8') as f:
+                    json.dump(export_data, f, indent=2, ensure_ascii=False)
+                
+                QtWidgets.QMessageBox.information(
+                    self,
+                    "Export Successful",
+                    f"LLM results exported to:\n{file_path}"
+                )
+            except Exception as e:
+                QtWidgets.QMessageBox.critical(
+                    self,
+                    "Export Failed",
+                    f"Failed to export LLM results:\n{str(e)}"
+                )
 
     def _debug_validate_payload(self, payload: dict) -> bool:
         try:
@@ -8735,11 +9700,13 @@ class PhenotypeSuggestionDialog(QtWidgets.QDialog):
                 self.progress.setValue(idx)
                 QtWidgets.QApplication.processEvents()
             if results:
-                # Cache the results
+                # Cache the results (using integer keys consistently)
                 if self._cache_dict is not None:
                     self._cache_dict.update(results)
                 self._render_choices(results)
                 self.apply_btn.setEnabled(True)
+                self.export_btn.setEnabled(True)
+                self.export_btn.show()
         except Exception as e:
             QtWidgets.QMessageBox.critical(self, "LLM Error", f"Error suggesting phenotypes: {str(e)}")
         finally:
