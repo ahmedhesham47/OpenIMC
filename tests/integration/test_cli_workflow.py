@@ -794,9 +794,6 @@ class TestFeatureExtractionRegression:
                 pytest.fail(f"Mask for acquisition {acq_id} is None")
             if mask.size == 0:
                 pytest.fail(f"Mask for acquisition {acq_id} is empty")
-            # Log mask info for debugging
-            print(f"\n[DEBUG] Mask for {acq_id}: shape={mask.shape}, dtype={mask.dtype}, "
-                  f"unique_labels={len(np.unique(mask))}, max_label={np.max(mask)}")
         
         # Use the same method as CLI: build_denoise_settings_for_all_channels
         # This matches: --denoise all --denoise-method median3

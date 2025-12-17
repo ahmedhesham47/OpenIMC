@@ -25,6 +25,12 @@ Entry point for running OpenIMC CLI and GUI as a module: python -m openimc
 # This must be the very first thing that happens when this module is imported
 import os
 import sys
+import warnings
+
+# Suppress dask dataframe legacy implementation warning at module level
+warnings.filterwarnings('ignore', category=FutureWarning, module='dask.dataframe')
+warnings.filterwarnings('ignore', category=FutureWarning, message='.*legacy.*Dask DataFrame.*')
+warnings.filterwarnings('ignore', category=FutureWarning, message='.*dataframe.query-planning.*')
 
 # Set environment variable first (this is read when dask is imported)
 os.environ['DASK_DATAFRAME__QUERY_PLANNING'] = 'False'
@@ -33,10 +39,9 @@ os.environ['DASK_DATAFRAME__QUERY_PLANNING'] = 'False'
 try:
     dask_dataframe_imported = 'dask.dataframe' in sys.modules
     if dask_dataframe_imported:
-        print("[DEBUG] __main__.py (module level): WARNING - dask.dataframe already imported!")
+        pass
     import dask
     dask.config.set({'dataframe.query-planning': False})
-    print("[DEBUG] __main__.py (module level): Configured dask: dataframe.query-planning = False")
 except (ImportError, AttributeError):
     pass
 
@@ -57,7 +62,9 @@ def run_gui():
     # Suppress warnings from dependencies
     import warnings
     # Suppress dask dataframe legacy implementation warning
+    warnings.filterwarnings('ignore', category=FutureWarning, module='dask.dataframe')
     warnings.filterwarnings('ignore', category=FutureWarning, message='.*legacy.*Dask DataFrame.*')
+    warnings.filterwarnings('ignore', category=FutureWarning, message='.*dataframe.query-planning.*')
     # Suppress xarray_schema pkg_resources deprecation warning
     warnings.filterwarnings('ignore', category=UserWarning, message='.*pkg_resources.*deprecated.*')
     # Suppress squidpy anndata __version__ deprecation warning
@@ -67,13 +74,11 @@ def run_gui():
     try:
         dask_dataframe_imported = 'dask.dataframe' in sys.modules
         if dask_dataframe_imported:
-            print("[DEBUG] __main__.py: WARNING - dask.dataframe already imported before configuration!")
+            pass
         import dask
         # Configure before dask.dataframe can be imported
         dask.config.set({'dataframe.query-planning': False})
-        print("[DEBUG] __main__.py: Configured dask: dataframe.query-planning = False")
     except (ImportError, AttributeError) as e:
-        print(f"[DEBUG] __main__.py: Could not configure dask: {e}")
         pass
 
     from PyQt5 import QtWidgets, QtGui

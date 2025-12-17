@@ -351,6 +351,30 @@ class FeatureSelectorDialog(QtWidgets.QDialog):
                 self.censor_both.setChecked(True)
             else:
                 self.censor_99th_only.setChecked(True)
+    
+    def set_selected_features(self, feature_names: List[str]):
+        """Pre-populate the dialog with specific features checked.
+        
+        Args:
+            feature_names: List of feature names to check. Features not in this list will be unchecked.
+        """
+        if feature_names is None:
+            return
+        
+        feature_set = set(feature_names)
+        
+        # Update checked_by_name for all available features
+        all_features = self._morpho_all + self._intensity_all
+        for name in all_features:
+            if name in feature_set:
+                self._checked_by_name[name] = Qt.Checked
+            else:
+                self._checked_by_name[name] = Qt.Unchecked
+        
+        # Update the visible lists
+        self._populate_checklist(self.lst_morpho, self._morpho_all)
+        # Re-apply intensity filter to update the intensity list
+        self._apply_intensity_filter()
 
 
 

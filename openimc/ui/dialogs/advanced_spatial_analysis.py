@@ -34,18 +34,11 @@ try:
     import dask
     # Check if dask.dataframe has already been imported (too late to configure)
     dask_dataframe_imported = 'dask.dataframe' in sys.modules
-    if dask_dataframe_imported:
-        print("[DEBUG] WARNING: dask.dataframe already imported - configuration may be too late!")
-    else:
-        print("[DEBUG] dask.dataframe not yet imported - configuring dask...")
     # Set configuration before dask.dataframe is imported
     dask.config.set({'dataframe.query-planning': False})
-    print("[DEBUG] Configured dask: dataframe.query-planning = False")
 except (ImportError, AttributeError) as e:
-    print(f"[DEBUG] Could not configure dask: {e}")
     pass
 except Exception as e:
-    print(f"[DEBUG] Unexpected error configuring dask: {e}")
     import traceback
     traceback.print_exc()
     pass
@@ -60,6 +53,7 @@ from matplotlib.figure import Figure
 import matplotlib.pyplot as plt
 from matplotlib.patches import Circle
 from scipy.spatial import Delaunay
+from scipy import stats
 import seaborn as sns
 from openimc.ui.dialogs.figure_save_dialog import save_figure_with_options
 from openimc.ui.dialogs.spatial_analysis import (
@@ -78,32 +72,22 @@ from openimc.core import (
     export_anndata
 )
 
-print("[DEBUG] advanced_spatial_analysis.py: Starting squidpy import check...")
-print(f"[DEBUG] _HAVE_SQUIDPY (from spatial_analysis): {_HAVE_SQUIDPY}")
 try:
     # Suppress FutureWarning about anndata.read_text deprecation and squidpy __version__ deprecation
     import warnings
     with warnings.catch_warnings():
         warnings.filterwarnings('ignore', category=FutureWarning, message='.*read_text.*')
         warnings.filterwarnings('ignore', category=FutureWarning, message='.*__version__.*')
-        print("[DEBUG] Attempting to import squidpy...")
         import squidpy as sq
-        print(f"[DEBUG] Successfully imported squidpy, version: {getattr(sq, '__version__', 'unknown')}")
-        print("[DEBUG] Attempting to import anndata...")
         import anndata as ad
-        print(f"[DEBUG] Successfully imported anndata, version: {getattr(ad, '__version__', 'unknown')}")
     _HAVE_SQUIDPY_LOCAL = True
     _SQUIDPY_IMPORT_ERROR = None
-    print("[DEBUG] _HAVE_SQUIDPY_LOCAL set to True")
 except (ImportError, RuntimeError) as e:
     sq = None
     ad = None
     _HAVE_SQUIDPY_LOCAL = False
     _SQUIDPY_IMPORT_ERROR = str(e)
-    print(f"[DEBUG] FAILED to import squidpy/anndata: {e}")
-    print(f"[DEBUG] Exception type: {type(e)}")
     import traceback
-    print(f"[DEBUG] Traceback:")
     traceback.print_exc()
     # Log the error for debugging
     import warnings
@@ -113,10 +97,7 @@ except Exception as e:
     ad = None
     _HAVE_SQUIDPY_LOCAL = False
     _SQUIDPY_IMPORT_ERROR = str(e)
-    print(f"[DEBUG] UNEXPECTED ERROR importing squidpy/anndata: {e}")
-    print(f"[DEBUG] Exception type: {type(e)}")
     import traceback
-    print(f"[DEBUG] Traceback:")
     traceback.print_exc()
 
 try:
@@ -127,23 +108,15 @@ except Exception:
 
 class AdvancedSpatialAnalysisDialog(QtWidgets.QDialog):
     """Advanced Spatial Analysis Dialog using squidpy for all analyses."""
-    def __init__(self, feature_dataframe: pd.DataFrame, batch_corrected_dataframe=None, parent=None):
-        print("[DEBUG] AdvancedSpatialAnalysisDialog.__init__: Starting initialization...")
-        print(f"[DEBUG] _HAVE_SQUIDPY (from spatial_analysis): {_HAVE_SQUIDPY}")
-        print(f"[DEBUG] _HAVE_SQUIDPY_LOCAL (local import): {_HAVE_SQUIDPY_LOCAL}")
-        print(f"[DEBUG] _SQUIDPY_IMPORT_ERROR: {_SQUIDPY_IMPORT_ERROR if '_SQUIDPY_IMPORT_ERROR' in globals() else 'N/A'}")
-        print(f"[DEBUG] sq is None: {sq is None}")
-        print(f"[DEBUG] ad is None: {ad is None}")
+    def __init__(self, feature_dataframe: pd.DataFrame, batch_corrected_dataframe=None, clustered_cells_dataframe=None, parent=None):
         
         # Check both the imported flag and local import status
         if not _HAVE_SQUIDPY and not _HAVE_SQUIDPY_LOCAL:
-            print("[DEBUG] Both _HAVE_SQUIDPY and _HAVE_SQUIDPY_LOCAL are False - raising error")
             error_msg = "squidpy is required for AdvancedSpatialAnalysisDialog. Please install with: pip install squidpy anndata"
             if '_SQUIDPY_IMPORT_ERROR' in globals() and _SQUIDPY_IMPORT_ERROR:
                 error_msg += f"\n\nImport error details: {_SQUIDPY_IMPORT_ERROR}"
             raise RuntimeError(error_msg)
         
-        print("[DEBUG] Squidpy check passed, continuing initialization...")
         
         super().__init__(parent)
         self.setWindowTitle("Advanced Spatial Analysis (Squidpy)")
@@ -156,12 +129,20 @@ class AdvancedSpatialAnalysisDialog(QtWidgets.QDialog):
             dialog_height = int(parent_size.height() * 0.9)
             self.resize(dialog_width, dialog_height)
 
-        self.original_feature_dataframe = feature_dataframe
+        self.original_feature_dataframe = feature_dataframe  # Full dataset
         self.batch_corrected_dataframe = batch_corrected_dataframe
+        self.clustered_cells_dataframe = clustered_cells_dataframe  # Saved state only (for initialization)
+        
+        # ALWAYS start with full feature_dataframe - do NOT pre-filter
+        # Filtering will be applied dynamically when needed based on current clustering state
         if batch_corrected_dataframe is not None and not batch_corrected_dataframe.empty:
             self.feature_dataframe = batch_corrected_dataframe.copy()
         else:
             self.feature_dataframe = feature_dataframe.copy()
+        
+        # Note: clustered_cells_dataframe is stored but NOT used to filter feature_dataframe
+        # We want users to have access to all cells for new analyses
+        # Filtering happens dynamically when creating AnnData objects based on current clustering state
         
         # Store AnnData objects per ROI
         self.anndata_cache: Dict[str, 'ad.AnnData'] = {}
@@ -272,16 +253,11 @@ class AdvancedSpatialAnalysisDialog(QtWidgets.QDialog):
     
     def _get_or_create_anndata(self, roi_id: str) -> Optional['ad.AnnData']:
         """Get or create AnnData object for a specific ROI."""
-        print(f"[DEBUG] _get_or_create_anndata: roi_id={roi_id}")
         if roi_id in self.anndata_cache:
-            print(f"[DEBUG] Using cached AnnData for ROI {roi_id}")
             return self.anndata_cache[roi_id]
         
         roi_col = self._get_roi_column()
-        print(f"[DEBUG] ROI column: {roi_col}")
         filtered_df = self._get_filtered_dataframe()
-        print(f"[DEBUG] Filtered dataframe shape: {filtered_df.shape}")
-        print(f"[DEBUG] Filtered dataframe columns: {list(filtered_df.columns)[:10]}...")
         
         # Get pixel size
         pixel_size_um = self._get_pixel_size_um(roi_id)
@@ -295,15 +271,11 @@ class AdvancedSpatialAnalysisDialog(QtWidgets.QDialog):
         )
         
         if adata is not None:
-            print(f"[DEBUG] Created AnnData: shape={adata.shape}, var_names={list(adata.var_names)[:5]}...")
             # Ensure cluster columns are categorical (required by squidpy)
             for col in ['cluster', 'cluster_phenotype', 'cluster_id']:
                 if col in adata.obs.columns:
                     adata.obs[col] = adata.obs[col].astype('category')
-                    print(f"[DEBUG] Set {col} as categorical, categories: {list(adata.obs[col].cat.categories)}")
             self.anndata_cache[roi_id] = adata
-        else:
-            print(f"[DEBUG] Failed to create AnnData for ROI {roi_id}")
         
         return adata
     
@@ -611,8 +583,34 @@ class AdvancedSpatialAnalysisDialog(QtWidgets.QDialog):
         sq_autocorr_btn_layout.addWidget(self.sq_autocorr_save_btn)
         sq_autocorr_btn_layout.addStretch()
         
+        # Visualization controls
+        sq_autocorr_viz_layout = QtWidgets.QHBoxLayout()
+        sq_autocorr_viz_layout.addWidget(QtWidgets.QLabel("Visualization Type:"))
+        self.sq_autocorr_viz_type_combo = QtWidgets.QComboBox()
+        self.sq_autocorr_viz_type_combo.addItems(["Bar Plot (Top K)", "Moran Scatter Plot", "Spatial Map"])
+        self.sq_autocorr_viz_type_combo.setCurrentText("Bar Plot (Top K)")
+        self.sq_autocorr_viz_type_combo.setToolTip(
+            "Bar Plot: Top K features by Moran's I\n"
+            "Moran Scatter Plot: Canonical visualization showing variable vs spatial lag\n"
+            "Spatial Map: Spatial coordinates colored by variable value"
+        )
+        sq_autocorr_viz_layout.addWidget(self.sq_autocorr_viz_type_combo)
+        
+        sq_autocorr_viz_layout.addWidget(QtWidgets.QLabel("Variable:"))
+        self.sq_autocorr_var_combo = QtWidgets.QComboBox()
+        self.sq_autocorr_var_combo.setToolTip("Select variable to visualize (for Moran scatter plot or spatial map)")
+        self.sq_autocorr_var_combo.setEnabled(False)  # Enabled when visualization type requires it
+        sq_autocorr_viz_layout.addWidget(self.sq_autocorr_var_combo)
+        
+        self.sq_autocorr_plot_viz_btn = QtWidgets.QPushButton("Plot Visualization")
+        self.sq_autocorr_plot_viz_btn.setEnabled(False)
+        self.sq_autocorr_plot_viz_btn.setToolTip("Generate selected visualization for the chosen variable")
+        sq_autocorr_viz_layout.addWidget(self.sq_autocorr_plot_viz_btn)
+        sq_autocorr_viz_layout.addStretch()
+        
         sq_autocorr_layout.addLayout(sq_autocorr_params)
         sq_autocorr_layout.addLayout(sq_autocorr_btn_layout)
+        sq_autocorr_layout.addLayout(sq_autocorr_viz_layout)
         
         # Add navigation toolbar
         self.sq_autocorr_canvas = FigureCanvas(Figure(figsize=(8, 6)))
@@ -625,6 +623,8 @@ class AdvancedSpatialAnalysisDialog(QtWidgets.QDialog):
         self.sq_autocorr_save_btn.clicked.connect(self._save_sq_autocorr_plot)
         self.sq_autocorr_roi_combo.currentIndexChanged.connect(self._on_sq_autocorr_roi_changed)
         self.sq_autocorr_topk_spin.valueChanged.connect(self._on_sq_autocorr_topk_changed)
+        self.sq_autocorr_viz_type_combo.currentTextChanged.connect(self._on_sq_autocorr_viz_type_changed)
+        self.sq_autocorr_plot_viz_btn.clicked.connect(self._plot_sq_autocorr_visualization)
     
     def _create_sq_ripley_tab(self):
         """Create Ripley tab."""
@@ -909,7 +909,7 @@ class AdvancedSpatialAnalysisDialog(QtWidgets.QDialog):
                                 self._plot_sq_nhood_enrichment(adata)
                                 self.sq_nhood_save_btn.setEnabled(True)
                         except Exception as e:
-                            print(f"[DEBUG] Error re-running enrichment for ROI {roi_id}: {e}")
+                            pass
                 elif 'nhood_enrichment' in adata.uns:
                     # Use existing results if available
                     self._plot_sq_nhood_enrichment(adata)
@@ -1032,7 +1032,7 @@ class AdvancedSpatialAnalysisDialog(QtWidgets.QDialog):
                             self._plot_sq_nhood_enrichment(adata)
                             self.sq_nhood_save_btn.setEnabled(True)
                     except Exception as e:
-                        print(f"[DEBUG] Error re-running enrichment for ROI {roi_id}: {e}")
+                        pass
     
     def _update_cooccur_ref_cluster_combo(self, adata: 'ad.AnnData', preserve_selection: bool = True):
         """Update the reference cluster combo box with available clusters."""
@@ -1092,11 +1092,124 @@ class AdvancedSpatialAnalysisDialog(QtWidgets.QDialog):
             if 'autocorrelation' in self.aggregated_results:
                 self._plot_sq_autocorrelation(self.aggregated_results['autocorrelation'])
                 self.sq_autocorr_save_btn.setEnabled(True)
+            self._update_autocorr_var_combo()
         elif roi_id in self.anndata_cache:
             adata = self.anndata_cache[roi_id]
             if 'moranI' in adata.uns:
                 self._plot_sq_autocorrelation(adata)
                 self.sq_autocorr_save_btn.setEnabled(True)
+            self._update_autocorr_var_combo()
+    
+    def _on_sq_autocorr_viz_type_changed(self):
+        """Handle visualization type change in autocorrelation tab."""
+        viz_type = self.sq_autocorr_viz_type_combo.currentText()
+        # Enable variable combo only for Moran scatter plot or spatial map
+        needs_var = viz_type in ["Moran Scatter Plot", "Spatial Map"]
+        self.sq_autocorr_var_combo.setEnabled(needs_var)
+        self.sq_autocorr_plot_viz_btn.setEnabled(needs_var)
+        
+        # If switching to bar plot, show the default plot
+        if viz_type == "Bar Plot (Top K)":
+            self._on_sq_autocorr_roi_changed()
+    
+    def _update_autocorr_var_combo(self):
+        """Update variable combo box with available variables, ordered by p-value."""
+        self.sq_autocorr_var_combo.clear()
+        
+        roi_id = self._get_selected_roi(self.sq_autocorr_roi_combo)
+        adata = None
+        
+        if roi_id is None:
+            # Use aggregated result if available
+            if 'autocorrelation' in self.aggregated_results:
+                adata = self.aggregated_results['autocorrelation']
+        elif roi_id in self.anndata_cache:
+            adata = self.anndata_cache[roi_id]
+        
+        if adata is not None and hasattr(adata, 'uns'):
+            # Check for moranI results
+            moran_key = None
+            if 'moranI' in adata.uns:
+                moran_key = 'moranI'
+            else:
+                # Try alternative key names
+                for key in adata.uns.keys():
+                    if 'moran' in key.lower() or 'autocorr' in key.lower():
+                        moran_key = key
+                        break
+            
+            if moran_key is None:
+                return
+            
+            moran_data = adata.uns[moran_key]
+            
+            # Extract variable names and p-values
+            var_pval_list = []
+            
+            if isinstance(moran_data, pd.DataFrame):
+                # DataFrame format
+                if 'pval_norm' in moran_data.columns:
+                    pval_col = 'pval_norm'
+                elif 'pval' in moran_data.columns:
+                    pval_col = 'pval'
+                else:
+                    pval_col = None
+                
+                # Get variable names from index
+                if 'var_names' in moran_data.columns:
+                    var_names = moran_data['var_names'].values
+                elif moran_data.index.name == 'var_names' or all(isinstance(x, str) for x in moran_data.index):
+                    var_names = moran_data.index.values
+                else:
+                    var_names = [str(x) for x in moran_data.index]
+                
+                # Pair with p-values
+                if pval_col:
+                    for i, var in enumerate(var_names):
+                        if var != 'touches_edge':
+                            pval = moran_data.iloc[i][pval_col] if i < len(moran_data) else 1.0
+                            var_pval_list.append((var, float(pval)))
+                else:
+                    # No p-values, just use variable names
+                    var_pval_list = [(var, 1.0) for var in var_names if var != 'touches_edge']
+            
+            elif isinstance(moran_data, dict):
+                # Dict format
+                var_names = moran_data.get('var_names', [])
+                p_values = moran_data.get('pval_norm', moran_data.get('pval', None))
+                
+                if var_names and p_values is not None:
+                    if isinstance(p_values, (list, np.ndarray)):
+                        for var, pval in zip(var_names, p_values):
+                            if var != 'touches_edge':
+                                var_pval_list.append((var, float(pval)))
+                    else:
+                        # Single p-value for all
+                        var_pval_list = [(var, 1.0) for var in var_names if var != 'touches_edge']
+                else:
+                    # No p-values, just use variable names
+                    var_pval_list = [(var, 1.0) for var in var_names if var != 'touches_edge']
+            
+            # Sort by p-value (ascending - most significant first)
+            var_pval_list.sort(key=lambda x: x[1])
+            
+            # Add to combo with p-value annotation
+            for var, pval in var_pval_list:
+                if pval < 0.001:
+                    label = f"{var} (p < 0.001)"
+                elif pval < 0.01:
+                    label = f"{var} (p = {pval:.3f})"
+                elif pval < 0.05:
+                    label = f"{var} (p = {pval:.2f})"
+                else:
+                    label = f"{var} (p = {pval:.2f})"
+                self.sq_autocorr_var_combo.addItem(label, var)  # Store actual var name as data
+            
+            # Enable if there are variables and visualization type requires it
+            viz_type = self.sq_autocorr_viz_type_combo.currentText()
+            if var_pval_list and viz_type in ["Moran Scatter Plot", "Spatial Map"]:
+                self.sq_autocorr_var_combo.setEnabled(True)
+                self.sq_autocorr_plot_viz_btn.setEnabled(True)
     
     def _on_sq_ripley_roi_changed(self):
         """Handle ROI change in Ripley tab."""
@@ -1170,17 +1283,28 @@ class AdvancedSpatialAnalysisDialog(QtWidgets.QDialog):
     
     def _create_spatial_graph(self):
         """Create spatial graph for all ROIs using core function."""
-        print(f"[DEBUG] _create_spatial_graph: Starting")
         if not self._validate_data():
-            print(f"[DEBUG] Data validation failed")
             return
+        
+        # Show progress dialog
+        progress_dlg = QtWidgets.QProgressDialog(
+            "Creating spatial graph...",
+            None,
+            0,
+            0,
+            self
+        )
+        progress_dlg.setWindowTitle("Building Spatial Graph")
+        progress_dlg.setWindowModality(QtCore.Qt.WindowModal)
+        progress_dlg.setMinimumDuration(0)
+        progress_dlg.setValue(0)
+        QtWidgets.QApplication.processEvents()
         
         try:
             method = self.graph_method_combo.currentText()
             k = int(self.graph_k_spin.value()) if method == "kNN" else None
             radius = float(self.graph_radius_spin.value()) if method == "Radius" else None
             seed = int(self.seed_spinbox.value())
-            print(f"[DEBUG] Graph method: {method}, k={k}, radius={radius}")
             
             roi_col = self._get_roi_column()
             filtered_df = self._get_filtered_dataframe()
@@ -1188,6 +1312,7 @@ class AdvancedSpatialAnalysisDialog(QtWidgets.QDialog):
             # Get pixel size (use first ROI as default)
             all_rois = self._get_all_rois()
             if not all_rois:
+                progress_dlg.close()
                 QtWidgets.QMessageBox.warning(self, "No ROIs", "No ROIs found in the data.")
                 return
             
@@ -1228,41 +1353,54 @@ class AdvancedSpatialAnalysisDialog(QtWidgets.QDialog):
                         self._update_cooccur_ref_cluster_combo(first_adata)
                 
                 self._update_button_states()
+                progress_dlg.close()
                 QtWidgets.QMessageBox.information(self, "Graph Created", 
                     f"Spatial graph created successfully for {success_count} ROI(s).")
             else:
                 self.graph_status_label.setText("Graph creation failed")
                 self.graph_status_label.setStyleSheet("color: red;")
+                progress_dlg.close()
                 QtWidgets.QMessageBox.warning(self, "Graph Creation Failed", 
                     "Failed to create spatial graph for any ROI.")
                 
         except Exception as e:
             import traceback
             traceback.print_exc()
+            progress_dlg.close()
             QtWidgets.QMessageBox.critical(self, "Error", f"Error creating spatial graph: {str(e)}")
     
     def _run_sq_nhood_enrichment(self):
         """Run neighborhood enrichment analysis using core function."""
-        print(f"[DEBUG] _run_sq_nhood_enrichment: Starting", flush=True)
         import sys
         sys.stdout.flush()
         if not self.spatial_graph_built:
-            print(f"[DEBUG] Spatial graph not built", flush=True)
             QtWidgets.QMessageBox.warning(self, "Graph Required", 
                 "Please create the spatial graph first (Step 1 at the top).")
             return
+        
+        # Show progress dialog
+        progress_dlg = QtWidgets.QProgressDialog(
+            "Running neighborhood enrichment analysis...",
+            None,
+            0,
+            0,
+            self
+        )
+        progress_dlg.setWindowTitle("Neighborhood Enrichment")
+        progress_dlg.setWindowModality(QtCore.Qt.WindowModal)
+        progress_dlg.setMinimumDuration(0)
+        progress_dlg.setValue(0)
+        QtWidgets.QApplication.processEvents()
         
         try:
             cluster_key = self.sq_nhood_cluster_combo.currentText()
             roi_id = self._get_selected_roi(self.sq_nhood_roi_combo)
             agg_method = self.sq_nhood_agg_combo.currentText().lower()  # "mean" or "sum"
-            print(f"[DEBUG] Cluster key: {cluster_key}, ROI: {roi_id}, Aggregation: {agg_method}", flush=True)
             sys.stdout.flush()
             
             # Check if cluster column exists
             filtered_df = self._get_filtered_dataframe()
             if cluster_key not in filtered_df.columns:
-                print(f"[DEBUG] Cluster column '{cluster_key}' not found in dataframe")
                 QtWidgets.QMessageBox.warning(self, "Missing Column", 
                     f"Cluster column '{cluster_key}' not found in data.")
                 return
@@ -1288,38 +1426,28 @@ class AdvancedSpatialAnalysisDialog(QtWidgets.QDialog):
                 return
             
             # Use core function
-            print(f"[DEBUG] Calling spatial_neighborhood_enrichment with {len(anndata_dict)} ROI(s)", flush=True)
             import sys
             sys.stdout.flush()
             try:
-                print(f"[DEBUG] About to call spatial_neighborhood_enrichment...", flush=True)
                 results = spatial_neighborhood_enrichment(
                     anndata_dict=anndata_dict,
                     cluster_key=cluster_key,
                     aggregation=agg_method
                 )
-                print(f"[DEBUG] spatial_neighborhood_enrichment returned", flush=True)
                 sys.stdout.flush()
-                print(f"[DEBUG] Results keys: {list(results.keys())}", flush=True)
-                print(f"[DEBUG] Results has 'results': {'results' in results}", flush=True)
-                print(f"[DEBUG] Results has 'aggregated': {'aggregated' in results}", flush=True)
-                print(f"[DEBUG] Results has 'significant_counts': {'significant_counts' in results}", flush=True)
                 if 'results' in results:
-                    print(f"[DEBUG] Number of result ROIs: {len(results['results'])}", flush=True)
+                    pass
                 if 'aggregated' in results:
-                    print(f"[DEBUG] Aggregated is None: {results['aggregated'] is None}", flush=True)
                     if results['aggregated'] is not None:
-                        print(f"[DEBUG] Aggregated shape: {results['aggregated'].shape}", flush=True)
+                        pass
                 sys.stdout.flush()
             except Exception as e:
-                print(f"[DEBUG] ERROR in spatial_neighborhood_enrichment: {e}", flush=True)
                 import traceback
                 traceback.print_exc()
                 sys.stdout.flush()
                 raise
             
             # Update cache with results
-            print(f"[DEBUG] Updating cache with results")
             self.anndata_cache.update(results['results'])
             
             # Update status
@@ -1330,9 +1458,6 @@ class AdvancedSpatialAnalysisDialog(QtWidgets.QDialog):
             
             # Create temporary adata for aggregated plotting
             if results['aggregated'] is not None:
-                print(f"[DEBUG] Creating TempAnnData for aggregated results")
-                print(f"[DEBUG] Aggregated matrix type: {type(results['aggregated'])}, shape: {results['aggregated'].shape if hasattr(results['aggregated'], 'shape') else 'N/A'}")
-                print(f"[DEBUG] Cluster categories: {results['cluster_categories']}")
                 
                 class TempAnnData:
                     def __init__(self, matrix, cluster_key, obs, significant_counts=None):
@@ -1353,9 +1478,6 @@ class AdvancedSpatialAnalysisDialog(QtWidgets.QDialog):
                     obs_df,
                     significant_counts=results.get('significant_counts')
                 )
-                print(f"[DEBUG] TempAnnData created: uns keys={list(temp_adata.uns.keys())}, obs shape={obs_df.shape}")
-                print(f"[DEBUG] TempAnnData.uns['nhood_enrichment'] keys={list(temp_adata.uns['nhood_enrichment'].keys())}")
-                print(f"[DEBUG] TempAnnData.uns['nhood_enrichment']['zscore'] shape={temp_adata.uns['nhood_enrichment']['zscore'].shape}")
                 
                 self.aggregated_results['nhood_enrichment'] = temp_adata
                 
@@ -1364,11 +1486,8 @@ class AdvancedSpatialAnalysisDialog(QtWidgets.QDialog):
                     f"Aggregated using {agg_method}.")
                 
                 # Plot aggregated results
-                print(f"[DEBUG] Calling _plot_sq_nhood_enrichment with TempAnnData")
-                print(f"[DEBUG] TempAnnData.uns keys: {list(temp_adata.uns.keys())}")
-                print(f"[DEBUG] TempAnnData has significant_counts: {hasattr(temp_adata, '_significant_counts')}")
                 if hasattr(temp_adata, '_significant_counts') and temp_adata._significant_counts is not None:
-                    print(f"[DEBUG] significant_counts shape: {temp_adata._significant_counts.shape}")
+                    pass
                 # Switch to neighborhood enrichment tab to show the plot
                 nhood_tab_idx = None
                 for i in range(self.tabs.count()):
@@ -1377,7 +1496,6 @@ class AdvancedSpatialAnalysisDialog(QtWidgets.QDialog):
                         break
                 if nhood_tab_idx is not None:
                     self.tabs.setCurrentIndex(nhood_tab_idx)
-                    print(f"[DEBUG] Switched to Neighborhood Enrichment tab (index {nhood_tab_idx})")
                 
                 self._plot_sq_nhood_enrichment(temp_adata)
                 # Ensure canvas is visible
@@ -1389,10 +1507,8 @@ class AdvancedSpatialAnalysisDialog(QtWidgets.QDialog):
                 # Plot first ROI result
                 if results['results']:
                     first_adata = list(results['results'].values())[0]
-                    print(f"[DEBUG] Plotting first ROI result (no aggregated result)")
-                    print(f"[DEBUG] First ROI adata.uns keys: {list(first_adata.uns.keys())}")
                     if 'nhood_enrichment' in first_adata.uns:
-                        print(f"[DEBUG] First ROI nhood_enrichment keys: {list(first_adata.uns['nhood_enrichment'].keys()) if isinstance(first_adata.uns['nhood_enrichment'], dict) else 'N/A'}")
+                        pass
                     # Switch to neighborhood enrichment tab to show the plot
                     nhood_tab_idx = None
                     for i in range(self.tabs.count()):
@@ -1401,7 +1517,6 @@ class AdvancedSpatialAnalysisDialog(QtWidgets.QDialog):
                             break
                     if nhood_tab_idx is not None:
                         self.tabs.setCurrentIndex(nhood_tab_idx)
-                        print(f"[DEBUG] Switched to Neighborhood Enrichment tab (index {nhood_tab_idx})")
                     
                     self._plot_sq_nhood_enrichment(first_adata)
                     # Ensure canvas is visible
@@ -1413,17 +1528,13 @@ class AdvancedSpatialAnalysisDialog(QtWidgets.QDialog):
                         f"Neighborhood enrichment completed for {len(results['results'])} ROI(s).")
                 
         except Exception as e:
-            print(f"[DEBUG] EXCEPTION in _run_sq_nhood_enrichment: {e}")
             import traceback
             traceback.print_exc()
             QtWidgets.QMessageBox.critical(self, "Error", f"Error running enrichment: {str(e)}")
     
     def _plot_sq_nhood_enrichment(self, adata: 'ad.AnnData'):
         """Plot neighborhood enrichment results with improved visualization."""
-        print(f"[DEBUG] _plot_sq_nhood_enrichment: Starting")
-        print(f"[DEBUG] adata: {adata}")
         if adata is None:
-            print(f"[DEBUG] adata is None")
             self.sq_nhood_canvas.figure.clear()
             ax = self.sq_nhood_canvas.figure.add_subplot(111)
             ax.text(0.5, 0.5, 'No data provided for plotting.', 
@@ -1431,10 +1542,8 @@ class AdvancedSpatialAnalysisDialog(QtWidgets.QDialog):
             self.sq_nhood_canvas.draw()
             return
         
-        print(f"[DEBUG] adata.uns keys: {list(adata.uns.keys()) if hasattr(adata, 'uns') else 'N/A'}")
         
         if 'nhood_enrichment' not in adata.uns:
-            print(f"[DEBUG] 'nhood_enrichment' not found in adata.uns")
             self.sq_nhood_canvas.figure.clear()
             ax = self.sq_nhood_canvas.figure.add_subplot(111)
             ax.text(0.5, 0.5, 'No enrichment data found.\nPlease run enrichment analysis first.', 
@@ -1442,44 +1551,41 @@ class AdvancedSpatialAnalysisDialog(QtWidgets.QDialog):
             self.sq_nhood_canvas.draw()
             return
         
-        # Clear figure and create new subplot
+        # Clear figure and create new subplot with space for external legend
         self.sq_nhood_canvas.figure.clear()
-        ax = self.sq_nhood_canvas.figure.add_subplot(111)
+        # Create a grid layout: main plot on top, legend area below
+        gs = self.sq_nhood_canvas.figure.add_gridspec(2, 1, height_ratios=[4, 1], hspace=0.15, wspace=0.1)
+        ax = self.sq_nhood_canvas.figure.add_subplot(gs[0, 0])
+        ax_legend = self.sq_nhood_canvas.figure.add_subplot(gs[1, 0])
+        ax_legend.axis('off')  # Hide axes for legend area
         
         enrichment_data = adata.uns['nhood_enrichment']
         cluster_key = self.sq_nhood_cluster_combo.currentText()
         
-        print(f"[DEBUG] enrichment_data type: {type(enrichment_data)}")
         if isinstance(enrichment_data, dict):
-            print(f"[DEBUG] enrichment_data keys: {list(enrichment_data.keys())}")
+            pass
         
         # Extract matrix from enrichment data
         matrix = None
         if isinstance(enrichment_data, dict):
             if 'zscore' in enrichment_data:
                 matrix = enrichment_data['zscore']
-                print(f"[DEBUG] Found 'zscore' key, shape: {matrix.shape if hasattr(matrix, 'shape') else 'N/A'}")
             elif 'count' in enrichment_data:
                 matrix = enrichment_data['count']
-                print(f"[DEBUG] Found 'count' key, shape: {matrix.shape if hasattr(matrix, 'shape') else 'N/A'}")
             elif 'stat' in enrichment_data:
                 matrix = enrichment_data['stat']
-                print(f"[DEBUG] Found 'stat' key, shape: {matrix.shape if hasattr(matrix, 'shape') else 'N/A'}")
             else:
                 # Try to find a matrix-like value
                 for key, value in enrichment_data.items():
                     if isinstance(value, np.ndarray) and value.ndim == 2:
                         matrix = value
-                        print(f"[DEBUG]   Found matrix at key '{key}', shape: {matrix.shape}")
                         break
                 if matrix is None and len(enrichment_data) > 0:
                     first_val = list(enrichment_data.values())[0]
                     if isinstance(first_val, np.ndarray) and first_val.ndim == 2:
                         matrix = first_val
-                        print(f"[DEBUG]   Using first value as matrix, shape: {matrix.shape}")
         elif isinstance(enrichment_data, np.ndarray):
             matrix = enrichment_data
-            print(f"[DEBUG] enrichment_data is numpy array, shape: {matrix.shape}")
         
         # Get cluster labels
         categories = None
@@ -1488,14 +1594,11 @@ class AdvancedSpatialAnalysisDialog(QtWidgets.QDialog):
                 categories = list(adata.obs[cluster_key].cat.categories)
             else:
                 categories = sorted(adata.obs[cluster_key].unique())
-            print(f"[DEBUG] Found {len(categories)} categories: {categories[:5]}...")
         
         if matrix is not None and isinstance(matrix, np.ndarray) and matrix.ndim == 2:
-            print(f"[DEBUG] Plotting matrix with shape {matrix.shape}")
             try:
                 # Handle NaN/inf values
                 if np.any(np.isnan(matrix)) or np.any(np.isinf(matrix)):
-                    print(f"[DEBUG] Found NaN/inf values, replacing")
                     matrix = np.nan_to_num(matrix, nan=0.0, posinf=3.0, neginf=-3.0)
                 
                 # Determine color scale
@@ -1511,18 +1614,15 @@ class AdvancedSpatialAnalysisDialog(QtWidgets.QDialog):
                 else:
                     vmin, vmax = -3, 3
                 
-                print(f"[DEBUG] Using vmin={vmin}, vmax={vmax}")
                 
                 # Get significance information
                 significant_counts = None
                 significance_threshold = 2.0
                 if hasattr(adata, '_significant_counts') and adata._significant_counts is not None:
                     significant_counts = adata._significant_counts
-                    print(f"[DEBUG] Found significant_counts in adata, shape: {significant_counts.shape}")
                 else:
                     # Compute significance from z-scores
                     significant_counts = (np.abs(matrix) > significance_threshold).astype(int)
-                    print(f"[DEBUG] Computed significant_counts from matrix, threshold={significance_threshold}")
                 
                 # Create DataFrame for seaborn heatmap
                 if categories is not None and len(categories) == matrix.shape[0] == matrix.shape[1]:
@@ -1531,25 +1631,13 @@ class AdvancedSpatialAnalysisDialog(QtWidgets.QDialog):
                 else:
                     df = pd.DataFrame(matrix)
                 
-                # Create annotation matrix: z-score values + significance markers
+                # Create annotation matrix: z-score values only (no asterisks)
                 annot_matrix = np.empty(matrix.shape, dtype=object)
                 for i in range(matrix.shape[0]):
                     for j in range(matrix.shape[1]):
                         z_val = matrix[i, j]
                         # Format z-score (2 decimal places)
-                        z_str = f"{z_val:.2f}"
-                        
-                        # Add significance marker
-                        if significant_counts is not None and significant_counts[i, j] > 0:
-                            # Use star(s) to indicate significance
-                            # More stars for higher counts (if multiple ROIs)
-                            if significant_counts[i, j] > 1:
-                                stars = "*" * min(significant_counts[i, j], 3)  # Max 3 stars
-                                z_str = f"{z_str}\n{stars}"
-                            else:
-                                z_str = f"{z_str}\n*"
-                        
-                        annot_matrix[i, j] = z_str
+                        annot_matrix[i, j] = f"{z_val:.2f}"
                 
                 # Create heatmap using seaborn for better aesthetics
                 # Use a diverging colormap centered at 0 (red-white-blue)
@@ -1568,7 +1656,7 @@ class AdvancedSpatialAnalysisDialog(QtWidgets.QDialog):
                            linewidths=0.5,
                            cbar_kws={'label': 'Z-Score', 'shrink': 0.8},
                            ax=ax,
-                           annot_kws={'size': 8, 'weight': 'bold', 'color': 'black'},
+                           annot_kws={'size': 9, 'weight': 'normal', 'color': 'black'},
                            xticklabels=True,
                            yticklabels=True)
                 
@@ -1581,28 +1669,13 @@ class AdvancedSpatialAnalysisDialog(QtWidgets.QDialog):
                 ax.set_ylabel("Cell Cluster", fontsize=11, fontweight='bold')
                 ax.set_title("Neighborhood Enrichment Analysis", fontsize=13, fontweight='bold', pad=15)
                 
-                # Add legend for significance markers if we have multi-ROI data
-                if significant_counts is not None and np.max(significant_counts) > 1:
-                    max_count = np.max(significant_counts)
-                    legend_text = "Significance: * = significant (|z| > 2.0)"
-                    if max_count > 1:
-                        legend_text += f"\nMultiple * = significant in {max_count} images"
-                    ax.text(0.02, 0.98, legend_text, 
-                           transform=ax.transAxes, 
-                           fontsize=9,
-                           verticalalignment='top',
-                           bbox=dict(boxstyle='round', facecolor='wheat', alpha=0.8))
-                
-                print(f"[DEBUG] Plot completed successfully")
                 
             except Exception as e:
-                print(f"[DEBUG] Error during plotting: {e}")
                 import traceback
                 traceback.print_exc()
                 raise
         else:
             # Debug: show what we got
-            print(f"[DEBUG] Failed to extract matrix for plotting")
             debug_info = f"Data type: {type(enrichment_data)}\n"
             if isinstance(enrichment_data, dict):
                 debug_info += f"Keys: {list(enrichment_data.keys())}\n"
@@ -1610,25 +1683,17 @@ class AdvancedSpatialAnalysisDialog(QtWidgets.QDialog):
                     debug_info += f"  {k}: {type(v)}, shape: {getattr(v, 'shape', 'N/A')}\n"
             else:
                 debug_info += f"Value: {enrichment_data}\n"
-            print(f"[DEBUG] Debug info:\n{debug_info}")
             ax.text(0.5, 0.5, f'Unable to plot enrichment data.\nData format not recognized.\n\n{debug_info}', 
                    ha='center', va='center', transform=ax.transAxes, fontsize=8)
         
         try:
-            print(f"[DEBUG] Applying layout adjustments...")
             # Adjust layout for better spacing
             self.sq_nhood_canvas.figure.tight_layout()
-            print(f"[DEBUG] tight_layout completed")
-            print(f"[DEBUG] Drawing canvas...")
             self.sq_nhood_canvas.draw()
-            print(f"[DEBUG] Canvas draw completed")
             # Force update and repaint
-            print(f"[DEBUG] Updating canvas...")
             self.sq_nhood_canvas.update()
             self.sq_nhood_canvas.repaint()
-            print(f"[DEBUG] Canvas update and repaint completed")
         except Exception as e:
-            print(f"[DEBUG] Error during canvas update: {e}")
             import traceback
             traceback.print_exc()
     
@@ -1639,17 +1704,28 @@ class AdvancedSpatialAnalysisDialog(QtWidgets.QDialog):
     
     def _run_sq_cooccurrence(self):
         """Run co-occurrence analysis using core function."""
-        print(f"[DEBUG] _run_sq_cooccurrence: Starting")
         if not self.spatial_graph_built:
-            print(f"[DEBUG] Spatial graph not built")
             QtWidgets.QMessageBox.warning(self, "Graph Required", 
                 "Please create the spatial graph first (Step 1 at the top).")
             return
         
+        # Show progress dialog
+        progress_dlg = QtWidgets.QProgressDialog(
+            "Running co-occurrence analysis...",
+            None,
+            0,
+            0,
+            self
+        )
+        progress_dlg.setWindowTitle("Co-occurrence Analysis")
+        progress_dlg.setWindowModality(QtCore.Qt.WindowModal)
+        progress_dlg.setMinimumDuration(0)
+        progress_dlg.setValue(0)
+        QtWidgets.QApplication.processEvents()
+        
         try:
             cluster_key = self.sq_cooccur_cluster_combo.currentText()
             roi_id = self._get_selected_roi(self.sq_cooccur_roi_combo)
-            print(f"[DEBUG] Cluster key: {cluster_key}, ROI: {roi_id}")
             
             # Parse neighborhood sizes
             sizes_str = self.sq_cooccur_sizes_edit.text().strip()
@@ -1674,7 +1750,6 @@ class AdvancedSpatialAnalysisDialog(QtWidgets.QDialog):
                     f"Error: {str(e)}")
                 return
             
-            print(f"[DEBUG] Neighborhood sizes: {nhood_sizes} (count: {len(nhood_sizes)})")
             
             # Store interval for distance selection
             self.sq_cooccur_interval = nhood_sizes
@@ -1687,7 +1762,6 @@ class AdvancedSpatialAnalysisDialog(QtWidgets.QDialog):
             # Check if cluster column exists
             filtered_df = self._get_filtered_dataframe()
             if cluster_key not in filtered_df.columns:
-                print(f"[DEBUG] Cluster column '{cluster_key}' not found in dataframe")
                 QtWidgets.QMessageBox.warning(self, "Missing Column", 
                     f"Cluster column '{cluster_key}' not found in data.")
                 return
@@ -1745,18 +1819,18 @@ class AdvancedSpatialAnalysisDialog(QtWidgets.QDialog):
             else:
                 QtWidgets.QMessageBox.warning(self, "No Results", 
                     "Co-occurrence analysis completed but no results to plot.")
+            
+            progress_dlg.close()
                 
         except Exception as e:
             import traceback
             traceback.print_exc()
+            progress_dlg.close()
             QtWidgets.QMessageBox.critical(self, "Error", f"Error running co-occurrence: {str(e)}")
     
     def _plot_sq_cooccurrence(self, adata: 'ad.AnnData'):
         """Plot co-occurrence results using squidpy's plotting function."""
-        print(f"[DEBUG] _plot_sq_cooccurrence: Starting")
-        print(f"[DEBUG] adata: {adata}")
         if adata is None:
-            print(f"[DEBUG] adata is None")
             self.sq_cooccur_canvas.figure.clear()
             ax = self.sq_cooccur_canvas.figure.add_subplot(111)
             ax.text(0.5, 0.5, 'No data provided for plotting.', 
@@ -1764,23 +1838,19 @@ class AdvancedSpatialAnalysisDialog(QtWidgets.QDialog):
             self.sq_cooccur_canvas.draw()
             return
         
-        print(f"[DEBUG] adata.uns keys: {list(adata.uns.keys())}")
         
         # Check for co_occurrence key or alternatives
         cooccur_key = None
         if 'co_occurrence' in adata.uns:
             cooccur_key = 'co_occurrence'
-            print(f"[DEBUG] Found 'co_occurrence' key")
         else:
             # Try alternative key names
             for key in adata.uns.keys():
                 if 'co' in key.lower() and 'occur' in key.lower():
                     cooccur_key = key
-                    print(f"[DEBUG] Found alternative key: {key}")
                     break
         
         if cooccur_key is None:
-            print(f"[DEBUG] No co-occurrence data found in adata.uns")
             self.sq_cooccur_canvas.figure.clear()
             ax = self.sq_cooccur_canvas.figure.add_subplot(111)
             ax.text(0.5, 0.5, 'No co-occurrence data found.\nPlease run co-occurrence analysis first.', 
@@ -1794,8 +1864,6 @@ class AdvancedSpatialAnalysisDialog(QtWidgets.QDialog):
         cluster_key = self.sq_cooccur_cluster_combo.currentText()
         plot_type = self.sq_cooccur_plot_type_combo.currentText()
         
-        print(f"[DEBUG] Co-occurrence data type: {type(cooccur_data)}")
-        print(f"[DEBUG] Plot type: {plot_type}")
         
         # Get cluster categories
         if cluster_key in adata.obs.columns:
@@ -1806,7 +1874,6 @@ class AdvancedSpatialAnalysisDialog(QtWidgets.QDialog):
         else:
             categories = []
         
-        print(f"[DEBUG] Categories: {categories}")
         
         # Handle heatmap plotting
         if plot_type == "Heatmap":
@@ -1949,7 +2016,6 @@ class AdvancedSpatialAnalysisDialog(QtWidgets.QDialog):
         # the current ROI's categories. The array shape is (n_clusters, n_clusters, n_distances)
         # So we need to get the categories that match the array dimensions.
         out_shape = out.shape
-        print(f"[DEBUG] Co-occurrence 'out' array shape: {out_shape}")
         
         # The out array should be (n_clusters, n_clusters, n_distances)
         # Use the actual dimensions from the array
@@ -1964,14 +2030,12 @@ class AdvancedSpatialAnalysisDialog(QtWidgets.QDialog):
             else:
                 # Categories don't match - try to get from adata.obs categories
                 # or use indices if categories are missing
-                print(f"[DEBUG] Category mismatch: {len(categories)} categories but array has {n_clusters_in_data} clusters")
                 # Use the categories from the adata that was used to compute co-occurrence
                 # If the current ROI has fewer categories, we need to handle this
                 if len(categories) < n_clusters_in_data:
                     # Current ROI has fewer categories - this means some clusters are missing
                     # We should use the categories from when co-occurrence was computed
                     # For now, create placeholder categories or use indices
-                    print(f"[DEBUG] Warning: Current ROI has fewer categories than co-occurrence data")
                     # Try to get all possible categories from the cluster column's categories
                     if cluster_key in adata.obs.columns and hasattr(adata.obs[cluster_key], 'cat'):
                         all_categories = list(adata.obs[cluster_key].cat.categories)
@@ -1988,7 +2052,6 @@ class AdvancedSpatialAnalysisDialog(QtWidgets.QDialog):
         else:
             categories_list = categories
         
-        print(f"[DEBUG] Using {len(categories_list)} categories for plotting: {categories_list[:5]}...")
         
         # Get clusters to plot (use reference cluster if selected, otherwise all)
         clusters_to_plot = None
@@ -2043,7 +2106,6 @@ class AdvancedSpatialAnalysisDialog(QtWidgets.QDialog):
             try:
                 idx = categories_list.index(g)
             except ValueError:
-                print(f"[DEBUG] Warning: Cluster {g} not found in categories_list, skipping")
                 continue
             
             # Create DataFrame like squidpy: out[idx, :, :].T with columns=categories
@@ -2053,7 +2115,6 @@ class AdvancedSpatialAnalysisDialog(QtWidgets.QDialog):
             
             # Ensure the number of columns matches categories_list length
             if actual_n_cols != len(categories_list):
-                print(f"[DEBUG] Warning: cluster_data has {actual_n_cols} columns but categories_list has {len(categories_list)} items")
                 # Use categories that match the actual data shape
                 if actual_n_cols <= len(categories_list):
                     # Use first actual_n_cols categories
@@ -2136,18 +2197,29 @@ class AdvancedSpatialAnalysisDialog(QtWidgets.QDialog):
     
     def _run_sq_autocorrelation(self):
         """Run spatial autocorrelation analysis using core function."""
-        print(f"[DEBUG] _run_sq_autocorrelation: Starting")
         if not self.spatial_graph_built:
-            print(f"[DEBUG] Spatial graph not built")
             QtWidgets.QMessageBox.warning(self, "Graph Required", 
                 "Please create the spatial graph first (Step 1 at the top).")
             return
+        
+        # Show progress dialog
+        progress_dlg = QtWidgets.QProgressDialog(
+            "Running spatial autocorrelation analysis...",
+            None,
+            0,
+            0,
+            self
+        )
+        progress_dlg.setWindowTitle("Spatial Autocorrelation")
+        progress_dlg.setWindowModality(QtCore.Qt.WindowModal)
+        progress_dlg.setMinimumDuration(0)
+        progress_dlg.setValue(0)
+        QtWidgets.QApplication.processEvents()
         
         try:
             markers_str = self.sq_autocorr_markers_edit.text().strip()
             roi_id = self._get_selected_roi(self.sq_autocorr_roi_combo)
             agg_method = self.sq_autocorr_agg_combo.currentText().lower()
-            print(f"[DEBUG] Markers: {markers_str}, ROI: {roi_id}, Aggregation: {agg_method}")
             
             # Parse markers
             markers = None
@@ -2204,21 +2276,24 @@ class AdvancedSpatialAnalysisDialog(QtWidgets.QDialog):
                 f"Spatial autocorrelation completed for {len(results['results'])} ROI(s). "
                 f"{'Aggregated using ' + agg_method if len(results['results']) > 1 else ''}")
             
+            # Update variable combo box
+            self._update_autocorr_var_combo()
+            
             # Plot results
             self._plot_sq_autocorrelation(plot_adata)
             self.sq_autocorr_save_btn.setEnabled(True)
+            
+            progress_dlg.close()
                 
         except Exception as e:
             import traceback
             traceback.print_exc()
+            progress_dlg.close()
             QtWidgets.QMessageBox.critical(self, "Error", f"Error running autocorrelation: {str(e)}")
     
     def _plot_sq_autocorrelation(self, adata: 'ad.AnnData'):
         """Plot spatial autocorrelation results using squidpy's plotting function."""
-        print(f"[DEBUG] _plot_sq_autocorrelation: Starting")
-        print(f"[DEBUG] adata: {adata}")
         if adata is None:
-            print(f"[DEBUG] adata is None")
             self.sq_autocorr_canvas.figure.clear()
             ax = self.sq_autocorr_canvas.figure.add_subplot(111)
             ax.text(0.5, 0.5, 'No data provided for plotting.', 
@@ -2226,23 +2301,19 @@ class AdvancedSpatialAnalysisDialog(QtWidgets.QDialog):
             self.sq_autocorr_canvas.draw()
             return
         
-        print(f"[DEBUG] adata.uns keys: {list(adata.uns.keys())}")
         
         # Check for moranI key or alternatives
         moran_key = None
         if 'moranI' in adata.uns:
             moran_key = 'moranI'
-            print(f"[DEBUG] Found 'moranI' key")
         else:
             # Try alternative key names
             for key in adata.uns.keys():
                 if 'moran' in key.lower() or 'autocorr' in key.lower():
                     moran_key = key
-                    print(f"[DEBUG] Found alternative key: {key}")
                     break
         
         if moran_key is None:
-            print(f"[DEBUG] No Moran's I data found in adata.uns")
             self.sq_autocorr_canvas.figure.clear()
             ax = self.sq_autocorr_canvas.figure.add_subplot(111)
             ax.text(0.5, 0.5, 'No autocorrelation data found.\nPlease run autocorrelation analysis first.', 
@@ -2256,7 +2327,6 @@ class AdvancedSpatialAnalysisDialog(QtWidgets.QDialog):
         ax = self.sq_autocorr_canvas.figure.add_subplot(111)
         moran_data = adata.uns[moran_key]
         
-        print(f"[DEBUG] moran_data type: {type(moran_data)}")
         
         # Extract I values and p-values
         I_values = None
@@ -2264,14 +2334,11 @@ class AdvancedSpatialAnalysisDialog(QtWidgets.QDialog):
         gene_names = None
         
         if isinstance(moran_data, pd.DataFrame):
-            print(f"[DEBUG] moran_data is DataFrame, shape: {moran_data.shape}, columns: {list(moran_data.columns)}")
             # DataFrame format - extract columns
             if 'I' in moran_data.columns:
                 I_values = moran_data['I'].values
-                print(f"[DEBUG] Extracted I values from DataFrame, shape: {I_values.shape}")
             elif 'moranI' in moran_data.columns:
                 I_values = moran_data['moranI'].values
-                print(f"[DEBUG] Extracted moranI values from DataFrame, shape: {I_values.shape}")
             
             if 'pval_norm' in moran_data.columns:
                 p_values = moran_data['pval_norm'].values
@@ -2329,7 +2396,6 @@ class AdvancedSpatialAnalysisDialog(QtWidgets.QDialog):
         
         # Plot the data (works for both DataFrame and dict formats)
         if I_values is not None and len(I_values) > 0:
-            print(f"[DEBUG] Plotting {len(I_values)} Moran's I values")
             # Create bar plot
             sorted_idx = np.argsort(I_values)[::-1]  # Sort by I value descending
             top_n = min(self.sq_autocorr_topk_spin.value(), len(sorted_idx))  # Use spinbox value
@@ -2346,9 +2412,7 @@ class AdvancedSpatialAnalysisDialog(QtWidgets.QDialog):
             ax.set_title(f"Spatial Autocorrelation (Top {top_n})")
             ax.axvline(x=0, color='black', linestyle='--', linewidth=1)
             ax.grid(True, alpha=0.3, axis='x')
-            print(f"[DEBUG] Plot completed successfully")
         else:
-            print(f"[DEBUG] Failed to plot - I_values is None or empty")
             ax.text(0.5, 0.5, 'Unable to extract Moran\'s I values.\nData format not recognized.\nCheck debug output for details.', 
                    ha='center', va='center', transform=ax.transAxes)
         
@@ -2360,26 +2424,262 @@ class AdvancedSpatialAnalysisDialog(QtWidgets.QDialog):
         if save_figure_with_options(self.sq_autocorr_canvas.figure, "squidpy_autocorrelation.png", self):
             QtWidgets.QMessageBox.information(self, "Success", "Plot saved successfully")
     
+    def _plot_sq_autocorr_visualization(self):
+        """Plot Moran scatter plot or spatial map for selected variable."""
+        viz_type = self.sq_autocorr_viz_type_combo.currentText()
+        
+        # Get the actual variable name from combo box data (not the display text)
+        current_idx = self.sq_autocorr_var_combo.currentIndex()
+        if current_idx < 0:
+            QtWidgets.QMessageBox.warning(self, "No Variable", "Please select a variable to visualize.")
+            return
+        
+        var_name = self.sq_autocorr_var_combo.itemData(current_idx)
+        if not var_name:
+            # Fallback to text if no data stored (shouldn't happen)
+            var_name = self.sq_autocorr_var_combo.currentText()
+            # Remove p-value annotation if present
+            if ' (p' in var_name:
+                var_name = var_name.split(' (p')[0]
+        
+        if not var_name:
+            QtWidgets.QMessageBox.warning(self, "No Variable", "Please select a variable to visualize.")
+            return
+        
+        roi_id = self._get_selected_roi(self.sq_autocorr_roi_combo)
+        adata = None
+        
+        if roi_id is None:
+            # Use aggregated result if available, but for visualization we need individual ROI
+            # Try to get first available ROI
+            if self.anndata_cache:
+                roi_id = list(self.anndata_cache.keys())[0]
+                adata = self.anndata_cache[roi_id]
+            else:
+                QtWidgets.QMessageBox.warning(self, "No Data", 
+                    "Spatial visualizations require a specific ROI. Please select an ROI.")
+                return
+        elif roi_id in self.anndata_cache:
+            adata = self.anndata_cache[roi_id]
+        else:
+            QtWidgets.QMessageBox.warning(self, "No Data", f"No data found for ROI {roi_id}.")
+            return
+        
+        if adata is None:
+            QtWidgets.QMessageBox.warning(self, "No Data", "No data available for visualization.")
+            return
+        
+        # Check if spatial graph exists
+        if 'spatial_connectivities' not in adata.obsp:
+            QtWidgets.QMessageBox.warning(self, "No Graph", 
+                "Spatial graph not found. Please build the spatial graph first.")
+            return
+        
+        # Get variable values
+        var_values = None
+        if var_name in adata.var_names:
+            # Variable is in var (feature matrix)
+            var_idx = list(adata.var_names).index(var_name)
+            var_values = adata.X[:, var_idx]
+            if hasattr(var_values, 'toarray'):  # Handle sparse matrices
+                var_values = var_values.toarray().flatten()
+            else:
+                var_values = np.asarray(var_values).flatten()
+        elif hasattr(adata, 'obs') and var_name in adata.obs.columns:
+            # Variable is in obs (metadata)
+            var_values = np.asarray(adata.obs[var_name].values).flatten()
+            if not pd.api.types.is_numeric_dtype(adata.obs[var_name]):
+                QtWidgets.QMessageBox.warning(self, "Invalid Variable", 
+                    f"Variable '{var_name}' is not numeric. Please select a numeric variable.")
+                return
+        else:
+            QtWidgets.QMessageBox.warning(self, "Variable Not Found", 
+                f"Variable '{var_name}' not found in data.")
+            return
+        
+        # Validate variable values
+        if var_values is None or len(var_values) == 0:
+            QtWidgets.QMessageBox.warning(self, "No Data", 
+                f"No data available for variable '{var_name}'.")
+            return
+        
+        # Handle NaN and inf values
+        if np.any(~np.isfinite(var_values)):
+            n_invalid = np.sum(~np.isfinite(var_values))
+            QtWidgets.QMessageBox.warning(self, "Invalid Values", 
+                f"Variable '{var_name}' contains {n_invalid} NaN or infinite values. "
+                "These will be replaced with 0 for visualization.")
+            var_values = np.nan_to_num(var_values, nan=0.0, posinf=0.0, neginf=0.0)
+        
+        if viz_type == "Moran Scatter Plot":
+            self._plot_moran_scatter(adata, var_name, var_values)
+        elif viz_type == "Spatial Map":
+            self._plot_spatial_map(adata, var_name, var_values)
+        
+        self.sq_autocorr_save_btn.setEnabled(True)
+    
+    def _plot_moran_scatter(self, adata: 'ad.AnnData', var_name: str, var_values: np.ndarray):
+        """Plot Moran scatter plot: variable vs spatial lag."""
+        self.sq_autocorr_canvas.figure.clear()
+        ax = self.sq_autocorr_canvas.figure.add_subplot(111)
+        
+        # Ensure var_values is a 1D array
+        if hasattr(var_values, 'toarray'):
+            var_values = var_values.toarray().flatten()
+        else:
+            var_values = np.asarray(var_values).flatten()
+        
+        # Get spatial weights matrix
+        W = adata.obsp['spatial_connectivities']
+        if hasattr(W, 'toarray'):
+            W = W.toarray()
+        else:
+            W = np.array(W)
+        
+        # Standardize variable (mean-center and scale)
+        var_centered = var_values - np.mean(var_values)
+        var_std = np.std(var_centered)
+        if var_std > 0:
+            var_standardized = var_centered / var_std
+        else:
+            var_standardized = var_centered
+        
+        # Ensure var_standardized is 1D
+        var_standardized = np.asarray(var_standardized).flatten()
+        
+        # Compute spatial lag: W * x
+        spatial_lag = W @ var_standardized
+        
+        # Ensure spatial_lag is 1D
+        spatial_lag = np.asarray(spatial_lag).flatten()
+        
+        # Compute Moran's I from the slope
+        # Moran's I = (n/W0) * (x' W x) / (x' x)
+        # where W0 is sum of weights
+        n = len(var_standardized)
+        W0 = np.sum(W)
+        if W0 > 0:
+            moran_I = (n / W0) * (var_standardized @ W @ var_standardized) / (var_standardized @ var_standardized)
+        else:
+            moran_I = 0.0
+        
+        # Create scatter plot
+        ax.scatter(var_standardized, spatial_lag, alpha=0.6, s=20, edgecolors='black', linewidths=0.5)
+        
+        # Fit regression line
+        slope, intercept, r_value, p_value, std_err = stats.linregress(var_standardized, spatial_lag)
+        x_line = np.linspace(var_standardized.min(), var_standardized.max(), 100)
+        y_line = slope * x_line + intercept
+        ax.plot(x_line, y_line, 'r-', linewidth=2, label=f"Slope = {slope:.3f} (Moran's I ≈ {moran_I:.3f})")
+        
+        # Add quadrant lines
+        ax.axhline(y=0, color='gray', linestyle='--', linewidth=1, alpha=0.5)
+        ax.axvline(x=0, color='gray', linestyle='--', linewidth=1, alpha=0.5)
+        
+        # Add quadrant labels
+        x_range = var_standardized.max() - var_standardized.min()
+        y_range = spatial_lag.max() - spatial_lag.min()
+        ax.text(0.95 * var_standardized.max(), 0.95 * spatial_lag.max(), 'HH', 
+                ha='right', va='top', fontsize=10, fontweight='bold', 
+                bbox=dict(boxstyle='round', facecolor='lightcoral', alpha=0.7))
+        ax.text(0.95 * var_standardized.min(), 0.95 * spatial_lag.min(), 'LL', 
+                ha='left', va='bottom', fontsize=10, fontweight='bold',
+                bbox=dict(boxstyle='round', facecolor='lightblue', alpha=0.7))
+        ax.text(0.95 * var_standardized.max(), 0.95 * spatial_lag.min(), 'HL', 
+                ha='right', va='bottom', fontsize=10, fontweight='bold',
+                bbox=dict(boxstyle='round', facecolor='lightyellow', alpha=0.7))
+        ax.text(0.95 * var_standardized.min(), 0.95 * spatial_lag.max(), 'LH', 
+                ha='left', va='top', fontsize=10, fontweight='bold',
+                bbox=dict(boxstyle='round', facecolor='lightgreen', alpha=0.7))
+        
+        # Labels and title
+        ax.set_xlabel(f'{var_name} (standardized)', fontsize=11, fontweight='bold')
+        ax.set_ylabel('Spatial Lag (Wx)', fontsize=11, fontweight='bold')
+        ax.set_title(f"Moran Scatter Plot: {var_name}\nSlope = {slope:.3f} (Moran's I ≈ {moran_I:.3f})", 
+                     fontsize=12, fontweight='bold')
+        ax.legend(loc='best')
+        ax.grid(True, alpha=0.3)
+        
+        self.sq_autocorr_canvas.figure.tight_layout()
+        self.sq_autocorr_canvas.draw()
+    
+    def _plot_spatial_map(self, adata: 'ad.AnnData', var_name: str, var_values: np.ndarray):
+        """Plot spatial map colored by variable."""
+        self.sq_autocorr_canvas.figure.clear()
+        ax = self.sq_autocorr_canvas.figure.add_subplot(111)
+        
+        # Ensure var_values is a 1D array
+        if hasattr(var_values, 'toarray'):
+            var_values = var_values.toarray().flatten()
+        else:
+            var_values = np.asarray(var_values).flatten()
+        
+        # Get spatial coordinates
+        if 'spatial' in adata.obsm:
+            coords = adata.obsm['spatial']
+        elif 'centroid_x' in adata.obs.columns and 'centroid_y' in adata.obs.columns:
+            coords = np.column_stack([adata.obs['centroid_x'].values, adata.obs['centroid_y'].values])
+        else:
+            QtWidgets.QMessageBox.warning(self, "No Coordinates", 
+                "Spatial coordinates not found. Cannot create spatial map.")
+            return
+        
+        # Validate dimensions match
+        if len(var_values) != len(coords):
+            QtWidgets.QMessageBox.warning(self, "Dimension Mismatch", 
+                f"Variable has {len(var_values)} values but there are {len(coords)} cells. "
+                "Cannot create spatial map.")
+            return
+        
+        # Create scatter plot colored by variable
+        scatter = ax.scatter(coords[:, 0], coords[:, 1], c=var_values, 
+                           cmap='viridis', s=10, alpha=0.7, edgecolors='black', linewidths=0.1)
+        
+        # Add colorbar
+        cbar = self.sq_autocorr_canvas.figure.colorbar(scatter, ax=ax)
+        cbar.set_label(var_name, fontsize=11, fontweight='bold')
+        
+        # Labels and title
+        ax.set_xlabel('X coordinate (µm)', fontsize=11, fontweight='bold')
+        ax.set_ylabel('Y coordinate (µm)', fontsize=11, fontweight='bold')
+        ax.set_title(f"Spatial Map: {var_name}\n(This map visualizes the variable used to compute Moran's I)", 
+                     fontsize=12, fontweight='bold')
+        ax.set_aspect('equal', adjustable='box')
+        ax.grid(True, alpha=0.3)
+        
+        self.sq_autocorr_canvas.figure.tight_layout()
+        self.sq_autocorr_canvas.draw()
+    
     def _run_sq_ripley(self):
         """Run Ripley analysis using core function."""
-        print(f"[DEBUG] _run_sq_ripley: Starting")
         if not self.spatial_graph_built:
-            print(f"[DEBUG] Spatial graph not built")
             QtWidgets.QMessageBox.warning(self, "Graph Required", 
                 "Please create the spatial graph first (Step 1 at the top).")
             return
+        
+        # Show progress dialog
+        progress_dlg = QtWidgets.QProgressDialog(
+            "Running Ripley analysis...",
+            None,
+            0,
+            0,
+            self
+        )
+        progress_dlg.setWindowTitle("Ripley Analysis")
+        progress_dlg.setWindowModality(QtCore.Qt.WindowModal)
+        progress_dlg.setMinimumDuration(0)
+        progress_dlg.setValue(0)
+        QtWidgets.QApplication.processEvents()
         
         try:
             mode = self.sq_ripley_mode_combo.currentText()  # F, G, or L
             max_dist = float(self.sq_ripley_r_max_spin.value())
             cluster_key = self.sq_ripley_cluster_combo.currentText()
             roi_id = self._get_selected_roi(self.sq_ripley_roi_combo)
-            print(f"[DEBUG] Mode: {mode}, max_dist: {max_dist}, cluster_key: {cluster_key}, ROI: {roi_id}")
             
             # Check if cluster column exists
             filtered_df = self._get_filtered_dataframe()
             if cluster_key not in filtered_df.columns:
-                print(f"[DEBUG] Cluster column '{cluster_key}' not found in dataframe")
                 QtWidgets.QMessageBox.warning(self, "Missing Column", 
                     f"Cluster column '{cluster_key}' not found in data.")
                 return
@@ -2428,7 +2728,6 @@ class AdvancedSpatialAnalysisDialog(QtWidgets.QDialog):
                 
                 if should_aggregate:
                     # Aggregate results across ROIs
-                    print(f"[DEBUG] Aggregating Ripley results using {agg_method} for {len(results)} ROIs")
                     plot_adata = self._aggregate_ripley_results(results, cluster_key, mode, agg_method)
                 else:
                     # Use first ROI for plotting
@@ -2444,10 +2743,13 @@ class AdvancedSpatialAnalysisDialog(QtWidgets.QDialog):
                 QtWidgets.QMessageBox.warning(self, "No Results", 
                     "Ripley analysis completed but no results to plot. "
                     "This can happen when clusters are too small.")
+            
+            progress_dlg.close()
                 
         except Exception as e:
             import traceback
             traceback.print_exc()
+            progress_dlg.close()
             QtWidgets.QMessageBox.critical(self, "Error", f"Error running Ripley: {str(e)}")
     
     def _aggregate_ripley_results(self, results: Dict[str, 'ad.AnnData'], cluster_key: str, mode: str, agg_method: str) -> 'ad.AnnData':
@@ -2485,7 +2787,7 @@ class AdvancedSpatialAnalysisDialog(QtWidgets.QDialog):
                     # Ensure bins match across ROIs
                     bins_this_roi = stat_df['bins'].unique()
                     if len(bins_this_roi) != len(all_bins) or not np.allclose(bins_this_roi, all_bins):
-                        print(f"[DEBUG] Warning: Bins mismatch for ROI {roi_id}, using first ROI's bins")
+                        pass
             
             # Collect simulation stats if available
             if sims_stat_key in ripley_data:
@@ -2529,16 +2831,12 @@ class AdvancedSpatialAnalysisDialog(QtWidgets.QDialog):
         aggregated_adata = first_adata.copy()
         aggregated_adata.uns['ripley'] = aggregated_ripley_data
         
-        print(f"[DEBUG] Aggregated Ripley results: {len(aggregated_stat_df)} rows, {len(all_clusters)} clusters")
         
         return aggregated_adata
     
     def _plot_sq_ripley(self, adata: 'ad.AnnData', cluster_key: str):
         """Plot Ripley results using squidpy's plotting function."""
-        print(f"[DEBUG] _plot_sq_ripley: Starting")
-        print(f"[DEBUG] adata: {adata}, cluster_key: {cluster_key}")
         if adata is None:
-            print(f"[DEBUG] adata is None")
             self.sq_ripley_canvas.figure.clear()
             ax = self.sq_ripley_canvas.figure.add_subplot(111)
             ax.text(0.5, 0.5, 'No data provided for plotting.', 
@@ -2546,23 +2844,19 @@ class AdvancedSpatialAnalysisDialog(QtWidgets.QDialog):
             self.sq_ripley_canvas.draw()
             return
         
-        print(f"[DEBUG] adata.uns keys: {list(adata.uns.keys())}")
         
         # Check for ripley key or alternatives
         ripley_key = None
         if 'ripley' in adata.uns:
             ripley_key = 'ripley'
-            print(f"[DEBUG] Found 'ripley' key")
         else:
             # Try alternative key names
             for key in adata.uns.keys():
                 if 'ripley' in key.lower():
                     ripley_key = key
-                    print(f"[DEBUG] Found alternative key: {key}")
                     break
         
         if ripley_key is None:
-            print(f"[DEBUG] No Ripley data found in adata.uns")
             self.sq_ripley_canvas.figure.clear()
             ax = self.sq_ripley_canvas.figure.add_subplot(111)
             ax.text(0.5, 0.5, 'No Ripley data found.\nPlease run Ripley analysis first.', 
@@ -2577,7 +2871,6 @@ class AdvancedSpatialAnalysisDialog(QtWidgets.QDialog):
         ax = self.sq_ripley_canvas.figure.add_subplot(111)
         ripley_data = adata.uns[ripley_key]
         
-        print(f"[DEBUG] ripley_data type: {type(ripley_data)}")
         
         # Plot using squidpy's exact approach
         # Based on sq.pl.ripley source code

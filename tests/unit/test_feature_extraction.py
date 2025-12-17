@@ -66,32 +66,99 @@ class TestFeatureExtraction:
         assert 'area_um2' in result.columns or 'area' in result.columns
     
     def test_extract_features_with_arcsinh(self, sample_segmentation_mask, sample_image_stack_chw, sample_acquisition_info):
-        """Test feature extraction with arcsinh transformation."""
-        img_stack_hwc = np.moveaxis(sample_image_stack_chw, 0, -1)
+        """Test feature extraction with arcsinh transformation using core.extract_features."""
+        import tempfile
+        import tifffile
+        from pathlib import Path
+        from openimc.core import extract_features
+        from openimc.data.mcd_loader import AcquisitionInfo, MCDLoader
         
-        selected_features = {
-            'mean': True,
-            'median': True
-        }
+        # Create a mock loader with the sample data
+        class MockLoader:
+            def __init__(self, img_stack_chw, channels):
+                self.img_stack_chw = img_stack_chw
+                self.channels = channels
+            
+            def get_channels(self, acq_id):
+                return self.channels
+            
+            def get_all_channels(self, acq_id):
+                # Return HWC format
+                return np.moveaxis(self.img_stack_chw, 0, -1)
         
-        result = extract_features_for_acquisition(
-            acq_id='test_1',
-            mask=sample_segmentation_mask,
-            selected_features=selected_features,
-            acq_info=sample_acquisition_info,
-            acq_label='Test',
-            img_stack=img_stack_hwc,
-            arcsinh_enabled=True,
-            cofactor=10.0,
-            denoise_source='None',
-            custom_denoise_settings=None,
-            spillover_config=None,
-            source_file='test.mcd',
-            excluded_channels=None
+        # Create mock acquisition info
+        channels = sample_acquisition_info['channels']
+        acq_info = AcquisitionInfo(
+            id='test_1',
+            name='Test Acquisition',
+            well=None,
+            size=(100, 100),
+            channels=channels,
+            channel_metals=[],
+            channel_labels=[],
+            metadata={},
+            source_file='test.mcd'
         )
         
-        assert isinstance(result, pd.DataFrame)
-        assert len(result) > 0
+        # Write mask to temp file
+        with tempfile.TemporaryDirectory() as tmpdir:
+            mask_path = Path(tmpdir) / 'test_mask.tif'
+            tifffile.imwrite(mask_path, sample_segmentation_mask.astype(np.uint32))
+            
+            # Create mock loader
+            loader = MockLoader(sample_image_stack_chw, channels)
+            
+            # Extract features WITHOUT arcsinh
+            result_no_arcsinh = extract_features(
+                loader=loader,
+                acquisitions=[acq_info],
+                mask_path=mask_path,
+                output_path=None,
+                morphological=False,
+                intensity=True,
+                arcsinh=False,
+                arcsinh_cofactor=5.0
+            )
+            
+            # Extract features WITH arcsinh
+            result_with_arcsinh = extract_features(
+                loader=loader,
+                acquisitions=[acq_info],
+                mask_path=mask_path,
+                output_path=None,
+                morphological=False,
+                intensity=True,
+                arcsinh=True,
+                arcsinh_cofactor=5.0
+            )
+        
+        # Verify results
+        assert isinstance(result_no_arcsinh, pd.DataFrame)
+        assert isinstance(result_with_arcsinh, pd.DataFrame)
+        assert len(result_no_arcsinh) > 0
+        assert len(result_with_arcsinh) > 0
+        
+        # Find intensity columns
+        intensity_cols = [col for col in result_no_arcsinh.columns 
+                         if any(col.endswith(f'_{ft}') for ft in ['mean', 'median', 'std', 'mad', 'p10', 'p90', 'integrated'])]
+        
+        assert len(intensity_cols) > 0, "Should have intensity columns"
+        
+        # Verify arcsinh transformation was applied
+        # arcsinh(x/cofactor) should be different from x for positive values
+        from openimc.ui.utils import arcsinh_normalize
+        for col in intensity_cols[:3]:  # Check first 3 intensity columns
+            original_vals = result_no_arcsinh[col].values
+            arcsinh_vals = result_with_arcsinh[col].values
+            expected_vals = arcsinh_normalize(original_vals, cofactor=5.0)
+            
+            # Values should be different (unless all zeros)
+            if np.any(original_vals > 0):
+                assert not np.allclose(original_vals, arcsinh_vals, rtol=0.01), \
+                    f"Arcsinh should transform values in column {col}"
+                # Verify transformation is correct
+                assert np.allclose(arcsinh_vals, expected_vals, rtol=1e-5), \
+                    f"Arcsinh values should match expected transformation for column {col}"
     
     def test_extract_features_morphological_only(self, sample_segmentation_mask, sample_image_stack_chw, sample_acquisition_info):
         """Test feature extraction with only morphological features."""

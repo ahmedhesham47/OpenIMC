@@ -29,7 +29,9 @@ os.environ.setdefault('DASK_DATAFRAME__QUERY_PLANNING', 'False')
 # Suppress warnings from dependencies
 import warnings
 # Suppress dask dataframe legacy implementation warning
+warnings.filterwarnings('ignore', category=FutureWarning, module='dask.dataframe')
 warnings.filterwarnings('ignore', category=FutureWarning, message='.*legacy.*Dask DataFrame.*')
+warnings.filterwarnings('ignore', category=FutureWarning, message='.*dataframe.query-planning.*')
 # Suppress xarray_schema pkg_resources deprecation warning
 warnings.filterwarnings('ignore', category=UserWarning, message='.*pkg_resources.*deprecated.*')
 # Suppress squidpy anndata __version__ deprecation warning

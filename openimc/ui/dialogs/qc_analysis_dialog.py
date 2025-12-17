@@ -590,49 +590,52 @@ class QCAnalysisDialog(QtWidgets.QDialog):
             
             for acq_info in acquisitions:
                 acq_id = acq_info.id
-                print(f"[QC DEBUG] Processing acquisition: {acq_id}, name: {acq_info.name}")
                 
                 # Get original acquisition ID for multiple MCD files
                 original_acq_id = acq_id
                 if (hasattr(self.parent_window, 'unique_acq_to_original') and 
                     acq_id in self.parent_window.unique_acq_to_original):
                     original_acq_id = self.parent_window.unique_acq_to_original[acq_id]
-                    print(f"[QC DEBUG] Mapped unique ID {acq_id} to original ID {original_acq_id}")
                 else:
-                    print(f"[QC DEBUG] No mapping found, using acq_id as original: {acq_id}")
+                    pass
                 
                 # Get channels
                 channels = acq_info.channels
                 if not channels:
-                    print(f"[QC DEBUG] No channels found for {acq_id}, skipping")
                     continue
-                print(f"[QC DEBUG] Found {len(channels)} channels: {channels[:5]}..." if len(channels) > 5 else f"[QC DEBUG] Found {len(channels)} channels: {channels}")
                 
-                # Get source file path for loader
+                # Get source file path for loader and determine loader type
                 source_file = None
+                loader_type = None
                 if hasattr(acq_info, 'source_file') and acq_info.source_file:
                     source_file = acq_info.source_file
-                    print(f"[QC DEBUG] Using source_file from acq_info: {source_file}")
+                    # Determine loader type from file extension or path
+                    if source_file.lower().endswith(('.mcd', '.mcdx')):
+                        loader_type = "mcd"
+                    elif os.path.isdir(source_file):
+                        loader_type = "ometiff"
+                    else:
+                        loader_type = "ometiff"  # Assume OME-TIFF for other file types
                 elif acq_id in self.parent_window.acq_to_file:
                     source_file = self.parent_window.acq_to_file[acq_id]
-                    print(f"[QC DEBUG] Using source_file from acq_to_file mapping: {source_file}")
+                    loader_type = "mcd"  # acq_to_file typically contains MCD files
                 else:
                     # Try to get from current_path
                     if hasattr(self.parent_window, 'current_path') and self.parent_window.current_path:
-                        if self.parent_window.current_path.endswith('.mcd'):
+                        if self.parent_window.current_path.endswith(('.mcd', '.mcdx')):
                             source_file = self.parent_window.current_path
-                            print(f"[QC DEBUG] Using current_path: {source_file}")
+                            loader_type = "mcd"
+                        elif os.path.isdir(self.parent_window.current_path):
+                            source_file = self.parent_window.current_path
+                            loader_type = "ometiff"
                 
                 if not source_file:
-                    print(f"[QC DEBUG] ERROR: No source file found for {acq_id}, skipping")
                     continue
                 
                 if not os.path.exists(source_file):
-                    print(f"[QC DEBUG] ERROR: Source file does not exist: {source_file}, skipping")
                     continue
                 
                 acq_to_file_map[acq_id] = source_file
-                print(f"[QC DEBUG] Successfully mapped {acq_id} to file: {source_file}")
                 
                 # Get mask path if cell-level analysis
                 mask_path = None
@@ -652,125 +655,225 @@ class QCAnalysisDialog(QtWidgets.QDialog):
                 
                 # Create one task per acquisition (all channels)
                 # Pass both unique ID (for results) and original ID (for loader)
-                task = (acq_id, original_acq_id, acq_info.name, channels, self.analysis_mode, mask_path, source_file, acq_to_file_map)
+                task = (acq_id, original_acq_id, acq_info.name, channels, self.analysis_mode, mask_path, source_file, loader_type, acq_to_file_map)
                 tasks.append(task)
-                print(f"[QC DEBUG] Created task for {acq_id} (original: {original_acq_id}), file: {os.path.basename(source_file)}, channels: {len(channels)}, mode: {self.analysis_mode}")
             
             if not tasks:
                 progress_dlg.close()
-                print("[QC DEBUG] ERROR: No tasks created")
                 QtWidgets.QMessageBox.warning(self, "Error", "No tasks to process.")
                 return
             
-            print(f"[QC DEBUG] Created {len(tasks)} tasks for processing")
+            # Group tasks by source file path
+            # IMPORTANT: Only group MCD files together. OME-TIFF files should be processed individually
+            # (one file per worker) since each OME-TIFF file is typically a single acquisition.
+            # MCD files need grouping to avoid file locking issues with readimc.
+            from collections import defaultdict
+            file_groups = defaultdict(list)
+            ometiff_tasks = []  # OME-TIFF tasks processed individually
+            
+            for task in tasks:
+                source_file = task[6]  # source_file is at index 6 in the task tuple
+                loader_type = task[7]  # loader_type is at index 7 in the task tuple
+                
+                # Only group MCD files. OME-TIFF files are processed individually
+                if loader_type == "mcd":
+                    file_groups[source_file].append(task)
+                else:
+                    # OME-TIFF: each file gets its own "group" (will be processed individually)
+                    ometiff_tasks.append(task)
             
             # Process with multiprocessing
             results = []
             total_tasks = len(tasks)
+            num_unique_files = len(file_groups) + len(ometiff_tasks)  # Count MCD groups + OME-TIFF files
             total_channels = sum(len(acq_info.channels) for acq_info in acquisitions if acq_info.channels)
             
             # Use multiprocessing for true parallelization
             # Use spawn method to ensure isolation from other multiprocessing operations
             if num_workers > 1 and total_tasks > 1:
                 ctx = mp.get_context('spawn')  # Use spawn to avoid conflicts with feature extraction
-                with ctx.Pool(processes=num_workers) as pool:
-                    # Submit all tasks (one per acquisition)
-                    futures = []
-                    for task in tasks:
-                        future = pool.apply_async(_qc_process_acquisition_worker, (task,))
-                        futures.append(future)
-                    
-                    # Collect results more efficiently - use get() with timeout instead of busy-waiting
-                    completed = 0
-                    channels_processed = 0
-                    
-                    # Process futures in order, but with timeout to allow UI updates
-                    for i, future in enumerate(futures):
+                
+                # Process each file sequentially, but all acquisitions from each file in parallel
+                file_num = 0
+                completed_acquisitions = 0
+                channels_processed = 0
+                worker_timeout = 300  # 5 minutes per worker
+                
+                try:
+                    for source_file, file_tasks in file_groups.items():
+                        file_num += 1
+                        file_basename = os.path.basename(source_file) if os.path.isfile(source_file) else os.path.basename(os.path.dirname(source_file))
+                        
                         if progress_dlg.is_cancelled():
-                            pool.terminate()
-                            pool.join()
+                            break
+                        
+                        # Update progress for file start
+                        progress_dlg.update_progress(
+                            int((completed_acquisitions / total_tasks) * 100),
+                            f"File {file_num}/{num_unique_files}: {file_basename}",
+                            f"Processing {len(file_tasks)} acquisitions from this file..."
+                        )
+                        QtWidgets.QApplication.processEvents()
+                        
+                        with ctx.Pool(processes=min(num_workers, len(file_tasks))) as pool:
+                            # Submit all acquisitions from this file
+                            futures = []
+                            for task in file_tasks:
+                                future = pool.apply_async(_qc_process_acquisition_worker, (task,))
+                                futures.append(future)
+                            
+                            # Collect results as they complete
+                            completed_for_file = 0
+                            for acq_idx, future in enumerate(futures, 1):
+                                if progress_dlg.is_cancelled():
+                                    pool.terminate()
+                                    pool.join()
+                                    break
+                                
+                                try:
+                                    acquisition_results = future.get(timeout=worker_timeout)
+                                    if acquisition_results:
+                                        results.extend(acquisition_results)
+                                        channels_processed += len(acquisition_results)
+                                    completed_for_file += 1
+                                    completed_acquisitions += 1
+                                    
+                                    # Update progress
+                                    progress = int((completed_acquisitions / total_tasks) * 100)
+                                    progress_dlg.update_progress(
+                                        progress,
+                                        f"File {file_num}/{num_unique_files}: {file_basename}",
+                                        f"Processed {completed_for_file}/{len(file_tasks)} acquisitions from this file ({completed_acquisitions}/{total_tasks} total, {channels_processed} channels)"
+                                    )
+                                    QtWidgets.QApplication.processEvents()
+                                except mp.TimeoutError:
+                                    print(f"[QC] [ERROR] QC analysis timed out for acquisition from {file_basename} after {worker_timeout}s")
+                                    completed_for_file += 1
+                                    completed_acquisitions += 1
+                                    progress = int((completed_acquisitions / total_tasks) * 100)
+                                    progress_dlg.update_progress(
+                                        progress,
+                                        f"File {file_num}/{num_unique_files}: {file_basename}",
+                                        f"Processed {completed_for_file}/{len(file_tasks)} acquisitions from this file..."
+                                    )
+                                    QtWidgets.QApplication.processEvents()
+                                except Exception as e:
+                                    # Handle errors
+                                    import traceback
+                                    traceback.print_exc()
+                                    print(f"[QC] [ERROR] QC analysis failed for acquisition from {file_basename}: {e}")
+                                    completed_for_file += 1
+                                    completed_acquisitions += 1
+                                    progress = int((completed_acquisitions / total_tasks) * 100)
+                                    progress_dlg.update_progress(
+                                        progress,
+                                        f"File {file_num}/{num_unique_files}: {file_basename}",
+                                        f"Processed {completed_for_file}/{len(file_tasks)} acquisitions from this file..."
+                                    )
+                                    QtWidgets.QApplication.processEvents()
+                        
+                        print(f"[QC] Completed MCD file {file_basename}: {completed_for_file}/{len(file_tasks)} acquisitions")
+                    
+                    # Process OME-TIFF files: each file individually (one file = one worker)
+                    # OME-TIFF files don't need grouping since each file is typically a single acquisition
+                    # and there are no file locking issues with OME-TIFF loaders
+                    if ometiff_tasks:
+                        print(f"[QC] Processing {len(ometiff_tasks)} OME-TIFF files individually")
+                        with ctx.Pool(processes=min(num_workers, len(ometiff_tasks))) as pool:
+                            futures = []
+                            for task in ometiff_tasks:
+                                future = pool.apply_async(_qc_process_acquisition_worker, (task,))
+                                futures.append(future)
+                            
+                            # Collect results as they complete
+                            completed_ometiff = 0
+                            mcd_acquisitions_processed = completed_acquisitions
+                            
+                            for acq_idx, future in enumerate(futures, 1):
+                                if progress_dlg.is_cancelled():
+                                    pool.terminate()
+                                    pool.join()
+                                    break
+                                
+                                try:
+                                    acquisition_results = future.get(timeout=worker_timeout)
+                                    if acquisition_results:
+                                        results.extend(acquisition_results)
+                                        channels_processed += len(acquisition_results)
+                                    completed_ometiff += 1
+                                    completed_acquisitions += 1
+                                    
+                                    # Update progress
+                                    progress = int((completed_acquisitions / total_tasks) * 100)
+                                    progress_dlg.update_progress(
+                                        progress,
+                                        f"Processing OME-TIFF files...",
+                                        f"Processed {completed_ometiff}/{len(ometiff_tasks)} OME-TIFF files ({completed_acquisitions}/{total_tasks} total, {channels_processed} channels)"
+                                    )
+                                    QtWidgets.QApplication.processEvents()
+                                except mp.TimeoutError:
+                                    print(f"[QC] [ERROR] QC analysis timed out for OME-TIFF acquisition after {worker_timeout}s")
+                                    completed_ometiff += 1
+                                    completed_acquisitions += 1
+                                    progress = int((completed_acquisitions / total_tasks) * 100)
+                                    progress_dlg.update_progress(
+                                        progress,
+                                        f"Processing OME-TIFF files...",
+                                        f"Processed {completed_ometiff}/{len(ometiff_tasks)} OME-TIFF files..."
+                                    )
+                                    QtWidgets.QApplication.processEvents()
+                                except Exception as e:
+                                    import traceback
+                                    traceback.print_exc()
+                                    print(f"[QC] [ERROR] QC analysis failed for OME-TIFF acquisition: {e}")
+                                    completed_ometiff += 1
+                                    completed_acquisitions += 1
+                                    progress = int((completed_acquisitions / total_tasks) * 100)
+                                    progress_dlg.update_progress(
+                                        progress,
+                                        f"Processing OME-TIFF files...",
+                                        f"Processed {completed_ometiff}/{len(ometiff_tasks)} OME-TIFF files..."
+                                    )
+                                    QtWidgets.QApplication.processEvents()
+                        
+                        print(f"[QC] Completed {completed_ometiff}/{len(ometiff_tasks)} OME-TIFF files")
+                
+                except Exception as mp_error:
+                    print(f"[QC] Multiprocessing failed, falling back to sequential processing: {mp_error}")
+                    import traceback
+                    traceback.print_exc()
+                    progress_dlg.update_progress(0, "Multiprocessing failed, using sequential processing", "Processing acquisitions one by one")
+                    
+                    # Fallback to sequential processing
+                    for i, task in enumerate(tasks):
+                        if progress_dlg.is_cancelled():
                             break
                         
                         try:
-                            # Get result with timeout - this blocks until ready or timeout
-                            # Use a reasonable timeout (30 seconds per acquisition)
-                            acquisition_results = future.get(timeout=30)
-                            print(f"[QC DEBUG] Got results from task {i}: {len(acquisition_results) if acquisition_results else 0} results")
+                            acquisition_results = _qc_process_acquisition_worker(task)
                             if acquisition_results:
                                 results.extend(acquisition_results)
                                 channels_processed += len(acquisition_results)
-                                print(f"[QC DEBUG] Total results so far: {len(results)}")
-                            else:
-                                print(f"[QC DEBUG] WARNING: Task {i} returned no results")
-                            completed += 1
                             
-                            # Update progress immediately
-                            progress = int((completed / total_tasks) * 100)
+                            # Update progress
+                            progress = int(((i + 1) / total_tasks) * 100)
                             progress_dlg.update_progress(
                                 progress,
-                                f"Processing {num_workers} acquisitions in parallel...",
-                                f"Processed {completed}/{total_tasks} acquisitions ({channels_processed} channels)"
+                                "Processing acquisitions...",
+                                f"Processed {i+1}/{total_tasks} acquisitions ({channels_processed} channels)"
                             )
                             QtWidgets.QApplication.processEvents()
-                        except mp.TimeoutError:
-                            # Timeout - task is taking too long, skip for now and collect later
-                            print(f"[QC DEBUG] WARNING: Task {i} timed out, will collect later")
-                            continue
                         except Exception as e:
-                            # Handle errors
-                            print(f"[QC DEBUG] ERROR getting results from task {i}: {e}")
+                            print(f"[QC] [ERROR] Sequential QC analysis failed: {e}")
                             import traceback
                             traceback.print_exc()
-                            completed += 1
-                            progress = int((completed / total_tasks) * 100)
-                            progress_dlg.update_progress(
-                                progress,
-                                f"Processing {num_workers} acquisitions in parallel...",
-                                f"Processed {completed}/{total_tasks} acquisitions..."
-                            )
-                            QtWidgets.QApplication.processEvents()
-                    
-                    # Collect any remaining results that timed out or weren't collected
-                    if completed < total_tasks:
-                        for i, future in enumerate(futures):
-                            if i < completed:  # Already processed
-                                continue
-                            try:
-                                acquisition_results = future.get(timeout=60)  # Longer timeout for remaining tasks
-                                if acquisition_results:
-                                    results.extend(acquisition_results)
-                                    channels_processed += len(acquisition_results)
-                                completed += 1
-                                
-                                # Update progress
-                                progress = int((completed / total_tasks) * 100)
-                                progress_dlg.update_progress(
-                                    progress,
-                                    f"Processing {num_workers} acquisitions in parallel...",
-                                    f"Processed {completed}/{total_tasks} acquisitions ({channels_processed} channels)"
-                                )
-                                QtWidgets.QApplication.processEvents()
-                            except Exception:
-                                completed += 1
-                                progress = int((completed / total_tasks) * 100)
-                                progress_dlg.update_progress(
-                                    progress,
-                                    f"Processing {num_workers} acquisitions in parallel...",
-                                    f"Processed {completed}/{total_tasks} acquisitions..."
-                                )
-                                QtWidgets.QApplication.processEvents()
-                    
-                    # Final progress update
-                    progress_dlg.update_progress(
-                        100,
-                        f"Processing {num_workers} acquisitions in parallel...",
-                        f"Processed {completed}/{total_tasks} acquisitions ({channels_processed} channels)"
-                    )
-                    QtWidgets.QApplication.processEvents()
             else:
                 # Single-threaded processing
                 channels_processed = 0
                 for i, task in enumerate(tasks):
+                    if progress_dlg.is_cancelled():
+                        break
+                    
                     acquisition_results = _qc_process_acquisition_worker(task)
                     if acquisition_results:
                         results.extend(acquisition_results)
@@ -786,11 +889,8 @@ class QCAnalysisDialog(QtWidgets.QDialog):
                     QtWidgets.QApplication.processEvents()
             
             # Create DataFrame
-            print(f"[QC DEBUG] Total results collected: {len(results)}")
             if results:
                 self.qc_results = pd.DataFrame(results)
-                print(f"[QC DEBUG] Created DataFrame with {len(self.qc_results)} rows, columns: {list(self.qc_results.columns)}")
-                print(f"[QC DEBUG] Unique acquisition IDs in results: {self.qc_results['acquisition_id'].unique() if 'acquisition_id' in self.qc_results.columns else 'N/A'}")
                 
                 # Map column names from core.py format to dialog format
                 # core.py uses: intensity_mean, intensity_std, intensity_median, intensity_min, intensity_max, coverage
@@ -807,7 +907,6 @@ class QCAnalysisDialog(QtWidgets.QDialog):
                 existing_mappings = {k: v for k, v in column_mapping.items() if k in self.qc_results.columns}
                 if existing_mappings:
                     self.qc_results = self.qc_results.rename(columns=existing_mappings)
-                    print(f"[QC DEBUG] Renamed columns: {existing_mappings}")
                 
                 # Convert coverage from fraction (0.0-1.0) to percentage (0-100)
                 if 'coverage_pct' in self.qc_results.columns:
@@ -816,16 +915,14 @@ class QCAnalysisDialog(QtWidgets.QDialog):
                     if max_coverage <= 1.0:
                         # Convert from fraction to percentage
                         self.qc_results['coverage_pct'] = self.qc_results['coverage_pct'] * 100.0
-                        print(f"[QC DEBUG] Converted coverage from fraction to percentage (multiplied by 100)")
                     else:
-                        print(f"[QC DEBUG] Coverage already in percentage format (max value: {max_coverage})")
+                        pass
                 
-                print(f"[QC DEBUG] Final columns after renaming: {list(self.qc_results.columns)}")
                 
                 # Aggregate results per channel across all ROIs
                 self._aggregate_results_by_channel()
                 if self.qc_results_aggregated is not None:
-                    print(f"[QC DEBUG] Aggregated results columns: {list(self.qc_results_aggregated.columns)}")
+                    pass
                 
                 # Cache results for persistence
                 self._save_results_to_cache()
@@ -887,7 +984,6 @@ class QCAnalysisDialog(QtWidgets.QDialog):
                 QtWidgets.QApplication.processEvents()
                 QtCore.QTimer.singleShot(500, progress_dlg.close)
             else:
-                print(f"[QC DEBUG] ERROR: No results collected!")
                 progress_dlg.close()
                 QtWidgets.QMessageBox.warning(self, "Error", "No results generated. Check console for errors.")
                 
@@ -1126,15 +1222,27 @@ class QCAnalysisDialog(QtWidgets.QDialog):
     
     def _restore_cached_results(self):
         """Restore QC results from cache if available for the current file set."""
-        if not self.file_set_id or not self.parent_window:
+        if not self.parent_window:
             return
         
         if not hasattr(self.parent_window, 'qc_results_cache'):
             return
         
         # Try to restore results for current analysis mode
-        cache_key = f"{self.file_set_id}_{self.analysis_mode}"
-        cached = self.parent_window.qc_results_cache.get(cache_key)
+        cached = None
+        if self.file_set_id:
+            # First try exact match with current file_set_id
+            cache_key = f"{self.file_set_id}_{self.analysis_mode}"
+            cached = self.parent_window.qc_results_cache.get(cache_key)
+        
+        # If no exact match, try to find any cache entry with results for current analysis mode
+        if not cached or cached.get('qc_results') is None:
+            for cache_key, cache_data in self.parent_window.qc_results_cache.items():
+                if (isinstance(cache_data, dict) and 
+                    cache_data.get('analysis_mode') == self.analysis_mode and
+                    cache_data.get('qc_results') is not None):
+                    cached = cache_data
+                    break
         
         if cached and cached.get('qc_results') is not None:
             # Restore results
@@ -1148,6 +1256,20 @@ class QCAnalysisDialog(QtWidgets.QDialog):
             self.snr_intensity_save_btn.setEnabled(True)
             self.coverage_save_btn.setEnabled(True)
             self.distribution_save_btn.setEnabled(True)
+        
+        # Restore UI state if available
+        if hasattr(self.parent_window, '_saved_qc_ui_state') and self.parent_window._saved_qc_ui_state:
+            ui_state = self.parent_window._saved_qc_ui_state
+            if "analysis_mode" in ui_state and hasattr(self, 'mode_combo'):
+                index = self.mode_combo.findText(ui_state["analysis_mode"])
+                if index >= 0:
+                    self.mode_combo.setCurrentIndex(index)
+            if "selected_acquisition" in ui_state and hasattr(self, 'acq_combo'):
+                index = self.acq_combo.findText(ui_state["selected_acquisition"])
+                if index >= 0:
+                    self.acq_combo.setCurrentIndex(index)
+            if "num_workers" in ui_state and hasattr(self, 'workers_spin'):
+                self.workers_spin.setValue(ui_state["num_workers"])
     
     def _update_summary_table(self):
         """Update the summary table with aggregated results."""
@@ -1244,6 +1366,9 @@ class QCAnalysisDialog(QtWidgets.QDialog):
         # Set log scale on both axes
         ax.set_xscale('log')
         ax.set_yscale('log')
+        
+        # Add dotted horizontal line at 10^0 = 1.0
+        ax.axhline(y=1.0, color='gray', linestyle='--', linewidth=1, alpha=0.5)
         
         ax.set_xlabel('Mean Intensity (log scale, averaged across ROIs)', fontsize=10)
         ax.set_ylabel('SNR (Signal-to-Noise Ratio, log scale, averaged across ROIs)', fontsize=10)

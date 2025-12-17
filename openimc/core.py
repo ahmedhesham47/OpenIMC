@@ -800,6 +800,21 @@ def extract_features(
         # No features extracted
         combined_features = pd.DataFrame()
     
+    # Apply arcsinh transformation to intensity features after combining all acquisitions
+    # This is more efficient than applying per-acquisition and ensures consistency
+    if arcsinh and not combined_features.empty:
+        # Find all intensity feature columns (exclude frac_pos as it's a proportion)
+        intensity_cols = [col for col in combined_features.columns 
+                         if any(col.endswith(f"_{ft}") for ft in ['mean', 'median', 'std', 'mad', 'p10', 'p90', 'integrated'])
+                         and not col.endswith('_frac_pos')]
+        
+        if intensity_cols:
+            # Apply arcsinh to all intensity features at once
+            combined_features[intensity_cols] = arcsinh_normalize(
+                combined_features[intensity_cols].values, 
+                cofactor=arcsinh_cofactor
+            )
+    
     # Save to CSV if output path is provided
     if output_path is not None:
         output_path = Path(output_path)
@@ -1914,10 +1929,61 @@ def qc_analysis(
     
     results = []
     
+    # Optimize: Load all channels at once instead of loading the entire acquisition
+    # multiple times (once per channel). This is much faster for larger files.
+    # For MCD files, get_image() reads the entire acquisition each time, so loading
+    # all channels once and extracting individual channels is much more efficient.
+    img_stack = None
+    channel_indices = None
+    n_channels_total = None
+    
+    try:
+        # Load all channels at once
+        img_stack = loader.get_all_channels(original_acq_id)
+        
+        # Determine shape - loaders return HWC format (H, W, C)
+        if img_stack.ndim == 3:
+            height, width, n_channels_total = img_stack.shape
+        elif img_stack.ndim == 2:
+            # Single channel - handle separately
+            n_channels_total = 1
+        else:
+            # Unexpected shape - fall back to per-channel loading
+            img_stack = None
+            n_channels_total = None
+        
+        if img_stack is not None:
+            # Get channel indices for the requested channels
+            all_channels = loader.get_channels(original_acq_id)
+            channel_indices = {}
+            for channel in channels:
+                if channel in all_channels:
+                    channel_indices[channel] = all_channels.index(channel)
+    except Exception as e:
+        # Fallback to per-channel loading if get_all_channels fails
+        # (e.g., for some loader implementations)
+        img_stack = None
+        channel_indices = None
+        n_channels_total = None
+    
     for channel in channels:
         try:
-            # Load image
-            img = loader.get_image(original_acq_id, channel)
+            # Extract channel from pre-loaded stack if available, otherwise load individually
+            if (img_stack is not None and channel_indices is not None and 
+                channel in channel_indices and n_channels_total is not None):
+                ch_idx = channel_indices[channel]
+                if img_stack.ndim == 3:
+                    if ch_idx >= n_channels_total:
+                        continue
+                    img = img_stack[:, :, ch_idx]
+                elif img_stack.ndim == 2:
+                    img = img_stack
+                else:
+                    continue
+            else:
+                # Fallback: load image individually (slower but works for all loaders)
+                img = loader.get_image(original_acq_id, channel)
+            
             if img is None:
                 continue
             
@@ -2454,8 +2520,6 @@ def spatial_enrichment(
             n_workers = 1
     n_workers = max(1, n_workers)
     
-    print(f"[DEBUG] spatial_enrichment: Starting enrichment analysis")
-    print(f"[DEBUG] spatial_enrichment: n_permutations={n_permutations}, n_workers={n_workers}, seed={seed}")
     
     # Collect all ROIs first
     roi_tasks = []
@@ -2463,13 +2527,11 @@ def spatial_enrichment(
         roi_edges = edges_df[edges_df['roi_id'] == str(roi_id)]
         
         if roi_edges.empty:
-            print(f"[DEBUG] spatial_enrichment: ROI {roi_id} has no edges, skipping")
             continue
         
         # Get unique clusters
         unique_clusters = sorted(roi_df[cluster_column].dropna().unique())
         if len(unique_clusters) < 2:
-            print(f"[DEBUG] spatial_enrichment: ROI {roi_id} has < 2 clusters, skipping")
             continue
         
         # Prepare ROI task for worker
@@ -2482,49 +2544,39 @@ def spatial_enrichment(
             seed + len(roi_tasks)  # Unique seed for each ROI
         ))
     
-    print(f"[DEBUG] spatial_enrichment: Prepared {len(roi_tasks)} ROI tasks")
     
     # Process ROIs with multiprocessing
     enrichment_results = []
     if len(roi_tasks) > 0:
         if n_workers > 1 and len(roi_tasks) > 1:
             # Use multiprocessing: one ROI per worker
-            print(f"[DEBUG] spatial_enrichment: Using MULTIPROCESSING with {n_workers} workers")
-            print(f"[DEBUG] spatial_enrichment: Distributing {len(roi_tasks)} ROIs across {n_workers} workers")
             import time
             start_time = time.time()
             with mp.Pool(processes=n_workers) as pool:
-                print(f"[DEBUG] spatial_enrichment: Pool created, starting parallel ROI processing...")
                 roi_results = pool.map(roi_enrichment_worker, roi_tasks)
             elapsed = time.time() - start_time
-            print(f"[DEBUG] spatial_enrichment: Multiprocessing completed in {elapsed:.2f} seconds")
             
             # Flatten results from all ROIs
             for roi_result_list in roi_results:
                 enrichment_results.extend(roi_result_list)
         else:
             # Single-threaded fallback: process ROIs sequentially
-            print(f"[DEBUG] spatial_enrichment: Using SINGLE-THREADED mode (n_workers={n_workers}, rois={len(roi_tasks)})")
             import time
             start_time = time.time()
             for roi_task in roi_tasks:
                 roi_result_list = roi_enrichment_worker(roi_task)
                 enrichment_results.extend(roi_result_list)
             elapsed = time.time() - start_time
-            print(f"[DEBUG] spatial_enrichment: Single-threaded computation completed in {elapsed:.2f} seconds")
     
     if not enrichment_results:
-        print(f"[DEBUG] spatial_enrichment: No enrichment results generated")
         return pd.DataFrame()
     
     results_df = pd.DataFrame(enrichment_results)
-    print(f"[DEBUG] spatial_enrichment: Completed! Generated {len(results_df)} enrichment results")
     
     # Save output if path is provided
     if output_path is not None:
         output_path = Path(output_path)
         results_df.to_csv(output_path, index=False)
-        print(f"[DEBUG] spatial_enrichment: Results saved to {output_path}")
     
     return results_df
 
@@ -2575,8 +2627,6 @@ def spatial_distance_distribution(
     
     n_workers = max(1, n_workers)
     
-    print(f"[DEBUG] spatial_distance_distribution: Starting distance distribution analysis")
-    print(f"[DEBUG] spatial_distance_distribution: n_workers={n_workers}, pixel_size_um={pixel_size_um}")
     
     # Collect all ROIs first
     roi_tasks = []
@@ -2584,7 +2634,6 @@ def spatial_distance_distribution(
         # Get unique clusters
         unique_clusters = sorted(roi_df[cluster_column].dropna().unique())
         if len(unique_clusters) < 1:
-            print(f"[DEBUG] spatial_distance_distribution: ROI {roi_id} has no clusters, skipping")
             continue
         
         # Prepare ROI task for worker
@@ -2595,15 +2644,12 @@ def spatial_distance_distribution(
             pixel_size_um
         ))
     
-    print(f"[DEBUG] spatial_distance_distribution: Prepared {len(roi_tasks)} ROI tasks")
     
     # Process ROIs with multiprocessing
     distance_results = []
     if len(roi_tasks) > 0:
         if n_workers > 1 and len(roi_tasks) > 1:
             # Use multiprocessing: one ROI per worker
-            print(f"[DEBUG] spatial_distance_distribution: Using MULTIPROCESSING with {n_workers} workers")
-            print(f"[DEBUG] spatial_distance_distribution: Distributing {len(roi_tasks)} ROIs across {n_workers} workers")
             with mp.Pool(processes=n_workers) as pool:
                 roi_results = pool.map(distance_distribution_worker, roi_tasks)
                 # Flatten results from all ROIs
@@ -2611,7 +2657,6 @@ def spatial_distance_distribution(
                     distance_results.extend(roi_result)
         else:
             # Single-threaded processing
-            print(f"[DEBUG] spatial_distance_distribution: Using SINGLE-THREADED processing")
             for roi_task in roi_tasks:
                 roi_result = distance_distribution_worker(roi_task)
                 distance_results.extend(roi_result)
@@ -2892,13 +2937,10 @@ def spatial_neighborhood_enrichment(
     roi_cluster_map = {}
     
     for roi_id, adata in anndata_dict.items():
-        print(f"[DEBUG] Processing ROI: {roi_id}")
         if 'spatial_connectivities' not in adata.obsp:
-            print(f"[DEBUG]   Skipping {roi_id}: no spatial_connectivities")
             continue
         
         if cluster_key not in adata.obs.columns:
-            print(f"[DEBUG]   Skipping {roi_id}: cluster_key '{cluster_key}' not in obs")
             continue
         
         # Filter out cells with NaN cluster values
@@ -2906,32 +2948,23 @@ def spatial_neighborhood_enrichment(
         nan_mask = pd.isna(cluster_values)
         n_nan = nan_mask.sum()
         if n_nan > 0:
-            print(f"[DEBUG]   Filtering out {n_nan} cells with NaN cluster values")
             # Create boolean mask for valid cells (non-NaN)
             valid_mask = ~nan_mask
             # Filter AnnData object (this will also filter spatial_connectivities)
             adata = adata[valid_mask].copy()
-            print(f"[DEBUG]   After filtering: {adata.n_obs} cells remaining")
         
         # Ensure categorical
         if not hasattr(adata.obs[cluster_key], 'cat'):
             adata.obs[cluster_key] = adata.obs[cluster_key].astype('category')
         
-        print(f"[DEBUG]   Running nhood_enrichment for {roi_id}...")
-        print(f"[DEBUG]   adata.obsp keys before: {list(adata.obsp.keys())}")
-        print(f"[DEBUG]   Number of cells: {adata.n_obs}")
         
         # Check graph connectivity
         if 'spatial_connectivities' in adata.obsp:
             conn = adata.obsp['spatial_connectivities']
             n_edges = conn.nnz // 2  # Divide by 2 because it's symmetric
-            print(f"[DEBUG]   Graph has {n_edges} edges (connections)")
             # Check if graph is connected
             from scipy.sparse.csgraph import connected_components
             n_components, labels = connected_components(conn, directed=False, return_labels=True)
-            print(f"[DEBUG]   Graph has {n_components} connected component(s)")
-            if n_components > 1:
-                print(f"[DEBUG]   WARNING: Graph is not fully connected! This may cause issues.")
         
         # Check clusters
         if hasattr(adata.obs[cluster_key], 'cat'):
@@ -2941,28 +2974,18 @@ def spatial_neighborhood_enrichment(
             categories = sorted(adata.obs[cluster_key].unique())
             unique_vals = categories
         
-        print(f"[DEBUG]   Cluster key '{cluster_key}' categories: {categories}")
-        print(f"[DEBUG]   Number of unique clusters: {len(unique_vals)}")
         if len(unique_vals) < 2:
-            print(f"[DEBUG]   WARNING: Only {len(unique_vals)} cluster(s) found. Need at least 2 for enrichment analysis!")
-            print(f"[DEBUG]   Skipping {roi_id} due to insufficient clusters")
             continue
         
         # Run neighborhood enrichment
         sq.gr.nhood_enrichment(adata, cluster_key=cluster_key)
-        print(f"[DEBUG]   nhood_enrichment completed for {roi_id}")
         
         # Check ALL keys in uns to see what squidpy stored
-        print(f"[DEBUG]   adata.uns keys after nhood_enrichment: {list(adata.uns.keys())}")
         for key in adata.uns.keys():
             if 'nhood' in key.lower() or 'enrich' in key.lower():
-                print(f"[DEBUG]   Found relevant key: '{key}'")
                 val = adata.uns[key]
-                print(f"[DEBUG]     Type: {type(val)}")
                 if isinstance(val, dict):
-                    print(f"[DEBUG]     Dict keys: {list(val.keys())}")
-                    for k, v in val.items():
-                        print(f"[DEBUG]       '{k}': type={type(v)}, shape={getattr(v, 'shape', 'N/A')}")
+                    pass
         
         # Extract matrix - try multiple possible keys
         enrichment_data = None
@@ -2970,7 +2993,6 @@ def spatial_neighborhood_enrichment(
         for key in possible_keys:
             if key in adata.uns:
                 enrichment_data = adata.uns[key]
-                print(f"[DEBUG]   Found enrichment data at key: '{key}'")
                 break
         
         if enrichment_data is None:
@@ -2978,42 +3000,29 @@ def spatial_neighborhood_enrichment(
             for key in adata.uns.keys():
                 if 'nhood' in key.lower() or 'enrich' in key.lower():
                     enrichment_data = adata.uns[key]
-                    print(f"[DEBUG]   Found enrichment data at key: '{key}' (searched)")
                     break
         
         if enrichment_data is None:
             enrichment_data = {}
-            print(f"[DEBUG]   No enrichment data found in uns, using empty dict")
         
-        print(f"[DEBUG]   enrichment_data type: {type(enrichment_data)}")
-        if isinstance(enrichment_data, dict):
-            print(f"[DEBUG]   enrichment_data keys: {list(enrichment_data.keys())}")
         matrix = None
         
         if isinstance(enrichment_data, dict):
             if 'zscore' in enrichment_data:
                 matrix = enrichment_data['zscore']
-                print(f"[DEBUG]   Found zscore matrix, shape: {matrix.shape if hasattr(matrix, 'shape') else 'N/A'}")
             elif 'count' in enrichment_data:
                 matrix = enrichment_data['count']
-                print(f"[DEBUG]   Found count matrix, shape: {matrix.shape if hasattr(matrix, 'shape') else 'N/A'}")
             elif 'stat' in enrichment_data:
                 matrix = enrichment_data['stat']
-                print(f"[DEBUG]   Found stat matrix, shape: {matrix.shape if hasattr(matrix, 'shape') else 'N/A'}")
             else:
-                print(f"[DEBUG]   Searching for matrix-like value in dict...")
                 for key, value in enrichment_data.items():
-                    print(f"[DEBUG]     Key '{key}': type={type(value)}, ndim={getattr(value, 'ndim', 'N/A')}")
                     if isinstance(value, np.ndarray) and value.ndim == 2:
                         matrix = value
-                        print(f"[DEBUG]   Found matrix at key '{key}', shape: {matrix.shape}")
                         break
         elif isinstance(enrichment_data, np.ndarray):
             matrix = enrichment_data
-            print(f"[DEBUG]   enrichment_data is numpy array, shape: {matrix.shape}")
         
         if matrix is not None and isinstance(matrix, np.ndarray) and matrix.ndim == 2:
-            print(f"[DEBUG]   Successfully extracted matrix for {roi_id}, shape: {matrix.shape}")
             results[roi_id] = adata
             enrichment_matrices.append((roi_id, matrix))
             
@@ -3023,12 +3032,9 @@ def spatial_neighborhood_enrichment(
             else:
                 clusters = sorted(adata.obs[cluster_key].unique())
             roi_cluster_map[roi_id] = clusters
-            print(f"[DEBUG]   Added {roi_id} with {len(clusters)} clusters")
         else:
-            print(f"[DEBUG]   Failed to extract valid matrix for {roi_id}")
-            print(f"[DEBUG]     matrix is None: {matrix is None}")
             if matrix is not None:
-                print(f"[DEBUG]     matrix type: {type(matrix)}, ndim: {getattr(matrix, 'ndim', 'N/A')}")
+                pass
     
     # Aggregate if multiple ROIs
     aggregated_matrix = None
@@ -3097,11 +3103,6 @@ def spatial_neighborhood_enrichment(
         if aggregated_matrix is not None:
             significant_counts_matrix = (np.abs(aggregated_matrix) > significance_threshold).astype(int)
     
-    print(f"[DEBUG] spatial_neighborhood_enrichment: Returning results")
-    print(f"[DEBUG]   - results: {len(results)} ROIs")
-    print(f"[DEBUG]   - aggregated: {aggregated_matrix.shape if aggregated_matrix is not None else None}")
-    print(f"[DEBUG]   - cluster_categories: {len(all_clusters_union)} clusters")
-    print(f"[DEBUG]   - significant_counts: {significant_counts_matrix.shape if significant_counts_matrix is not None else None}")
     
     return {
         'results': results,
@@ -3150,10 +3151,8 @@ def spatial_cooccurrence(
         nan_mask = pd.isna(cluster_values)
         n_nan = nan_mask.sum()
         if n_nan > 0:
-            print(f"[DEBUG]   Filtering out {n_nan} cells with NaN cluster values")
             valid_mask = ~nan_mask
             adata = adata[valid_mask].copy()
-            print(f"[DEBUG]   After filtering: {adata.n_obs} cells remaining")
         
         # Ensure categorical
         if not hasattr(adata.obs[cluster_key], 'cat'):
@@ -3197,17 +3196,33 @@ def spatial_autocorrelation(
         if 'spatial_connectivities' not in adata.obsp:
             continue
         
+        # Exclude 'touches_edge' from analysis
+        var_names_list = list(adata.var_names) if hasattr(adata.var_names, '__iter__') else []
+        
         # Run spatial autocorrelation
         if markers is not None:
-            available_genes = [g for g in markers if g in adata.var_names]
+            # Filter out 'touches_edge' from markers
+            markers_filtered = [g for g in markers if g != 'touches_edge']
+            available_genes = [g for g in markers_filtered if g in var_names_list]
             if not available_genes:
                 continue
             sq.gr.spatial_autocorr(adata, mode="moran", genes=available_genes)
             all_genes.update(available_genes)
         else:
-            sq.gr.spatial_autocorr(adata, mode="moran")
-            var_names_list = list(adata.var_names) if hasattr(adata.var_names, '__iter__') else []
-            all_genes.update(var_names_list)
+            # Filter out 'touches_edge' before running autocorrelation
+            if 'touches_edge' in var_names_list:
+                # Create a filtered view excluding touches_edge
+                var_mask = adata.var_names != 'touches_edge'
+                adata_filtered = adata[:, var_mask].copy()
+                sq.gr.spatial_autocorr(adata_filtered, mode="moran")
+                # Copy results back to original adata
+                if 'moranI' in adata_filtered.uns:
+                    adata.uns['moranI'] = adata_filtered.uns['moranI']
+                var_names_list_filtered = [v for v in var_names_list if v != 'touches_edge']
+                all_genes.update(var_names_list_filtered)
+            else:
+                sq.gr.spatial_autocorr(adata, mode="moran")
+                all_genes.update(var_names_list)
         
         # Extract results
         moran_data = adata.uns.get('moranI', {})
@@ -3335,10 +3350,8 @@ def spatial_ripley(
         nan_mask = pd.isna(cluster_values)
         n_nan = nan_mask.sum()
         if n_nan > 0:
-            print(f"[DEBUG]   Filtering out {n_nan} cells with NaN cluster values")
             valid_mask = ~nan_mask
             adata = adata[valid_mask].copy()
-            print(f"[DEBUG]   After filtering: {adata.n_obs} cells remaining")
         
         # Ensure categorical
         if not hasattr(adata.obs[cluster_key], 'cat'):

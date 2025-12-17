@@ -28,7 +28,7 @@ import json
 import os
 import shutil
 from pathlib import Path
-from typing import Dict, List, Optional, Any, Union
+from typing import Dict, List, Optional, Any, Union, Iterable
 import numpy as np
 import pandas as pd
 import tifffile
@@ -46,9 +46,19 @@ class StateManager:
     - masks/: Segmentation masks
     - features/: Feature dataframes
     - analysis/: Analysis module states (QC, clustering, spatial, etc.)
+    
+    The state manager ensures that all data structures required by each analysis
+    module are properly saved and can be restored, including:
+    - Clustering: cluster labels, embeddings, annotations, filtered features
+    - Pixel Correlation: correlation results, aggregated results
+    - QC Analysis: QC results (pixel and cell level), aggregated results
+    - Spatial Analysis: edge dataframes, enrichment results, distance results
     """
     
-    STATE_VERSION = "1.0"
+    STATE_VERSION = "1.1"  # Incremented for improved state management
+    # Heuristics for keeping analysis-state JSON reasonably sized
+    _INLINE_NDARRAY_MAX_ELEMENTS = 10_000
+    _INLINE_DF_MAX_CELLS = 50_000  # rows * cols; above this we save to CSV
     
     def __init__(self):
         self.state_version = self.STATE_VERSION
@@ -267,12 +277,13 @@ class StateManager:
                             tifffile.imwrite(str(img_path), img)
                             if acq_id not in saved_images:
                                 saved_images[acq_id] = {}
-                            saved_images[acq_id][channel] = str(img_path.relative_to(images_dir.parent.parent))
+                            # Store paths relative to the state folder for portability (renaming/moving the state folder)
+                            saved_images[acq_id][channel] = str(img_path.relative_to(images_dir.parent))
                 elif isinstance(image_data, np.ndarray):
                     # Single image array
                     img_path = images_dir / f"{acq_id}.tif"
                     tifffile.imwrite(str(img_path), image_data)
-                    saved_images[acq_id] = str(img_path.relative_to(images_dir.parent.parent))
+                    saved_images[acq_id] = str(img_path.relative_to(images_dir.parent))
                 elif isinstance(image_data, str):
                     # Already a file path - just record it
                     saved_images[acq_id] = image_data
@@ -308,12 +319,12 @@ class StateManager:
                     # Multi-channel
                     loaded_images[acq_id] = {}
                     for channel, path in img_path.items():
-                        full_path = images_dir.parent.parent / path
+                        full_path = images_dir.parent / path
                         if full_path.exists():
                             loaded_images[acq_id][channel] = tifffile.imread(str(full_path))
                 elif isinstance(img_path, str):
                     # Single image
-                    full_path = images_dir.parent.parent / img_path
+                    full_path = images_dir.parent / img_path
                     if full_path.exists():
                         loaded_images[acq_id] = tifffile.imread(str(full_path))
             except Exception as e:
@@ -383,12 +394,12 @@ class StateManager:
                 if isinstance(mask_data, np.ndarray):
                     # Save mask array
                     tifffile.imwrite(str(mask_path), mask_data.astype(np.uint16), compression='lzw')
-                    saved_masks[acq_id] = str(mask_path.relative_to(masks_dir.parent.parent))
+                    saved_masks[acq_id] = str(mask_path.relative_to(masks_dir.parent))
                 elif isinstance(mask_data, str):
                     # Already a file path - copy it
                     if os.path.exists(mask_data):
                         shutil.copy2(mask_data, mask_path)
-                        saved_masks[acq_id] = str(mask_path.relative_to(masks_dir.parent.parent))
+                        saved_masks[acq_id] = str(mask_path.relative_to(masks_dir.parent))
                     else:
                         saved_masks[acq_id] = mask_data
             except Exception as e:
@@ -415,7 +426,7 @@ class StateManager:
         loaded_masks = {}
         
         for acq_id, mask_path in masks_info.items():
-            full_path = masks_dir.parent.parent / mask_path
+            full_path = masks_dir.parent / mask_path
             if full_path.exists():
                 loaded_masks[acq_id] = tifffile.imread(str(full_path))
         
@@ -474,7 +485,7 @@ class StateManager:
                 filename = feature_names.get(name, f"{name}_features.csv")
                 feature_path = features_dir / filename
                 df.to_csv(feature_path, index=False)
-                saved_features[name] = str(feature_path.relative_to(features_dir.parent.parent))
+                saved_features[name] = str(feature_path.relative_to(features_dir.parent))
         
         return saved_features
     
@@ -496,7 +507,7 @@ class StateManager:
         loaded_features = {}
         
         for name, feature_path in features_info.items():
-            full_path = features_dir.parent.parent / feature_path
+            full_path = features_dir.parent / feature_path
             if full_path.exists():
                 loaded_features[name] = pd.read_csv(full_path)
         
@@ -525,12 +536,17 @@ class StateManager:
                 analysis_path = analysis_dir / f"{module_name}.json"
                 
                 # Convert state to JSON-serializable format
-                json_state = self._prepare_analysis_state_for_json(module_state)
+                json_state = self._prepare_analysis_state_for_json(
+                    module_state,
+                    analysis_dir=analysis_dir,
+                    module_name=module_name,
+                    path_parts=(),
+                )
                 
                 with open(analysis_path, 'w') as f:
                     json.dump(json_state, f, indent=2, default=self._json_serializer)
                 
-                saved_analysis[module_name] = str(analysis_path.relative_to(analysis_dir.parent.parent))
+                saved_analysis[module_name] = str(analysis_path.relative_to(analysis_dir.parent))
         
         return saved_analysis
     
@@ -552,7 +568,7 @@ class StateManager:
         loaded_analysis = {}
         
         for module_name, analysis_path in analysis_info.items():
-            full_path = analysis_dir.parent.parent / analysis_path
+            full_path = analysis_dir.parent / analysis_path
             if full_path.exists():
                 with open(full_path, 'r') as f:
                     state = json.load(f)
@@ -561,29 +577,114 @@ class StateManager:
         
         return loaded_analysis
     
-    def _prepare_analysis_state_for_json(self, state: Any) -> Any:
+    def _prepare_analysis_state_for_json(
+        self,
+        state: Any,
+        *,
+        analysis_dir: Optional[Path] = None,
+        module_name: Optional[str] = None,
+        path_parts: Iterable[str] = (),
+    ) -> Any:
         """
         Prepare analysis state for JSON serialization.
-        Handles DataFrames, numpy arrays, etc.
+        Handles DataFrames, Series, numpy arrays, etc.
         """
         if isinstance(state, dict):
-            return {k: self._prepare_analysis_state_for_json(v) for k, v in state.items()}
+            return {
+                k: self._prepare_analysis_state_for_json(
+                    v,
+                    analysis_dir=analysis_dir,
+                    module_name=module_name,
+                    path_parts=tuple(path_parts) + (str(k),),
+                )
+                for k, v in state.items()
+            }
         elif isinstance(state, list):
-            return [self._prepare_analysis_state_for_json(item) for item in state]
+            return [
+                self._prepare_analysis_state_for_json(
+                    item,
+                    analysis_dir=analysis_dir,
+                    module_name=module_name,
+                    path_parts=tuple(path_parts) + (str(i),),
+                )
+                for i, item in enumerate(state)
+            ]
         elif isinstance(state, pd.DataFrame):
-            # Save DataFrame to CSV and return path reference
+            # Inline small DataFrames; save larger ones to disk for portability/perf.
+            n_cells = int(state.shape[0]) * int(state.shape[1])
+            if analysis_dir is not None and module_name is not None and n_cells > self._INLINE_DF_MAX_CELLS:
+                blob_dir = analysis_dir / "_blobs"
+                blob_dir.mkdir(parents=True, exist_ok=True)
+                safe_name = self._make_blob_name(module_name, path_parts, ext="csv")
+                df_path = blob_dir / safe_name
+                state.to_csv(df_path, index=False)
+                return {
+                    "__type__": "DataFrame_file",
+                    "__path__": str(df_path.relative_to(analysis_dir.parent)),
+                }
             return {"__type__": "DataFrame", "__data__": state.to_dict('records')}
+        elif isinstance(state, pd.Series):
+            # Convert Series to dict format with index and values
+            return {
+                "__type__": "Series",
+                "__data__": state.to_dict(),
+                "__index__": state.index.tolist() if hasattr(state.index, 'tolist') else list(state.index),
+                "__name__": state.name if state.name is not None else None
+            }
+        elif isinstance(state, pd.Index):
+            # Convert Index to list
+            return {"__type__": "Index", "__data__": state.tolist() if hasattr(state, 'tolist') else list(state)}
         elif isinstance(state, np.ndarray):
-            # Convert to list (for small arrays) or save to file
-            if state.size < 10000:  # Small arrays can be serialized directly
-                return {"__type__": "ndarray", "__data__": state.tolist(), "__shape__": list(state.shape), "__dtype__": str(state.dtype)}
-            else:
-                # Large arrays should be saved to file
-                return {"__type__": "ndarray_file", "__path__": None}  # Will be handled separately
+            # Inline small arrays; save larger ones to .npy under analysis/_blobs.
+            if state.size <= self._INLINE_NDARRAY_MAX_ELEMENTS:
+                return {
+                    "__type__": "ndarray",
+                    "__data__": state.tolist(),
+                    "__shape__": list(state.shape),
+                    "__dtype__": str(state.dtype),
+                }
+            if analysis_dir is not None and module_name is not None:
+                blob_dir = analysis_dir / "_blobs"
+                blob_dir.mkdir(parents=True, exist_ok=True)
+                safe_name = self._make_blob_name(module_name, path_parts, ext="npy")
+                arr_path = blob_dir / safe_name
+                np.save(str(arr_path), state)
+                return {
+                    "__type__": "ndarray_file",
+                    "__path__": str(arr_path.relative_to(analysis_dir.parent)),
+                    "__shape__": list(state.shape),
+                    "__dtype__": str(state.dtype),
+                }
+            # Fallback (shouldn't happen in normal save flow)
+            return {
+                "__type__": "ndarray",
+                "__data__": state.tolist(),
+                "__shape__": list(state.shape),
+                "__dtype__": str(state.dtype),
+            }
         elif isinstance(state, (np.integer, np.floating)):
             return state.item()
+        elif isinstance(state, (set, frozenset)):
+            # Convert sets to lists for JSON serialization
+            return {"__type__": "set", "__data__": list(state)}
+        elif isinstance(state, tuple):
+            # Convert tuples to lists (will be restored as lists, which is usually fine)
+            return list(state)
         else:
             return state
+
+    def _make_blob_name(self, module_name: str, path_parts: Iterable[str], *, ext: str) -> str:
+        """Create a deterministic, filesystem-safe blob filename for an analysis-state leaf."""
+        def _sanitize(s: str) -> str:
+            s = str(s)
+            # Keep it readable; collapse anything risky to underscores.
+            return "".join(ch if (ch.isalnum() or ch in "-_.") else "_" for ch in s)[:80]
+
+        parts = [_sanitize(module_name)] + [_sanitize(p) for p in path_parts if p is not None]
+        stem = "__".join([p for p in parts if p])
+        if not stem:
+            stem = "analysis_state"
+        return f"{stem}.{ext}"
     
     def _restore_analysis_state_from_json(self, state: Any, analysis_dir: Path) -> Any:
         """
@@ -593,14 +694,37 @@ class StateManager:
             if "__type__" in state:
                 if state["__type__"] == "DataFrame":
                     return pd.DataFrame(state["__data__"])
+                elif state["__type__"] == "DataFrame_file":
+                    # Load DataFrame from CSV stored relative to state folder
+                    if state.get("__path__"):
+                        full_path = analysis_dir.parent / state["__path__"]
+                        if full_path.exists():
+                            return pd.read_csv(full_path)
+                    return pd.DataFrame()
+                elif state["__type__"] == "Series":
+                    # Restore Series from dict format
+                    series_data = state.get("__data__", {})
+                    series_index = state.get("__index__", None)
+                    series_name = state.get("__name__", None)
+                    if series_index is not None:
+                        restored_series = pd.Series(series_data, index=series_index, name=series_name)
+                    else:
+                        restored_series = pd.Series(series_data, name=series_name)
+                    return restored_series
+                elif state["__type__"] == "Index":
+                    # Restore Index from list
+                    return pd.Index(state.get("__data__", []))
+                elif state["__type__"] == "set":
+                    # Restore set from list
+                    return set(state.get("__data__", []))
                 elif state["__type__"] == "ndarray":
                     return np.array(state["__data__"], dtype=state.get("__dtype__", float)).reshape(state["__shape__"])
                 elif state["__type__"] == "ndarray_file":
                     # Load from file if path is provided
                     if state.get("__path__"):
-                        full_path = analysis_dir.parent.parent / state["__path__"]
+                        full_path = analysis_dir.parent / state["__path__"]
                         if full_path.exists():
-                            return np.load(str(full_path))
+                            return np.load(str(full_path), allow_pickle=False)
                     return None
             else:
                 return {k: self._restore_analysis_state_from_json(v, analysis_dir) for k, v in state.items()}
@@ -617,6 +741,23 @@ class StateManager:
             return obj.tolist()
         elif isinstance(obj, pd.DataFrame):
             return obj.to_dict('records')
+        elif isinstance(obj, pd.Series):
+            # Convert Series to dict format
+            return {
+                "__type__": "Series",
+                "__data__": obj.to_dict(),
+                "__index__": obj.index.tolist() if hasattr(obj.index, 'tolist') else list(obj.index),
+                "__name__": obj.name if obj.name is not None else None
+            }
+        elif isinstance(obj, pd.Index):
+            # Convert Index to list
+            return {"__type__": "Index", "__data__": obj.tolist() if hasattr(obj, 'tolist') else list(obj)}
+        elif isinstance(obj, (set, frozenset)):
+            # Convert sets to lists for JSON serialization
+            return {"__type__": "set", "__data__": list(obj)}
+        elif isinstance(obj, tuple):
+            # Convert tuples to lists (will be restored as lists)
+            return list(obj)
         elif isinstance(obj, Path):
             return str(obj)
         else:

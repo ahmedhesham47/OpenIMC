@@ -21,6 +21,7 @@ from typing import List
 import os
 import pandas as pd
 import multiprocessing as mp
+from concurrent.futures import ThreadPoolExecutor, as_completed
 
 import numpy as np
 import matplotlib.pyplot as plt
@@ -182,7 +183,7 @@ def _get_patient_colors(n):
 # Cell Clustering Dialog
 # --------------------------
 class CellClusteringDialog(QtWidgets.QDialog):
-    def __init__(self, feature_dataframe, normalization_config=None, batch_corrected_dataframe=None, parent=None):
+    def __init__(self, feature_dataframe, normalization_config=None, batch_corrected_dataframe=None, clustered_cells_dataframe=None, parent=None):
         super().__init__(parent)
         self.setWindowTitle("Cell Clustering Analysis")
         self.setModal(True)
@@ -195,7 +196,7 @@ class CellClusteringDialog(QtWidgets.QDialog):
             self.resize(dialog_width, dialog_height)
         
         self.setMinimumSize(800, 600)
-        self.original_feature_dataframe = feature_dataframe  # Store original
+        self.original_feature_dataframe = feature_dataframe  # Store original (full dataset)
         self.batch_corrected_dataframe = batch_corrected_dataframe  # Store batch-corrected
         # Default to batch-corrected features if available, otherwise use original
         if batch_corrected_dataframe is not None and not batch_corrected_dataframe.empty:
@@ -203,15 +204,32 @@ class CellClusteringDialog(QtWidgets.QDialog):
         else:
             self.feature_dataframe = feature_dataframe  # Active dataframe (can be switched)
         self.normalization_config = normalization_config
+        
+        # Initialize clustering state
         self.cluster_labels = None
         self.clustered_data = None
         self.clustered_data_unscaled = None  # Store original unscaled data for heatmap display
+        
+        # If clustered_cells_dataframe is provided (from saved state), use it ONLY for initialization
+        # This restores the previous clustering state but does NOT limit future clustering operations
+        # When user clicks "Run Clustering", they will use the full feature_dataframe with new filters
+        if clustered_cells_dataframe is not None and not clustered_cells_dataframe.empty:
+            print(f"[CellClusteringDialog] Initializing with saved clustered_cells: {len(clustered_cells_dataframe)} cells")
+            self.clustered_data = clustered_cells_dataframe.copy()
+            self.clustered_data_unscaled = self.clustered_data.copy()
+            # Extract cluster_labels for compatibility
+            if 'cluster' in self.clustered_data.columns:
+                self.cluster_labels = self.clustered_data['cluster'].values
+                print(f"[CellClusteringDialog] Restored clusters: {sorted(self.clustered_data['cluster'].unique())}")
+        # Note: feature_dataframe remains FULL - users can run new clustering with different filters
         self.umap_embedding = None
         self.tsne_embedding = None
         self.cluster_annotation_map = {}
         self.cluster_backend_names = {}  # Store normalized names for CSV export
         self.original_cluster_assignments = None  # Store original cluster assignments before merging
         self.clustering_scaling_method = None  # Store scaling method used for clustering
+        self.actual_clustering_method = None  # Store the clustering method actually used when clustering was run
+        self.actual_dendrogram_mode = None  # Store the dendrogram mode actually used when clustering was run
         self.patient_annotation_map = {}  # Store custom patient/source file labels
         self.patient_cohort_map = {}  # Store patient -> cohort mapping (e.g., {'patient1': 'cohort_A', 'patient2': 'cohort_A'})
         self.cohort_colors = {}  # Store cohort -> color mapping (will be auto-generated)
@@ -250,6 +268,9 @@ class CellClusteringDialog(QtWidgets.QDialog):
         self.cluster_map_zscore_method = 'Mean'  # 'Mean', 'Median', 'Max', 'Min' for cluster aggregation
         self.gating_rules = []  # list of dict: {name, logic, conditions: [{column, op, threshold}]}
         self.llm_phenotype_cache = {}  # Cache for LLM phenotype suggestions
+        # Ensure cache is always a dict, never None
+        if not isinstance(self.llm_phenotype_cache, dict):
+            self.llm_phenotype_cache = {}
         self.seed = 42  # Default seed for reproducibility
         self.statistical_results = {}  # Store statistical test results for export: {marker: [(cluster1, cluster2, p_val, adj_p_val)]}
         self.filter_settings = None  # Store filter settings from feature selector
@@ -268,7 +289,29 @@ class CellClusteringDialog(QtWidgets.QDialog):
         self._check_and_auto_draw_heatmap()
     
     def _check_and_auto_draw_heatmap(self):
-        """Check if cluster columns exist in feature dataframe and auto-draw heatmap if they do."""
+        """Check if cluster columns exist and auto-draw heatmap if they do.
+        
+        This is called during initialization when loading a saved file.
+        If clustered_data was already initialized (from clustered_cells_dataframe),
+        we use that directly. Otherwise, we extract from feature_dataframe.
+        """
+        # If clustered_data is already initialized (from clustered_cells_dataframe), use it
+        if self.clustered_data is not None and not self.clustered_data.empty:
+            print(f"[_check_and_auto_draw_heatmap] Using pre-initialized clustered_data: {len(self.clustered_data)} cells")
+            # clustered_data and clustered_data_unscaled should already be set
+            # Just need to set display features and draw
+            if hasattr(self, 'last_features_used') and self.last_features_used:
+                available_last_features = [f for f in self.last_features_used if f in self.clustered_data.columns]
+                if available_last_features:
+                    self.selected_display_features = available_last_features
+            
+            # Set view to Heatmap and draw it
+            if hasattr(self, 'view_combo'):
+                self.view_combo.setCurrentText('Heatmap')
+            self._show_heatmap()
+            return
+        
+        # Otherwise, extract from feature_dataframe (backward compatibility)
         if self.feature_dataframe is None or self.feature_dataframe.empty:
             return
         
@@ -327,7 +370,12 @@ class CellClusteringDialog(QtWidgets.QDialog):
             return
         
         # Set up clustered_data from existing feature dataframe
-        self.clustered_data = self.feature_dataframe.copy()
+        # IMPORTANT: Only include cells that were actually clustered (cluster != 0 and not NaN)
+        # This respects the original filtering (e.g., edge cells excluded during clustering)
+        print(f"[_check_and_auto_draw_heatmap] Extracting clustered_data from feature_dataframe")
+        valid_cluster_mask = (self.feature_dataframe[cluster_col] != 0) & (self.feature_dataframe[cluster_col].notna())
+        self.clustered_data = self.feature_dataframe[valid_cluster_mask].copy()
+        print(f"[_check_and_auto_draw_heatmap] Extracted {len(self.clustered_data)} cells with valid clusters")
         
         # Ensure cluster column is named 'cluster' for consistency
         if cluster_col != 'cluster':
@@ -356,7 +404,16 @@ class CellClusteringDialog(QtWidgets.QDialog):
         self.clustered_data_unscaled = self.clustered_data.copy()
         
         # Set selected display features to morphometric and mean features
-        self.selected_display_features = display_features
+        # Prioritize last_features_used if available (from previous clustering session)
+        if hasattr(self, 'last_features_used') and self.last_features_used:
+            # Filter to only include features that exist in current dataframe
+            available_last_features = [f for f in self.last_features_used if f in self.feature_dataframe.columns]
+            if available_last_features:
+                self.selected_display_features = available_last_features
+            else:
+                self.selected_display_features = display_features
+        else:
+            self.selected_display_features = display_features
         
         # Set view to Heatmap and draw it
         if hasattr(self, 'view_combo'):
@@ -944,6 +1001,9 @@ class CellClusteringDialog(QtWidgets.QDialog):
         self.clustered_data_unscaled = None
         self.umap_embedding = None
         self.tsne_embedding = None
+        # Clear stored clustering method and dendrogram mode so new clustering uses current UI settings
+        self.actual_clustering_method = None
+        self.actual_dendrogram_mode = None
         
         # Clear plots if they exist
         if hasattr(self, 'figure') and hasattr(self, 'canvas'):
@@ -963,6 +1023,17 @@ class CellClusteringDialog(QtWidgets.QDialog):
     def _run_clustering(self):
         """Run the clustering analysis."""
         try:
+            # Preserve selected display features and view state before resetting
+            saved_view = None
+            saved_selected_features = None
+            saved_heatmap_scaling = None
+            if hasattr(self, 'view_combo'):
+                saved_view = self.view_combo.currentText()
+            if hasattr(self, 'selected_display_features') and self.selected_display_features is not None:
+                saved_selected_features = self.selected_display_features.copy() if hasattr(self.selected_display_features, 'copy') else set(self.selected_display_features)
+            if hasattr(self, 'heatmap_scaling_combo'):
+                saved_heatmap_scaling = self.heatmap_scaling_combo.currentText()
+            
             # Reset cluster merges when re-clustering (restore original assignments if they exist)
             if self.original_cluster_assignments is not None:
                 self._reset_cluster_merges()
@@ -1004,6 +1075,12 @@ class CellClusteringDialog(QtWidgets.QDialog):
             # Pre-populate filter settings if available
             if self.filter_settings is not None:
                 selector.set_filter_settings(self.filter_settings)
+            # Pre-populate selected features if available (from saved state)
+            if hasattr(self, 'last_features_used') and self.last_features_used is not None:
+                # Only set features that are actually available in the current dataset
+                available_features = [f for f in self.last_features_used if f in available_cols]
+                if available_features:
+                    selector.set_selected_features(available_features)
             if selector.exec_() != QtWidgets.QDialog.Accepted:
                 return
             selected_columns = selector.get_selected_columns()
@@ -1053,6 +1130,12 @@ class CellClusteringDialog(QtWidgets.QDialog):
             # Store original cluster assignments before any merging
             if self.clustered_data is not None and 'cluster' in self.clustered_data.columns:
                 self.original_cluster_assignments = self.clustered_data['cluster'].copy()
+            
+            # Store features used for clustering so they can be auto-selected for display
+            self.last_features_used = list(selected_columns)
+            
+            # Auto-select these features for heatmap display
+            self.selected_display_features = list(selected_columns)
             
             # Store unscaled data with same structure as clustered_data
             if self.clustered_data is not None:
@@ -1146,48 +1229,68 @@ class CellClusteringDialog(QtWidgets.QDialog):
                 source_file=source_file
             )
             
-            # Store the scaling method used for clustering and sync heatmap scaling
+            # Store the scaling method used for clustering and set heatmap scaling default
             clustering_scaling_text = self.clustering_scaling_combo.currentText()
             self.clustering_scaling_method = clustering_scaling_text
             if hasattr(self, 'heatmap_scaling_combo'):
-                # Update heatmap scaling to match clustering scaling
+                # Set heatmap scaling default to match clustering scaling (user can change it later)
                 self.heatmap_scaling_combo.blockSignals(True)
                 self.heatmap_scaling_combo.setCurrentText(clustering_scaling_text)
                 self.heatmap_scaling_combo.blockSignals(False)
             
-            # Default to heatmap view after clustering
-            try:
-                print(f"[DEBUG PLOT] About to create heatmap after clustering")
-                print(f"[DEBUG PLOT] clustered_data type: {type(self.clustered_data)}")
-                if self.clustered_data is not None:
-                    print(f"[DEBUG PLOT] clustered_data shape: {self.clustered_data.shape}")
-                    print(f"[DEBUG PLOT] clustered_data columns: {list(self.clustered_data.columns)[:10]}...")
-                    if 'cluster' in self.clustered_data.columns:
-                        print(f"[DEBUG PLOT] cluster column dtype: {self.clustered_data['cluster'].dtype}")
-                        print(f"[DEBUG PLOT] cluster column sample values: {self.clustered_data['cluster'].head().values}")
-                        print(f"[DEBUG PLOT] cluster column unique values (first 10): {self.clustered_data['cluster'].unique()[:10]}")
-                self._create_heatmap()
-                print(f"[DEBUG PLOT] Heatmap created successfully")
-            except Exception as e:
-                import traceback
-                print(f"[DEBUG PLOT] ERROR in _create_heatmap: {str(e)}")
-                print(f"[DEBUG PLOT] Error type: {type(e)}")
-                print(f"[DEBUG PLOT] Traceback:")
-                traceback.print_exc()
-                QtWidgets.QMessageBox.critical(self, "Plot Generation Error", 
-                    f"Error generating heatmap after clustering:\n{str(e)}\n\nSee console for details.")
-                # Still try to show something
-                self.figure.clear()
-                ax = self.figure.add_subplot(111)
-                ax.text(0.5, 0.5, f"Clustering completed but plot generation failed.\nError: {str(e)}", 
-                       ha='center', va='center', transform=ax.transAxes, fontsize=10)
-                self.canvas.draw()
+            # Restore preserved view and selected features after clustering
+            if saved_view and hasattr(self, 'view_combo'):
+                # Only restore if we were viewing heatmap
+                if saved_view == 'Heatmap' and saved_selected_features:
+                    self.selected_display_features = saved_selected_features
+                    # Restore heatmap scaling if it was set
+                    if saved_heatmap_scaling and hasattr(self, 'heatmap_scaling_combo'):
+                        self.heatmap_scaling_combo.blockSignals(True)
+                        self.heatmap_scaling_combo.setCurrentText(saved_heatmap_scaling)
+                        self.heatmap_scaling_combo.blockSignals(False)
+                    # Restore view to heatmap
+                    self.view_combo.blockSignals(True)
+                    self.view_combo.setCurrentText('Heatmap')
+                    self.view_combo.blockSignals(False)
+                    # Redraw heatmap with preserved features
+                    if hasattr(self, '_show_heatmap'):
+                        try:
+                            self._show_heatmap()
+                        except Exception as e:
+                            print(f"Warning: Could not redraw heatmap after clustering: {e}")
+            
+            # Store the clustering method and dendrogram mode actually used
+            self.actual_clustering_method = self.clustering_type.currentText()
+            if hasattr(self, 'dendro_mode') and self.dendro_mode.isVisible():
+                self.actual_dendrogram_mode = self.dendro_mode.currentText()
+            else:
+                self.actual_dendrogram_mode = None
+            
+            # Only create heatmap if we don't have a preserved view/features
+            # (The preservation logic above will handle redrawing if needed)
+            if not (saved_view == 'Heatmap' and saved_selected_features):
+                # Default to heatmap view after clustering
+                try:
+                    if self.clustered_data is not None:
+                        if 'cluster' in self.clustered_data.columns:
+                            pass
+                    self._create_heatmap()
+                except Exception as e:
+                    import traceback
+                    traceback.print_exc()
+                    QtWidgets.QMessageBox.critical(self, "Plot Generation Error", 
+                        f"Error generating heatmap after clustering:\n{str(e)}\n\nSee console for details.")
+                    # Still try to show something
+                    self.figure.clear()
+                    ax = self.figure.add_subplot(111)
+                    ax.text(0.5, 0.5, f"Clustering completed but plot generation failed.\nError: {str(e)}", 
+                           ha='center', va='center', transform=ax.transAxes, fontsize=10)
+                    self.canvas.draw()
             
             # Force canvas refresh
             try:
                 self.canvas.draw()
             except Exception as e:
-                print(f"[DEBUG PLOT] ERROR in canvas.draw(): {str(e)}")
                 import traceback
                 traceback.print_exc()
             
@@ -1245,19 +1348,15 @@ class CellClusteringDialog(QtWidgets.QDialog):
             if 'touches_edge' in filtered_df.columns:
                 # Count cells touching edge before filtering
                 edge_cells_count = filtered_df['touches_edge'].astype(bool).sum()
-                print(f"[FILTER DEBUG] Excluding cells touching edge: {edge_cells_count} cells will be removed")
                 # Use .eq(False) instead of ~ to avoid numpy boolean subtraction issues
                 filtered_df = filtered_df[filtered_df['touches_edge'].astype(bool).eq(False)]
                 after_edge_filter = len(filtered_df)
-                print(f"[FILTER DEBUG] Edge filter: {before_edge_filter} -> {after_edge_filter} cells ({before_edge_filter - after_edge_filter} removed)")
             elif 'touches_border' in filtered_df.columns:
                 # Count cells touching border before filtering
                 border_cells_count = filtered_df['touches_border'].astype(bool).sum()
-                print(f"[FILTER DEBUG] Excluding cells touching border: {border_cells_count} cells will be removed")
                 # Fallback to touches_border if touches_edge not available
                 filtered_df = filtered_df[filtered_df['touches_border'].astype(bool).eq(False)]
                 after_edge_filter = len(filtered_df)
-                print(f"[FILTER DEBUG] Border filter: {before_edge_filter} -> {after_edge_filter} cells ({before_edge_filter - after_edge_filter} removed)")
         
         # Filter by area
         if 'area_um2' in filtered_df.columns:
@@ -1267,17 +1366,15 @@ class CellClusteringDialog(QtWidgets.QDialog):
             
             if min_area is not None:
                 filtered_df = filtered_df[filtered_df['area_um2'] >= min_area]
-                print(f"[FILTER DEBUG] Min area filter (>= {min_area}): {before_area_filter} -> {len(filtered_df)} cells")
             if max_area is not None:
                 before_max = len(filtered_df)
                 filtered_df = filtered_df[filtered_df['area_um2'] <= max_area]
-                print(f"[FILTER DEBUG] Max area filter (<= {max_area}): {before_max} -> {len(filtered_df)} cells")
         
         final_count = len(filtered_df)
         if initial_count != final_count:
-            print(f"[FILTER DEBUG] Total filtering: {initial_count} -> {final_count} cells ({initial_count - final_count} removed, {100*(initial_count - final_count)/initial_count:.1f}%)")
+            pass
         else:
-            print(f"[FILTER DEBUG] No cells removed by filters (total: {final_count} cells)")
+            pass
         
         return filtered_df
     
@@ -1300,7 +1397,6 @@ class CellClusteringDialog(QtWidgets.QDialog):
         if not filter_settings.get('enable_percentile_censoring', False):
             return data
         
-        print(f"[CENSORING DEBUG] Starting percentile censoring on {len(data)} cells, {len(data.columns)} features")
         data_censored = data.copy()
         censor_both_ends = filter_settings.get('censor_both_ends', False)
         
@@ -1351,9 +1447,6 @@ class CellClusteringDialog(QtWidgets.QDialog):
                     if values_censored > 0:
                         censored_cols.append(col)
                         total_values_censored += values_censored
-                        print(f"[CENSORING DEBUG] {col}: 1st={p1:.4f}, 99th={p99:.4f}, "
-                              f"range=[{original_min:.4f}, {original_max:.4f}], "
-                              f"censored {values_censored} values ({values_above_p99} above p99, {values_below_p1} below p1)")
                 else:
                     # Censor at 99th percentile only (cap values at 99th percentile)
                     # This is the standard IMC approach: "censored at the 99th percentile"
@@ -1366,9 +1459,6 @@ class CellClusteringDialog(QtWidgets.QDialog):
                     if values_above_p99 > 0:
                         censored_cols.append(col)
                         total_values_censored += values_above_p99
-                        print(f"[CENSORING DEBUG] {col}: 99th percentile={p99:.4f}, "
-                              f"max={original_max:.4f}, censored {values_above_p99} values above p99 "
-                              f"({100*values_above_p99/len(finite_data):.2f}% of cells)")
                     
                     # Use np.minimum to clip from above (equivalent to clip with None lower bound)
                     data_censored[col] = np.minimum(col_data, p99).astype(np.float64)
@@ -1378,10 +1468,9 @@ class CellClusteringDialog(QtWidgets.QDialog):
                 continue
         
         if censored_cols:
-            print(f"[CENSORING DEBUG] Censoring complete: {len(censored_cols)}/{len(data.columns)} features censored, "
-                  f"{total_values_censored} values total ({100*total_values_censored/total_values:.2f}% of all values)")
+            pass
         else:
-            print(f"[CENSORING DEBUG] Censoring complete: No values needed censoring (all values within percentiles)")
+            pass
         
         return data_censored
     
@@ -1459,16 +1548,12 @@ class CellClusteringDialog(QtWidgets.QDialog):
         Returns:
             Scaled pandas DataFrame
         """
-        print(f"[DEBUG SCALING] _apply_scaling called with method: '{scaling_method}'")
-        print(f"[DEBUG SCALING] Input data shape: {data.shape}")
         if scaling_method == 'none':
-            print(f"[DEBUG SCALING] No scaling applied, returning copy")
             return data.copy()
         
         data_scaled = data.copy()
         
         if scaling_method == 'zscore':
-            print(f"[DEBUG SCALING] Applying Z-score normalization")
             # Z-score normalization: (x - mean) / std
             data_means = data_scaled.mean()
             data_stds = data_scaled.std(ddof=0)
@@ -1487,7 +1572,6 @@ class CellClusteringDialog(QtWidgets.QDialog):
                 data_scaled = (data_scaled - data_means) / data_stds
         
         elif scaling_method == 'mad':
-            print(f"[DEBUG SCALING] Applying MAD normalization")
             # MAD (Median Absolute Deviation) scaling: (x - median) / MAD
             # MAD = median(|x - median(x)|)
             data_medians = data_scaled.median()
@@ -1529,26 +1613,20 @@ class CellClusteringDialog(QtWidgets.QDialog):
         # Handle any infinities that might have been introduced
         data_scaled = data_scaled.replace([np.inf, -np.inf], np.nan)
         
-        print(f"[DEBUG SCALING] Output data shape: {data_scaled.shape}")
         if data_scaled.shape[0] > 0 and data_scaled.shape[1] > 0:
-            print(f"[DEBUG SCALING] Output data sample (first row, first 3 cols): {data_scaled.iloc[0, :3].values}")
-            print(f"[DEBUG SCALING] Output data stats - mean: {data_scaled.iloc[:, :3].mean().values}, std: {data_scaled.iloc[:, :3].std().values}")
+            pass
         
         return data_scaled
     
     def _perform_clustering(self, data, n_clusters, method):
         """Perform clustering using specified method."""
         import time
-        print(f"[CLUSTERING DEBUG] _perform_clustering called: method={method}, n_clusters={n_clusters}")
-        print(f"[CLUSTERING DEBUG] Input data shape: {data.shape}")
-        print(f"[CLUSTERING DEBUG] Input data columns: {list(data.columns)[:10]}...")  # First 10 columns
         
         t0 = time.time()
         clustering_type = self.clustering_type.currentText()
         
         # Get selected columns from data
         selected_columns = list(data.columns)
-        print(f"[CLUSTERING DEBUG] Selected columns count: {len(selected_columns)}")
         
         # Get scaling method
         scaling_text = self.clustering_scaling_combo.currentText()
@@ -1558,7 +1636,6 @@ class CellClusteringDialog(QtWidgets.QDialog):
             "MAD (Median Absolute Deviation)": "mad"
         }
         scaling_method = scaling_map.get(scaling_text, "zscore")
-        print(f"[CLUSTERING DEBUG] Scaling method: {scaling_method}")
         
         # Get seed
         seed = self.seed_spinbox.value()
@@ -1567,18 +1644,12 @@ class CellClusteringDialog(QtWidgets.QDialog):
         # The core function needs the full dataframe but will use only selected columns
         # Use the indices from the filtered/scaled data to get the corresponding rows from the original dataframe
         full_data = self.feature_dataframe.loc[data.index].copy()
-        print(f"[CLUSTERING DEBUG] Full dataframe shape: {full_data.shape}")
-        print(f"[CLUSTERING DEBUG] Time to prepare data: {time.time() - t0:.3f}s")
         
         if clustering_type == "Leiden":
             # Use core.cluster for Leiden
             resolution = self.resolution_spinbox.value() if self.resolution_radio.isChecked() else 1.0
             n_neighbors = self.n_neighbors_spinbox.value()
             metric = self.leiden_metric_combo.currentText()
-            print(f"[CLUSTERING DEBUG] Calling core.cluster with Leiden method")
-            print(f"[CLUSTERING DEBUG] Parameters: resolution={resolution}, seed={seed}, scaling={scaling_method}")
-            print(f"[CLUSTERING DEBUG] Parameters: n_neighbors={n_neighbors}, metric={metric}")
-            print(f"[CLUSTERING DEBUG] Selected columns: {len(selected_columns)} columns")
             
             use_jaccard = self.jaccard_checkbox.isChecked()
             t1 = time.time()
@@ -1594,9 +1665,6 @@ class CellClusteringDialog(QtWidgets.QDialog):
                 metric=metric,
                 use_jaccard=use_jaccard
             )
-            print(f"[CLUSTERING DEBUG] core.cluster returned in {time.time() - t1:.3f}s")
-            print(f"[CLUSTERING DEBUG] Result shape: {clustered_df.shape}")
-            print(f"[CLUSTERING DEBUG] Unique clusters: {clustered_df['cluster'].nunique()}")
             # Extract cluster labels and ensure integer type to avoid boolean subtraction issues
             cluster_labels = clustered_df['cluster'].astype(int).values
             # Get data subset with clusters
@@ -1609,10 +1677,6 @@ class CellClusteringDialog(QtWidgets.QDialog):
             # Use core.cluster for Louvain
             n_neighbors = self.n_neighbors_spinbox.value()
             metric = self.leiden_metric_combo.currentText()
-            print(f"[CLUSTERING DEBUG] Calling core.cluster with Louvain method")
-            print(f"[CLUSTERING DEBUG] Parameters: seed={seed}, scaling={scaling_method}")
-            print(f"[CLUSTERING DEBUG] Parameters: n_neighbors={n_neighbors}, metric={metric}")
-            print(f"[CLUSTERING DEBUG] Selected columns: {len(selected_columns)} columns")
             
             use_jaccard = self.jaccard_checkbox.isChecked()
             t1 = time.time()
@@ -1627,9 +1691,6 @@ class CellClusteringDialog(QtWidgets.QDialog):
                 metric=metric,
                 use_jaccard=use_jaccard
             )
-            print(f"[CLUSTERING DEBUG] core.cluster returned in {time.time() - t1:.3f}s")
-            print(f"[CLUSTERING DEBUG] Result shape: {clustered_df.shape}")
-            print(f"[CLUSTERING DEBUG] Unique clusters: {clustered_df['cluster'].nunique()}")
             # Extract cluster labels and ensure integer type to avoid boolean subtraction issues
             cluster_labels = clustered_df['cluster'].astype(int).values
             # Get data subset with clusters
@@ -1644,11 +1705,6 @@ class CellClusteringDialog(QtWidgets.QDialog):
             min_samples = self.min_samples_spinbox.value()
             cluster_selection_method = self.cluster_selection_combo.currentText()
             hdbscan_metric = self.metric_combo.currentText()
-            print(f"[CLUSTERING DEBUG] Calling core.cluster with HDBSCAN method")
-            print(f"[CLUSTERING DEBUG] Parameters: seed={seed}, scaling={scaling_method}")
-            print(f"[CLUSTERING DEBUG] Parameters: min_cluster_size={min_cluster_size}, min_samples={min_samples}")
-            print(f"[CLUSTERING DEBUG] Parameters: cluster_selection_method={cluster_selection_method}, metric={hdbscan_metric}")
-            print(f"[CLUSTERING DEBUG] Selected columns: {len(selected_columns)} columns")
             
             t1 = time.time()
             clustered_df = cluster(
@@ -1663,7 +1719,6 @@ class CellClusteringDialog(QtWidgets.QDialog):
                 cluster_selection_method=cluster_selection_method,
                 hdbscan_metric=hdbscan_metric
             )
-            print(f"[CLUSTERING DEBUG] core.cluster returned in {time.time() - t1:.3f}s")
             # Extract cluster labels and ensure integer type to avoid boolean subtraction issues
             cluster_labels = clustered_df['cluster'].astype(int).values
             # Get data subset with clusters
@@ -1674,9 +1729,6 @@ class CellClusteringDialog(QtWidgets.QDialog):
             
         elif clustering_type == "K-means":
             # Use core.cluster for K-means
-            print(f"[CLUSTERING DEBUG] Calling core.cluster with K-means method")
-            print(f"[CLUSTERING DEBUG] Parameters: n_clusters={n_clusters}, seed={seed}, scaling={scaling_method}")
-            print(f"[CLUSTERING DEBUG] Selected columns: {len(selected_columns)} columns")
             
             t1 = time.time()
             clustered_df = cluster(
@@ -1689,9 +1741,6 @@ class CellClusteringDialog(QtWidgets.QDialog):
                 seed=seed,
                 n_init=10  # Use 10 initializations (efficient default)
             )
-            print(f"[CLUSTERING DEBUG] core.cluster returned in {time.time() - t1:.3f}s")
-            print(f"[CLUSTERING DEBUG] Result shape: {clustered_df.shape}")
-            print(f"[CLUSTERING DEBUG] Unique clusters: {clustered_df['cluster'].nunique()}")
             # Extract cluster labels and ensure integer type to avoid boolean subtraction issues
             cluster_labels = clustered_df['cluster'].astype(int).values
             # Get data subset with clusters
@@ -1702,9 +1751,6 @@ class CellClusteringDialog(QtWidgets.QDialog):
         else:  # Hierarchical
             # Use core.cluster for hierarchical
             linkage_method = method if isinstance(method, str) else "ward"
-            print(f"[CLUSTERING DEBUG] Calling core.cluster with Hierarchical method")
-            print(f"[CLUSTERING DEBUG] Parameters: n_clusters={n_clusters}, linkage={linkage_method}, seed={seed}, scaling={scaling_method}")
-            print(f"[CLUSTERING DEBUG] Selected columns: {len(selected_columns)} columns")
             
             t1 = time.time()
             clustered_df = cluster(
@@ -1717,7 +1763,6 @@ class CellClusteringDialog(QtWidgets.QDialog):
                 linkage=linkage_method,
                 seed=seed
             )
-            print(f"[CLUSTERING DEBUG] core.cluster returned in {time.time() - t1:.3f}s")
             # Extract cluster labels and ensure integer type to avoid boolean subtraction issues
             cluster_labels = clustered_df['cluster'].astype(int).values
             # Get data subset with clusters
@@ -1994,7 +2039,6 @@ class CellClusteringDialog(QtWidgets.QDialog):
     def _create_heatmap(self):
         """Create the heatmap visualization."""
         try:
-            print(f"[DEBUG PLOT] _create_heatmap called")
             self.figure.clear()
             
             # Check if clustered_data exists
@@ -2006,18 +2050,15 @@ class CellClusteringDialog(QtWidgets.QDialog):
                 self.canvas.draw()
                 return
             
-            print(f"[DEBUG PLOT] clustered_data exists, shape: {self.clustered_data.shape}")
             if 'cluster' in self.clustered_data.columns:
-                print(f"[DEBUG PLOT] cluster column dtype: {self.clustered_data['cluster'].dtype}")
-                print(f"[DEBUG PLOT] cluster column type info: {type(self.clustered_data['cluster'])}")
+                pass
             
             # Get selected scaling method
             scaling_text = "None (no scaling)"  # Default
             if hasattr(self, 'heatmap_scaling_combo'):
                 scaling_text = self.heatmap_scaling_combo.currentText()
-                print(f"[DEBUG PLOT] Heatmap scaling selected from combo: {scaling_text}")
             else:
-                print(f"[DEBUG PLOT] WARNING: heatmap_scaling_combo not found, using default: {scaling_text}")
+                pass
             
             # Map UI text to method string
             scaling_map = {
@@ -2026,16 +2067,62 @@ class CellClusteringDialog(QtWidgets.QDialog):
                 "MAD (Median Absolute Deviation)": "mad"
             }
             scaling_method = scaling_map.get(scaling_text, "none")
-            print(f"[DEBUG PLOT] Scaling method mapped to: {scaling_method}")
             
             # Use unscaled data if available, otherwise use clustered_data
             base_data = self.clustered_data_unscaled if self.clustered_data_unscaled is not None else self.clustered_data
-            print(f"[DEBUG PLOT] base_data type: {type(base_data)}, shape: {base_data.shape if base_data is not None else None}")
             if base_data is not None and 'cluster' in base_data.columns:
-                print(f"[DEBUG PLOT] base_data cluster dtype: {base_data['cluster'].dtype}")
-                print(f"[DEBUG PLOT] base_data cluster sample: {base_data['cluster'].head(3).values}")
+                pass
+            
+            # IMPORTANT: Filter out cells with cluster 0 (unclustered/filtered cells)
+            # This ensures that cells excluded during clustering (e.g., touching edge) don't appear in heatmap
+            if 'cluster' in base_data.columns:
+                valid_cluster_mask = (base_data['cluster'] != 0) & (base_data['cluster'].notna())
+                if not valid_cluster_mask.any():
+                    ax = self.figure.add_subplot(111)
+                    ax.text(0.5, 0.5, "No clustered cells available (all cells have cluster=0).\nPlease run clustering first.", 
+                           ha='center', va='center', transform=ax.transAxes, fontsize=12)
+                    ax.set_title("Heatmap")
+                    self.canvas.draw()
+                    return
+                base_data = base_data[valid_cluster_mask].copy()
+                print(f"[_create_heatmap] Filtered to {len(base_data)} cells with valid clusters (cluster != 0)")
+            
+            # Additional safeguard: If filter_settings exist, reapply them to ensure excluded cells don't appear
+            # This handles cases where clustered_data might have been corrupted or incorrectly restored
+            if hasattr(self, 'filter_settings') and self.filter_settings is not None:
+                try:
+                    # Check for exclude_edge_cells filter
+                    if self.filter_settings.get('exclude_edge_cells', False):
+                        if 'touches_edge' in base_data.columns:
+                            edge_mask = base_data['touches_edge'] == 0
+                            cells_before = len(base_data)
+                            base_data = base_data[edge_mask].copy()
+                            cells_after = len(base_data)
+                            if cells_before != cells_after:
+                                print(f"[_create_heatmap] Filtered out {cells_before - cells_after} edge-touching cells (from {cells_before} to {cells_after})")
+                    
+                    # Check for area filters
+                    if 'min_area' in self.filter_settings and self.filter_settings['min_area'] is not None:
+                        if 'area' in base_data.columns:
+                            area_mask = base_data['area'] >= self.filter_settings['min_area']
+                            base_data = base_data[area_mask].copy()
+                    
+                    if 'max_area' in self.filter_settings and self.filter_settings['max_area'] is not None:
+                        if 'area' in base_data.columns:
+                            area_mask = base_data['area'] <= self.filter_settings['max_area']
+                            base_data = base_data[area_mask].copy()
+                    
+                    if base_data.empty:
+                        ax = self.figure.add_subplot(111)
+                        ax.text(0.5, 0.5, "No cells remain after applying filter settings.", 
+                               ha='center', va='center', transform=ax.transAxes, fontsize=12)
+                        ax.set_title("Heatmap")
+                        self.canvas.draw()
+                        return
+                except Exception as filter_err:
+                    print(f"[_create_heatmap] Warning: Could not apply filter settings: {filter_err}")
+                    # Continue anyway with unfiltered data
         except Exception as e:
-            print(f"[DEBUG PLOT] ERROR at start of _create_heatmap: {str(e)}")
             import traceback
             traceback.print_exc()
             raise
@@ -2080,59 +2167,47 @@ class CellClusteringDialog(QtWidgets.QDialog):
         else:
             # Clusters source: optionally filter by selected clusters (by display name or id)
             try:
-                print(f"[DEBUG PLOT] Checking heatmap filter selection")
                 if hasattr(self, 'heatmap_filter_selection') and self.heatmap_filter_selection:
-                    print(f"[DEBUG PLOT] Filter selection exists: {self.heatmap_filter_selection}")
                     # Ensure cluster column is integer before filtering
+                    # Handle NaN/inf values properly
                     if data_to_plot['cluster'].dtype == bool:
-                        print(f"[DEBUG PLOT] WARNING: data_to_plot cluster column is boolean! Converting to int")
                         data_to_plot['cluster'] = data_to_plot['cluster'].astype(int)
                     elif data_to_plot['cluster'].dtype.name.startswith('object'):
-                        print(f"[DEBUG PLOT] WARNING: data_to_plot cluster column is object! Converting to int")
                         data_to_plot['cluster'] = pd.to_numeric(data_to_plot['cluster'], errors='coerce').fillna(0).astype(int)
                     else:
-                        data_to_plot['cluster'] = data_to_plot['cluster'].astype(int)
+                        # Replace inf and NaN before converting to int
+                        data_to_plot['cluster'] = data_to_plot['cluster'].replace([np.inf, -np.inf], np.nan).fillna(0).astype(int)
                     
                     wanted_ids = set()
                     for cid in sorted(base_data['cluster'].unique()):
                         name = self._get_cluster_display_name(cid)
                         if name in self.heatmap_filter_selection or str(cid) in self.heatmap_filter_selection:
                             wanted_ids.add(int(cid))  # Ensure integer
-                    print(f"[DEBUG PLOT] wanted_ids: {wanted_ids}")
                     if wanted_ids:
                         mask = data_to_plot['cluster'].isin(sorted(wanted_ids))
-                        print(f"[DEBUG PLOT] mask type: {type(mask)}, dtype: {mask.dtype if hasattr(mask, 'dtype') else 'N/A'}")
                         data_to_plot = data_to_plot[mask]
-                        print(f"[DEBUG PLOT] Filtered data_to_plot shape: {data_to_plot.shape}")
                 # Ensure cluster is integer before sorting
                 if data_to_plot['cluster'].dtype != int and not data_to_plot['cluster'].dtype.name.startswith('int'):
-                    print(f"[DEBUG PLOT] Converting cluster to int before sorting, current dtype: {data_to_plot['cluster'].dtype}")
                     # Handle NaN/inf values before converting to int
                     data_to_plot['cluster'] = pd.to_numeric(data_to_plot['cluster'], errors='coerce')
                     # Fill NaN/inf with 0, then convert to int
                     data_to_plot['cluster'] = data_to_plot['cluster'].replace([np.inf, -np.inf], np.nan).fillna(0).astype(int)
                 data_to_plot = data_to_plot.sort_values('cluster')
-                print(f"[DEBUG PLOT] Sorted data_to_plot, shape: {data_to_plot.shape}")
             except Exception as e:
-                print(f"[DEBUG PLOT] ERROR in cluster filtering/sorting: {str(e)}")
                 import traceback
                 traceback.print_exc()
                 raise
 
         # Prepare feature columns before scaling
         feature_cols = self._select_feature_columns(data_to_plot)
-        print(f"[DEBUG PLOT] Selected {len(feature_cols)} feature columns for scaling")
         
         # Apply selected scaling to feature data
         feature_data = data_to_plot[feature_cols].copy()
-        print(f"[DEBUG PLOT] Applying scaling method '{scaling_method}' to feature data")
-        print(f"[DEBUG PLOT] Feature data shape before scaling: {feature_data.shape}")
         if feature_data.shape[0] > 0 and feature_data.shape[1] > 0:
-            print(f"[DEBUG PLOT] Feature data sample (first row, first 3 cols) before scaling: {feature_data.iloc[0, :3].values}")
+            pass
         feature_data_scaled = self._apply_scaling(feature_data, scaling_method)
-        print(f"[DEBUG PLOT] Feature data shape after scaling: {feature_data_scaled.shape}")
         if feature_data_scaled.shape[0] > 0 and feature_data_scaled.shape[1] > 0:
-            print(f"[DEBUG PLOT] Feature data sample (first row, first 3 cols) after scaling: {feature_data_scaled.iloc[0, :3].values}")
+            pass
         feature_data_scaled = feature_data_scaled.fillna(0)  # Handle any NaN from scaling
         
         # Create data_to_plot with scaled features
@@ -2155,23 +2230,17 @@ class CellClusteringDialog(QtWidgets.QDialog):
         heatmap_data = data_to_plot_scaled[feature_cols].values
         
         # Ensure heatmap_data is numeric (convert boolean/object to float)
-        print(f"[DEBUG PLOT] heatmap_data dtype before conversion: {heatmap_data.dtype}")
-        print(f"[DEBUG PLOT] heatmap_data shape: {heatmap_data.shape}")
         if heatmap_data.dtype == bool:
-            print(f"[DEBUG PLOT] WARNING: heatmap_data is boolean! Converting to float")
             heatmap_data = heatmap_data.astype(float)
         elif heatmap_data.dtype.name.startswith('object'):
-            print(f"[DEBUG PLOT] WARNING: heatmap_data is object type! Converting to float")
             # Try to convert to numeric, fill NaN with 0
             heatmap_data = pd.DataFrame(heatmap_data).apply(pd.to_numeric, errors='coerce').fillna(0).values.astype(float)
         elif not np.issubdtype(heatmap_data.dtype, np.number):
-            print(f"[DEBUG PLOT] WARNING: heatmap_data is not numeric (dtype: {heatmap_data.dtype})! Converting to float")
             heatmap_data = heatmap_data.astype(float)
-        print(f"[DEBUG PLOT] heatmap_data dtype after conversion: {heatmap_data.dtype}")
-        print(f"[DEBUG PLOT] heatmap_data min/max: {np.nanmin(heatmap_data)}, {np.nanmax(heatmap_data)}")
         
         # Determine if dendrograms should be applied (but don't show them)
-        clustering_type = self.clustering_type.currentText() if hasattr(self, 'clustering_type') else 'Hierarchical'
+        # Use the actual clustering method that was used when clustering was run, not the current UI selection
+        clustering_type = self.actual_clustering_method if hasattr(self, 'actual_clustering_method') and self.actual_clustering_method is not None else (self.clustering_type.currentText() if hasattr(self, 'clustering_type') else 'Hierarchical')
         is_leiden = clustering_type == "Leiden"
         is_louvain = clustering_type == "Louvain"
         is_hdbscan = clustering_type == "HDBSCAN"
@@ -2183,7 +2252,8 @@ class CellClusteringDialog(QtWidgets.QDialog):
             linkage_method = None
         else:
             row_cluster = True
-            dendro_mode = self.dendro_mode.currentText() if hasattr(self, 'dendro_mode') else "Rows and columns"
+            # Use the actual dendrogram mode that was used when clustering was run, not the current UI selection
+            dendro_mode = self.actual_dendrogram_mode if hasattr(self, 'actual_dendrogram_mode') and self.actual_dendrogram_mode is not None else (self.dendro_mode.currentText() if hasattr(self, 'dendro_mode') else "Rows and columns")
             col_cluster = (dendro_mode == "Rows and columns")
             linkage_method = self.hierarchical_method.currentText() if hasattr(self, 'hierarchical_method') else "ward"
         
@@ -2383,25 +2453,18 @@ class CellClusteringDialog(QtWidgets.QDialog):
         
         # Create heatmap with reordered data
         # Ensure heatmap_data_reordered is numeric before percentile calculation
-        print(f"[DEBUG PLOT] heatmap_data_reordered dtype before percentile: {heatmap_data_reordered.dtype}")
         if heatmap_data_reordered.dtype == bool:
-            print(f"[DEBUG PLOT] WARNING: heatmap_data_reordered is boolean! Converting to float")
             heatmap_data_reordered = heatmap_data_reordered.astype(float)
         elif not np.issubdtype(heatmap_data_reordered.dtype, np.number):
-            print(f"[DEBUG PLOT] WARNING: heatmap_data_reordered is not numeric (dtype: {heatmap_data_reordered.dtype})! Converting to float")
             heatmap_data_reordered = heatmap_data_reordered.astype(float)
         
         # Remove any NaN or Inf values before percentile calculation
         heatmap_data_reordered_clean = np.nan_to_num(heatmap_data_reordered, nan=0.0, posinf=0.0, neginf=0.0)
-        print(f"[DEBUG PLOT] Calculating percentiles on clean data, shape: {heatmap_data_reordered_clean.shape}, dtype: {heatmap_data_reordered_clean.dtype}")
         
         try:
             vmin_val = np.percentile(heatmap_data_reordered_clean, 2)
             vmax_val = np.percentile(heatmap_data_reordered_clean, 98)
-            print(f"[DEBUG PLOT] Percentiles calculated: vmin={vmin_val}, vmax={vmax_val}")
         except Exception as e:
-            print(f"[DEBUG PLOT] ERROR calculating percentiles: {str(e)}")
-            print(f"[DEBUG PLOT] Data stats: min={np.nanmin(heatmap_data_reordered_clean)}, max={np.nanmax(heatmap_data_reordered_clean)}")
             # Fallback to min/max if percentile fails
             vmin_val = np.nanmin(heatmap_data_reordered_clean)
             vmax_val = np.nanmax(heatmap_data_reordered_clean)
@@ -2570,7 +2633,6 @@ class CellClusteringDialog(QtWidgets.QDialog):
     def _create_cluster_map(self):
         """Create the cluster map visualization (one equal-sized box per cluster)."""
         try:
-            print(f"[DEBUG PLOT] _create_cluster_map called")
             self.figure.clear()
             
             # Check if clustered_data exists
@@ -2582,15 +2644,13 @@ class CellClusteringDialog(QtWidgets.QDialog):
                 self.canvas.draw()
                 return
             
-            print(f"[DEBUG PLOT] clustered_data exists, shape: {self.clustered_data.shape}")
             
             # Get selected scaling method
             scaling_text = "None (no scaling)"  # Default
             if hasattr(self, 'heatmap_scaling_combo'):
                 scaling_text = self.heatmap_scaling_combo.currentText()
-                print(f"[DEBUG PLOT] Cluster map scaling selected from combo: {scaling_text}")
             else:
-                print(f"[DEBUG PLOT] WARNING: heatmap_scaling_combo not found, using default: {scaling_text}")
+                pass
             
             # Map UI text to method string
             scaling_map = {
@@ -2599,11 +2659,9 @@ class CellClusteringDialog(QtWidgets.QDialog):
                 "MAD (Median Absolute Deviation)": "mad"
             }
             scaling_method = scaling_map.get(scaling_text, "none")
-            print(f"[DEBUG PLOT] Scaling method mapped to: {scaling_method}")
             
             # Use unscaled data if available, otherwise use clustered_data
             base_data = self.clustered_data_unscaled if self.clustered_data_unscaled is not None else self.clustered_data
-            print(f"[DEBUG PLOT] base_data type: {type(base_data)}, shape: {base_data.shape if base_data is not None else None}")
             
             # Prepare data - filter clusters if needed
             data_to_plot = base_data.copy()
@@ -2611,26 +2669,21 @@ class CellClusteringDialog(QtWidgets.QDialog):
             # Ensure cluster column is integer
             if 'cluster' in data_to_plot.columns:
                 if data_to_plot['cluster'].dtype != int and not data_to_plot['cluster'].dtype.name.startswith('int'):
-                    print(f"[DEBUG PLOT] Converting cluster to int, current dtype: {data_to_plot['cluster'].dtype}")
-                    data_to_plot['cluster'] = pd.to_numeric(data_to_plot['cluster'], errors='coerce').fillna(0).astype(int)
-                    data_to_plot['cluster'] = data_to_plot['cluster'].astype(int)
+                    # Handle NaN/inf properly before converting
+                    data_to_plot['cluster'] = pd.to_numeric(data_to_plot['cluster'], errors='coerce').replace([np.inf, -np.inf], np.nan).fillna(0).astype(int)
             
             # Apply filter if set
             if hasattr(self, 'heatmap_filter_selection') and self.heatmap_filter_selection:
-                print(f"[DEBUG PLOT] Applying cluster filter")
                 wanted_ids = set()
                 for cid in sorted(base_data['cluster'].unique()):
                     name = self._get_cluster_display_name(cid)
                     if name in self.heatmap_filter_selection or str(cid) in self.heatmap_filter_selection:
                         wanted_ids.add(int(cid))
-                print(f"[DEBUG PLOT] wanted_ids: {wanted_ids}")
                 if wanted_ids:
                     data_to_plot = data_to_plot[data_to_plot['cluster'].isin(sorted(wanted_ids))]
-                    print(f"[DEBUG PLOT] Filtered data_to_plot shape: {data_to_plot.shape}")
             
             # Select feature columns
             feature_cols = self._select_feature_columns(data_to_plot)
-            print(f"[DEBUG PLOT] Selected {len(feature_cols)} feature columns")
             
             # Aggregate data per cluster using selected method
             zscore_method = getattr(self, 'cluster_map_zscore_method', 'Mean')
@@ -2644,12 +2697,10 @@ class CellClusteringDialog(QtWidgets.QDialog):
                 cluster_aggregated = data_to_plot.groupby('cluster')[feature_cols].min()
             else:
                 cluster_aggregated = data_to_plot.groupby('cluster')[feature_cols].mean()  # Default to mean
-            print(f"[DEBUG PLOT] Cluster aggregated ({zscore_method}) shape: {cluster_aggregated.shape}")
             
             # Apply scaling to aggregated data
             feature_data_scaled = self._apply_scaling(cluster_aggregated, scaling_method)
             feature_data_scaled = feature_data_scaled.fillna(0)  # Handle any NaN from scaling
-            print(f"[DEBUG PLOT] Scaled cluster means shape: {feature_data_scaled.shape}")
             
             # Ensure feature_cols matches the scaled data columns
             scaled_feature_cols = list(feature_data_scaled.columns)
@@ -2659,7 +2710,6 @@ class CellClusteringDialog(QtWidgets.QDialog):
             return
             
         except Exception as e:
-            print(f"[DEBUG PLOT] ERROR in _create_cluster_map: {str(e)}")
             import traceback
             traceback.print_exc()
             raise
@@ -2672,8 +2722,24 @@ class CellClusteringDialog(QtWidgets.QDialog):
         orientation = getattr(self, 'cluster_map_orientation', 'portrait')
         is_landscape = (orientation == 'landscape')
         
-        # Get dendrogram setting
-        dendrogram_setting = getattr(self, 'cluster_map_dendrogram', 'Columns only')
+        # Get dendrogram setting - use the actual dendrogram mode that was used when clustering was run
+        # Only apply dendrograms if hierarchical clustering was actually used
+        clustering_type = self.actual_clustering_method if hasattr(self, 'actual_clustering_method') and self.actual_clustering_method is not None else (self.clustering_type.currentText() if hasattr(self, 'clustering_type') else 'Hierarchical')
+        is_hierarchical = clustering_type == "Hierarchical"
+        
+        if is_hierarchical and hasattr(self, 'actual_dendrogram_mode') and self.actual_dendrogram_mode is not None:
+            # Map the stored dendrogram mode to cluster_map_dendrogram format
+            dendro_mode = self.actual_dendrogram_mode
+            if dendro_mode == "Rows and columns":
+                dendrogram_setting = 'Both rows and columns'
+            elif dendro_mode == "Rows only":
+                dendrogram_setting = 'Rows only'
+            else:
+                dendrogram_setting = 'Columns only'
+        else:
+            # For non-hierarchical methods or if no dendrogram mode was stored, don't show dendrograms
+            dendrogram_setting = 'No dendrogram'
+        
         show_row_dendro = dendrogram_setting in ['Both rows and columns', 'Rows only']
         show_col_dendro = dendrogram_setting in ['Both rows and columns', 'Columns only']
         
@@ -3092,7 +3158,8 @@ class CellClusteringDialog(QtWidgets.QDialog):
             cluster_colors_series = data_to_plot[group_col].map(cluster_color_map)
             
             # Determine clustering settings based on method
-            clustering_type = self.clustering_type.currentText()
+            # Use the actual clustering method that was used when clustering was run, not the current UI selection
+            clustering_type = self.actual_clustering_method if hasattr(self, 'actual_clustering_method') and self.actual_clustering_method is not None else (self.clustering_type.currentText() if hasattr(self, 'clustering_type') else 'Hierarchical')
             is_leiden = clustering_type == "Leiden"
             is_louvain = clustering_type == "Louvain"
             is_hdbscan = clustering_type == "HDBSCAN"
@@ -3105,7 +3172,9 @@ class CellClusteringDialog(QtWidgets.QDialog):
             else:
                 # For hierarchical clustering, use dendrograms
                 row_cluster = True
-                col_cluster = (self.dendro_mode.currentText() == "Rows and columns")
+                # Use the actual dendrogram mode that was used when clustering was run, not the current UI selection
+                dendro_mode = self.actual_dendrogram_mode if hasattr(self, 'actual_dendrogram_mode') and self.actual_dendrogram_mode is not None else (self.dendro_mode.currentText() if hasattr(self, 'dendro_mode') else "Rows and columns")
+                col_cluster = (dendro_mode == "Rows and columns")
                 linkage_method = self.hierarchical_method.currentText()
             
             # Get canvas size to determine appropriate figure size
@@ -3210,26 +3279,17 @@ class CellClusteringDialog(QtWidgets.QDialog):
         
         # Filter out dropped clusters (cluster 0)
         try:
-            print(f"[DEBUG PLOT] About to filter base_data by cluster != 0")
-            print(f"[DEBUG PLOT] base_data cluster dtype before filter: {base_data['cluster'].dtype}")
-            print(f"[DEBUG PLOT] base_data cluster type: {type(base_data['cluster'])}")
             # Ensure cluster column is integer before comparison
             if base_data['cluster'].dtype == bool:
-                print(f"[DEBUG PLOT] WARNING: cluster column is boolean! Converting to int")
                 base_data['cluster'] = base_data['cluster'].astype(int)
             elif base_data['cluster'].dtype.name.startswith('object'):
-                print(f"[DEBUG PLOT] WARNING: cluster column is object type! Converting to int")
                 base_data['cluster'] = pd.to_numeric(base_data['cluster'], errors='coerce').fillna(0).astype(int)
             else:
                 base_data['cluster'] = base_data['cluster'].astype(int)
-            print(f"[DEBUG PLOT] base_data cluster dtype after conversion: {base_data['cluster'].dtype}")
-            # Now do the comparison
+            # Now do the comparison - filter out cluster 0 (excluded/filtered cells)
             mask = base_data['cluster'] != 0
-            print(f"[DEBUG PLOT] mask type: {type(mask)}, dtype: {mask.dtype if hasattr(mask, 'dtype') else 'N/A'}")
             base_data = base_data[mask].copy()
-            print(f"[DEBUG PLOT] Filtered base_data shape: {base_data.shape}")
         except Exception as e:
-            print(f"[DEBUG PLOT] ERROR filtering base_data by cluster: {str(e)}")
             import traceback
             traceback.print_exc()
             raise
@@ -4168,13 +4228,6 @@ class CellClusteringDialog(QtWidgets.QDialog):
     def _show_heatmap(self):
         """Switch back to heatmap view."""
         if self.clustered_data is not None:
-            # Sync heatmap scaling to clustering scaling if available
-            if (hasattr(self, 'clustering_scaling_method') and 
-                self.clustering_scaling_method is not None and 
-                hasattr(self, 'heatmap_scaling_combo')):
-                # Only update if the combo doesn't already match (to avoid unnecessary updates)
-                if self.heatmap_scaling_combo.currentText() != self.clustering_scaling_method:
-                    self.heatmap_scaling_combo.setCurrentText(self.clustering_scaling_method)
             self._create_heatmap()
         else:
             QtWidgets.QMessageBox.warning(self, "No Clustering", "Please run clustering first to view the heatmap.")
@@ -4182,13 +4235,6 @@ class CellClusteringDialog(QtWidgets.QDialog):
     def _show_cluster_map(self):
         """Switch to cluster map view."""
         if self.clustered_data is not None:
-            # Sync heatmap scaling to clustering scaling if available
-            if (hasattr(self, 'clustering_scaling_method') and 
-                self.clustering_scaling_method is not None and 
-                hasattr(self, 'heatmap_scaling_combo')):
-                # Only update if the combo doesn't already match (to avoid unnecessary updates)
-                if self.heatmap_scaling_combo.currentText() != self.clustering_scaling_method:
-                    self.heatmap_scaling_combo.setCurrentText(self.clustering_scaling_method)
             self._create_cluster_map()
         else:
             QtWidgets.QMessageBox.warning(self, "No Clustering", "Please run clustering first to view the cluster map.")
@@ -4577,24 +4623,33 @@ class CellClusteringDialog(QtWidgets.QDialog):
     
     def _plot_umap_single(self, ax, color_by, point_size, point_alpha, title=None, show_legend=True):
         """Plot a single UMAP subplot with specified coloring."""
-        # DEBUG: Print at the start of the function
-        print(f"[UMAP DEBUG] _plot_umap_single called with color_by='{color_by}'")
-        print(f"[UMAP DEBUG] color_by type: {type(color_by)}")
-        print(f"[UMAP DEBUG] hasattr(self, 'umap_raw_data'): {hasattr(self, 'umap_raw_data')}")
-        print(f"[UMAP DEBUG] hasattr(self, 'umap_selected_columns'): {hasattr(self, 'umap_selected_columns')}")
         if hasattr(self, 'umap_selected_columns'):
-            print(f"[UMAP DEBUG] umap_selected_columns: {self.umap_selected_columns}")
-            print(f"[UMAP DEBUG] color_by in umap_selected_columns: {color_by in self.umap_selected_columns if self.umap_selected_columns else False}")
+            pass
         if hasattr(self, 'umap_raw_data'):
-            print(f"[UMAP DEBUG] umap_raw_data columns: {list(self.umap_raw_data.columns[:10])}... (showing first 10)")
-            print(f"[UMAP DEBUG] color_by in umap_raw_data.columns: {color_by in self.umap_raw_data.columns}")
+            pass
         
-        # Compute filtered embedding once at the start (used for spread control)
+        # Ensure UMAP embedding size matches the data we're trying to plot
+        # This is critical when cells have been filtered (e.g., edge cells excluded)
         if hasattr(self, 'umap_index') and self.umap_index is not None:
+            # UMAP was created from specific indices - use those
             cluster_labels_series = self.clustered_data['cluster']
-            cluster_labels = cluster_labels_series.reindex(self.umap_index).values
+            # Only reindex with indices that exist in both umap_index and clustered_data
+            valid_indices = [idx for idx in self.umap_index if idx in cluster_labels_series.index]
+            cluster_labels = cluster_labels_series.loc[valid_indices].values
+            
+            # Verify that umap_embedding length matches the cluster_labels we extracted
+            if len(cluster_labels) != len(self.umap_embedding):
+                # Mismatch - use direct clustered_data values instead
+                cluster_labels = self.clustered_data['cluster'].values
         else:
             cluster_labels = self.clustered_data['cluster'].values
+        
+        # Final safety check: ensure mask size matches embedding size
+        if len(cluster_labels) != len(self.umap_embedding):
+            # If still mismatched, truncate or pad to match
+            min_len = min(len(cluster_labels), len(self.umap_embedding))
+            cluster_labels = cluster_labels[:min_len]
+            self.umap_embedding = self.umap_embedding[:min_len]
         
         # Filter out cluster 0 (noise/unassigned)
         valid_mask = cluster_labels != 0
@@ -4618,11 +4673,8 @@ class CellClusteringDialog(QtWidgets.QDialog):
         
         umap_embedding_filtered = self.umap_embedding[valid_mask]
         
-        print(f"[UMAP DEBUG] Checking conditions...")
-        print(f"[UMAP DEBUG] color_by == 'Cluster': {color_by == 'Cluster'}")
-        print(f"[UMAP DEBUG] self.clustered_data is not None: {self.clustered_data is not None}")
         if self.clustered_data is not None:
-            print(f"[UMAP DEBUG] 'cluster' in self.clustered_data.columns: {'cluster' in self.clustered_data.columns}")
+            pass
         
         if color_by == 'Cluster' and self.clustered_data is not None and 'cluster' in self.clustered_data.columns:
             # Use pre-computed filtered data
@@ -5026,70 +5078,32 @@ class CellClusteringDialog(QtWidgets.QDialog):
                 ax.legend(handles, labels, loc='best', frameon=True, fontsize=8, title='Manual Phenotype')
         elif hasattr(self, 'umap_raw_data') and color_by in getattr(self, 'umap_selected_columns', []):
             # Check all conditions before processing
-            print(f"[UMAP DEBUG] Reached intensity feature check...")
-            print(f"[UMAP DEBUG] hasattr(self, 'umap_raw_data'): {hasattr(self, 'umap_raw_data')}")
-            print(f"[UMAP DEBUG] getattr(self, 'umap_selected_columns', []): {getattr(self, 'umap_selected_columns', [])}")
-            print(f"[UMAP DEBUG] color_by in getattr(self, 'umap_selected_columns', []): {color_by in getattr(self, 'umap_selected_columns', [])}")
-            print(f"[UMAP DEBUG] Combined condition: {hasattr(self, 'umap_raw_data') and color_by in getattr(self, 'umap_selected_columns', [])}")
-            # DEBUG: Print diagnostic information
-            print(f"[DEBUG] Coloring by intensity feature: {color_by}")
-            print(f"[DEBUG] umap_raw_data exists: {hasattr(self, 'umap_raw_data')}")
-            print(f"[DEBUG] umap_selected_columns: {getattr(self, 'umap_selected_columns', None)}")
-            print(f"[DEBUG] color_by in umap_selected_columns: {color_by in getattr(self, 'umap_selected_columns', [])}")
-            print(f"[DEBUG] umap_index exists: {hasattr(self, 'umap_index')}")
             if hasattr(self, 'umap_index'):
-                print(f"[DEBUG] umap_index length: {len(self.umap_index) if self.umap_index else 0}")
-            print(f"[DEBUG] umap_raw_data shape: {self.umap_raw_data.shape if hasattr(self, 'umap_raw_data') else 'N/A'}")
-            print(f"[DEBUG] umap_raw_data columns: {list(self.umap_raw_data.columns) if hasattr(self, 'umap_raw_data') else 'N/A'}")
-            print(f"[DEBUG] color_by in umap_raw_data.columns: {color_by in self.umap_raw_data.columns if hasattr(self, 'umap_raw_data') else False}")
-            print(f"[DEBUG] valid_mask shape: {valid_mask.shape}")
-            print(f"[DEBUG] valid_mask sum (valid points): {valid_mask.sum()}")
+                pass
             
             # Use pre-computed filtered data
             # Align umap_raw_data with umap_index order
             if hasattr(self, 'umap_index') and self.umap_index is not None:
                 # Align umap_raw_data with umap_index order
-                print(f"[DEBUG] Using umap_index alignment")
-                print(f"[DEBUG] umap_index type: {type(self.umap_index)}")
-                print(f"[DEBUG] umap_index first few: {self.umap_index[:5] if len(self.umap_index) > 5 else self.umap_index}")
-                print(f"[DEBUG] umap_raw_data index type: {type(self.umap_raw_data.index)}")
-                print(f"[DEBUG] umap_raw_data index first few: {list(self.umap_raw_data.index[:5]) if len(self.umap_raw_data) > 5 else list(self.umap_raw_data.index)}")
                 
                 try:
                     feature_series = self.umap_raw_data.loc[self.umap_index, color_by]
                     vals = feature_series.values
-                    print(f"[DEBUG] Successfully extracted feature_series, length: {len(feature_series)}")
-                    print(f"[DEBUG] vals shape: {vals.shape}")
-                    print(f"[DEBUG] vals dtype: {vals.dtype}")
-                    print(f"[DEBUG] vals min/max: {np.nanmin(vals)}/{np.nanmax(vals)}")
-                    print(f"[DEBUG] vals NaN count: {np.isnan(vals).sum()}")
                 except Exception as e:
-                    print(f"[DEBUG] ERROR extracting feature_series: {e}")
-                    print(f"[DEBUG] Attempting direct column access...")
                     vals = self.umap_raw_data[color_by].values
-                    print(f"[DEBUG] Direct access successful, vals length: {len(vals)}")
             else:
-                print(f"[DEBUG] No umap_index, using direct column access")
                 vals = self.umap_raw_data[color_by].values
-                print(f"[DEBUG] vals shape: {vals.shape}")
-                print(f"[DEBUG] vals dtype: {vals.dtype}")
             
             # Continuous coloring by selected feature (aligned to UMAP order)
             vals_filtered = vals[valid_mask]
-            print(f"[DEBUG] vals_filtered shape: {vals_filtered.shape}")
-            print(f"[DEBUG] vals_filtered min/max: {np.nanmin(vals_filtered)}/{np.nanmax(vals_filtered)}")
-            print(f"[DEBUG] vals_filtered NaN count: {np.isnan(vals_filtered).sum()}")
-            print(f"[DEBUG] vals_filtered non-NaN count: {(~np.isnan(vals_filtered)).sum()}")
             
             # Check for valid values
             if len(vals_filtered) == 0:
-                print(f"[DEBUG] ERROR: vals_filtered is empty!")
                 ax.scatter(umap_embedding_filtered[:, 0], umap_embedding_filtered[:, 1], c='blue', 
                           alpha=point_alpha, s=point_size, edgecolors='none')
                 ax.text(0.5, 0.5, 'No valid values for coloring', transform=ax.transAxes, 
                        ha='center', va='center')
             elif np.all(np.isnan(vals_filtered)):
-                print(f"[DEBUG] ERROR: All values are NaN!")
                 ax.scatter(umap_embedding_filtered[:, 0], umap_embedding_filtered[:, 1], c='blue', 
                           alpha=point_alpha, s=point_size, edgecolors='none')
                 ax.text(0.5, 0.5, 'All values are NaN', transform=ax.transAxes, 
@@ -5097,13 +5111,7 @@ class CellClusteringDialog(QtWidgets.QDialog):
             else:
                 # Remove NaN values for plotting
                 valid_vals_mask = ~np.isnan(vals_filtered)
-                print(f"[DEBUG] valid_vals_mask sum: {valid_vals_mask.sum()}")
                 if np.any(valid_vals_mask):
-                    print(f"[DEBUG] Creating scatter plot with {valid_vals_mask.sum()} valid points")
-                    print(f"[DEBUG] umap_embedding_filtered shape: {umap_embedding_filtered.shape}")
-                    print(f"[DEBUG] umap_embedding_filtered[valid_vals_mask] shape: {umap_embedding_filtered[valid_vals_mask].shape}")
-                    print(f"[DEBUG] vals_filtered[valid_vals_mask] shape: {vals_filtered[valid_vals_mask].shape}")
-                    print(f"[DEBUG] vals_filtered[valid_vals_mask] range: [{np.min(vals_filtered[valid_vals_mask])}, {np.max(vals_filtered[valid_vals_mask])}]")
                     
                     try:
                         sc = ax.scatter(umap_embedding_filtered[valid_vals_mask, 0], 
@@ -5112,9 +5120,7 @@ class CellClusteringDialog(QtWidgets.QDialog):
                                       cmap='viridis', alpha=point_alpha, s=point_size, edgecolors='none')
                         cbar = self.figure.colorbar(sc, ax=ax)
                         cbar.set_label(color_by)
-                        print(f"[DEBUG] Scatter plot created successfully")
                     except Exception as e:
-                        print(f"[DEBUG] ERROR creating scatter plot: {e}")
                         import traceback
                         traceback.print_exc()
                         ax.scatter(umap_embedding_filtered[:, 0], umap_embedding_filtered[:, 1], c='blue', 
@@ -5122,7 +5128,6 @@ class CellClusteringDialog(QtWidgets.QDialog):
                         ax.text(0.5, 0.5, f'Error: {str(e)}', transform=ax.transAxes, 
                                ha='center', va='center', fontsize=8)
                 else:
-                    print(f"[DEBUG] ERROR: No valid (non-NaN) values after filtering!")
                     ax.scatter(umap_embedding_filtered[:, 0], umap_embedding_filtered[:, 1], c='blue', 
                               alpha=point_alpha, s=point_size, edgecolors='none')
                     ax.text(0.5, 0.5, 'No valid values for coloring', transform=ax.transAxes, 
@@ -5167,9 +5172,6 @@ class CellClusteringDialog(QtWidgets.QDialog):
         else:
             # Use pre-computed filtered data
             # Fallback single color
-            print(f"[UMAP DEBUG] Falling through to else branch (fallback)")
-            print(f"[UMAP DEBUG] color_by value: '{color_by}'")
-            print(f"[UMAP DEBUG] All conditions checked, none matched. Using fallback blue scatter.")
             ax.scatter(umap_embedding_filtered[:, 0], umap_embedding_filtered[:, 1], c='blue', alpha=point_alpha, s=point_size, edgecolors='none')
         
         ax.set_xlabel('UMAP 1')
@@ -5263,20 +5265,25 @@ class CellClusteringDialog(QtWidgets.QDialog):
         for col in metadata_cols:
             if col not in options:
                 options.append(col)
-        # Add feature columns from UMAP or t-SNE (use display names for UI, but store actual column names)
-        for col in getattr(self, 'umap_selected_columns', []) or []:
+        
+        # Prioritize features used for clustering (from last_features_used)
+        # These are the most relevant features to display
+        features_to_show = []
+        if hasattr(self, 'last_features_used') and self.last_features_used:
+            features_to_show = list(self.last_features_used)
+        elif hasattr(self, 'umap_selected_columns') and self.umap_selected_columns:
+            features_to_show = list(self.umap_selected_columns)
+        elif hasattr(self, 'tsne_selected_columns') and self.tsne_selected_columns:
+            features_to_show = list(self.tsne_selected_columns)
+        
+        # Add feature columns (prioritize clustering features)
+        for col in features_to_show:
             # Check if column is already in options (either as string or as tuple)
             already_in = col in options or any(isinstance(opt, tuple) and opt[1] == col for opt in options)
             if not already_in:
                 # Use display name for UI, but we'll store the actual column name
                 display_name = self._get_feature_display_name(col)
                 options.append((display_name, col))  # Store as (display, actual) tuple
-        for col in getattr(self, 'tsne_selected_columns', []) or []:
-            # Check if column is already in options (either as string or as tuple)
-            already_in = col in options or any(isinstance(opt, tuple) and opt[1] == col for opt in options)
-            if not already_in:
-                display_name = self._get_feature_display_name(col)
-                options.append((display_name, col))
         # Add phenotype if available
         if hasattr(self, 'clustered_data') and self.clustered_data is not None and 'cluster_phenotype' in self.clustered_data.columns:
             if 'Phenotype' not in options:
@@ -6887,6 +6894,9 @@ class CellClusteringDialog(QtWidgets.QDialog):
                         editors[cid].setText(name)
                 # Store backend names for CSV export
                 self.cluster_backend_names.update(backend_name_map)
+            # Ensure llm_phenotype_cache is initialized
+            if not hasattr(self, 'llm_phenotype_cache') or self.llm_phenotype_cache is None:
+                self.llm_phenotype_cache = {}
             d = PhenotypeSuggestionDialog(self, unique_clusters, apply_names, self.llm_phenotype_cache, self.normalization_config)
             d.exec_()
         llm_btn.clicked.connect(open_llm_dialog)
@@ -9253,7 +9263,21 @@ class PhenotypeSuggestionDialog(QtWidgets.QDialog):
         self._parent_dialog = parent_dialog
         self._cluster_ids = list(cluster_ids)
         self._apply_callback = apply_callback
-        self._cache_dict = cache_dict or {}
+        # Ensure cache_dict is properly initialized and is a reference to parent's cache
+        if cache_dict is None:
+            if parent_dialog and hasattr(parent_dialog, 'llm_phenotype_cache'):
+                self._cache_dict = parent_dialog.llm_phenotype_cache
+            else:
+                self._cache_dict = {}
+        else:
+            self._cache_dict = cache_dict
+        # Ensure it's a dict
+        if not isinstance(self._cache_dict, dict):
+            if parent_dialog and hasattr(parent_dialog, 'llm_phenotype_cache'):
+                parent_dialog.llm_phenotype_cache = {}
+                self._cache_dict = parent_dialog.llm_phenotype_cache
+            else:
+                self._cache_dict = {}
         self.normalization_config = normalization_config
         self._create_ui()
         # Resize dialog to 75% of the parent window size for better usability
@@ -9368,6 +9392,12 @@ class PhenotypeSuggestionDialog(QtWidgets.QDialog):
 
         layout.addLayout(form)
 
+        # Create export button before adding to layout
+        self.export_btn = QtWidgets.QPushButton("Export LLM Results")
+        self.export_btn.setEnabled(False)
+        self.export_btn.clicked.connect(self._export_llm_results)
+        self.export_btn.hide()  # Hidden until results are available
+
         btns = QtWidgets.QHBoxLayout()
         self.run_btn = QtWidgets.QPushButton("Run Suggestion")
         self.run_btn.clicked.connect(self._run)
@@ -9408,24 +9438,14 @@ class PhenotypeSuggestionDialog(QtWidgets.QDialog):
         
         # Check for cached results and display them immediately
         self._check_and_display_cached_results()
-        
-        # Export button (initially hidden, shown after LLM runs)
-        self.export_btn = QtWidgets.QPushButton("Export LLM Results")
-        self.export_btn.setEnabled(False)
-        self.export_btn.clicked.connect(self._export_llm_results)
-        self.export_btn.hide()  # Hidden until results are available
 
     def closeEvent(self, event):
         """Handle dialog closing to preserve cache and apply suggestions."""
         # Ensure the current suggestions are cached for future use
-        # Use integer keys consistently for cache storage
-        if self._cache_dict is not None and self._suggestions:
-            # Convert any string keys to integers for consistency
-            cache_update = {}
-            for cid, result in self._suggestions.items():
-                cid_int = int(cid) if isinstance(cid, str) else cid
-                cache_update[cid_int] = result
-            self._cache_dict.update(cache_update)
+        # This is a backup in case results weren't cached during _run
+        if self._suggestions:
+            # Save all suggestions to cache
+            self._save_results_to_cache(self._suggestions)
         
         # Automatically apply suggestions when closing if they exist
         # This ensures annotations persist even if user doesn't click "Apply Names"
@@ -9478,9 +9498,46 @@ class PhenotypeSuggestionDialog(QtWidgets.QDialog):
         self.run_btn.setEnabled(True)
         self.run_btn.setText("Run Suggestion")
 
+    def _save_results_to_cache(self, results_dict):
+        """Save results to cache immediately. Ensures cache persists even without clicking Apply."""
+        if self._cache_dict is None:
+            # If cache_dict is None, try to get it from parent dialog
+            if self._parent_dialog and hasattr(self._parent_dialog, 'llm_phenotype_cache'):
+                self._cache_dict = self._parent_dialog.llm_phenotype_cache
+            else:
+                return
+        
+        # Ensure _cache_dict is a proper dict
+        if not isinstance(self._cache_dict, dict):
+            if self._parent_dialog and hasattr(self._parent_dialog, 'llm_phenotype_cache'):
+                self._parent_dialog.llm_phenotype_cache = {}
+                self._cache_dict = self._parent_dialog.llm_phenotype_cache
+            else:
+                return
+        
+        # Update cache with results, ensuring integer keys
+        cache_update = {}
+        for cid, result in results_dict.items():
+            cid_int = int(cid) if isinstance(cid, str) else cid
+            cache_update[cid_int] = result
+        
+        # Update the cache (this is a reference to parent's llm_phenotype_cache)
+        self._cache_dict.update(cache_update)
+        
+        # Also ensure parent's cache is updated (in case reference was lost)
+        if self._parent_dialog and hasattr(self._parent_dialog, 'llm_phenotype_cache'):
+            if not isinstance(self._parent_dialog.llm_phenotype_cache, dict):
+                self._parent_dialog.llm_phenotype_cache = {}
+            self._parent_dialog.llm_phenotype_cache.update(cache_update)
+    
     def _check_and_display_cached_results(self):
         """Check if we have cached results for the current cluster set and display them."""
-        if not self._cache_dict:
+        # Ensure _cache_dict is properly initialized
+        if self._cache_dict is None:
+            self._cache_dict = {}
+            return
+        
+        if not isinstance(self._cache_dict, dict) or not self._cache_dict:
             return
             
         # Check if we have cached results for current clusters
@@ -9490,11 +9547,15 @@ class PhenotypeSuggestionDialog(QtWidgets.QDialog):
             # Convert cluster ID to int for consistent comparison
             cid_int = int(cid)
             # Check both the original cid (string) and converted int version
+            # Also check if the cache has the cluster ID in any form
             if cid_int in self._cache_dict:
                 cached_results[cid_int] = self._cache_dict[cid_int]
             elif cid in self._cache_dict:
                 # If found with string key, convert to int for consistency
                 cached_results[cid_int] = self._cache_dict[cid]
+            elif str(cid_int) in self._cache_dict:
+                # Also check string version of int
+                cached_results[cid_int] = self._cache_dict[str(cid_int)]
         
         # If we have cached results for any clusters, display them
         if cached_results:
@@ -9554,8 +9615,8 @@ class PhenotypeSuggestionDialog(QtWidgets.QDialog):
         if display_name_map:
             self._apply_callback(display_name_map, backend_name_map)
             # Ensure the current suggestions are cached for future use
-            if self._cache_dict is not None and self._suggestions:
-                self._cache_dict.update(self._suggestions)
+            if self._suggestions:
+                self._save_results_to_cache(self._suggestions)
             QtWidgets.QMessageBox.information(self, "Applied", f"Applied {len(display_name_map)} suggested names.")
 
     def _export_llm_results(self):
@@ -9602,45 +9663,46 @@ class PhenotypeSuggestionDialog(QtWidgets.QDialog):
                     f"Failed to export LLM results:\n{str(e)}"
                 )
 
-    def _debug_validate_payload(self, payload: dict) -> bool:
-        try:
-            ok = True
-            # Basic keys
-            if not isinstance(payload, dict):
-                return False
-            if 'input' not in payload:
-                ok = False
-            if 'model' not in payload:
-                ok = False
-            # Input structure
-            msgs = payload.get('input')
-            if not isinstance(msgs, list) or len(msgs) < 2:
-                ok = False
-            else:
-                # Check roles and content types
-                roles = [m.get('role') for m in msgs if isinstance(m, dict)]
-                if roles[:2] != ['system', 'user']:
-                    pass
-                for m in msgs:
-                    content = m.get('content') if isinstance(m, dict) else None
-                    if not isinstance(content, list):
-                        ok = False
-                        break
-                    for block in content:
-                        if not isinstance(block, dict) or block.get('type') != 'input_text' or 'text' not in block:
-                            ok = False
-                            break
-            # Ensure user context JSON parses back
+    def _process_single_cluster(self, cid, api_key, stats_per_cluster, k_int, context_str, model_name):
+        """Process a single cluster with LLM API call. Used as worker function for ThreadPoolExecutor."""
+        import time
+        
+        cid_int = int(cid)
+        max_retries = 3  # Maximum number of retries for timeout/connection errors
+        retry_delay = 2  # Initial delay between retries (seconds)
+        
+        for attempt in range(max_retries):
             try:
-                user_blocks = msgs[1]['content'] if isinstance(msgs, list) and len(msgs) > 1 else []
-                user_texts = [b.get('text') for b in user_blocks if isinstance(b, dict) and b.get('type') == 'input_text']
-                if user_texts:
-                    json.loads(user_texts[0])
+                payload = self._build_prompt_payload(cid, stats_per_cluster.get(cid, {}), k_int, context_str)
+                payload['model'] = model_name
+                # Validate payload before sending
+                suggestion = self._call_openai(api_key, payload)
+                # Validate JSON
+                obj = self._validate_json(suggestion, cid)
+                if obj is None:
+                    # One retry with repair instruction
+                    suggestion = self._call_openai(api_key, payload, repair=True)
+                    obj = self._validate_json(suggestion, cid)
+                if obj is not None:
+                    # Return with consistent integer keys
+                    return (cid_int, obj)
+                return (cid_int, None)
             except Exception as e:
-                ok = False
-            return ok
-        except Exception as e:
-            return False
+                error_msg = str(e).lower()
+                is_timeout = "timeout" in error_msg or "timed out" in error_msg
+                is_connection = "connection" in error_msg or "network" in error_msg
+                
+                # Retry for timeout/connection errors, but not for other errors (auth, rate limit, etc.)
+                if (is_timeout or is_connection) and attempt < max_retries - 1:
+                    wait_time = retry_delay * (2 ** attempt)  # Exponential backoff
+                    time.sleep(wait_time)
+                    continue
+                else:
+                    # Return error information for this cluster (no more retries or non-retryable error)
+                    return (cid_int, {'error': str(e)})
+        
+        # Should not reach here, but just in case
+        return (cid_int, {'error': 'Max retries exceeded'})
 
     def _run(self):
         # Disable the run button to prevent multiple clicks
@@ -9668,45 +9730,99 @@ class PhenotypeSuggestionDialog(QtWidgets.QDialog):
             mode = self.feature_mode_combo.currentText()
             k_int = self.k_int_spin.value()
             k_morpho = self.k_morpho_spin.value()
+            model_name = self.model_combo.currentText()
+            context_str = self.context_edit.text().strip() or "IMC panel of single cells"
+            
             # Use k_int as the K parameter for consistency
             self.progress.setFormat("Computing cluster statistics...")
             QtWidgets.QApplication.processEvents()
             stats_per_cluster = self._compute_stats(self._parent_dialog.clustered_data, K=k_int, mode=mode, k_int=k_int, k_morpho=k_morpho)
-            results = {}
+            
             total = max(1, len(self._cluster_ids))
             self.progress.setRange(0, total)
             self.progress.setValue(0)
             self.progress.setFormat("Processing clusters with LLM...")
             QtWidgets.QApplication.processEvents()
-            for idx, cid in enumerate(self._cluster_ids, start=1):
-                context_str = self.context_edit.text().strip() or "IMC panel of single cells"
-                payload = self._build_prompt_payload(cid, stats_per_cluster.get(cid, {}), k_int, context_str)
-                payload['model'] = self.model_combo.currentText()
-                # Validate payload before sending
-                self._debug_validate_payload(payload)
-                suggestion = self._call_openai(api_key, payload)
-                # Validate JSON
-                obj = self._validate_json(suggestion, cid)
-                if obj is None:
-                    # One retry with repair instruction
-                    suggestion = self._call_openai(api_key, payload, repair=True)
-                    obj = self._validate_json(suggestion, cid)
-                if obj is not None:
-                    # Store with consistent integer keys
+            
+            # Use ThreadPoolExecutor for parallel API calls (up to 10 concurrent requests)
+            max_workers = min(10, len(self._cluster_ids))
+            results = {}
+            completed_count = 0
+            
+            with ThreadPoolExecutor(max_workers=max_workers) as executor:
+                # Submit all tasks - maintain order by storing futures with their cluster IDs
+                future_to_cid = {}
+                for cid in self._cluster_ids:
+                    future = executor.submit(
+                        self._process_single_cluster,
+                        cid, api_key, stats_per_cluster, k_int, context_str, model_name
+                    )
+                    future_to_cid[future] = cid
+                
+                # Collect results as they complete (maintain order by processing in submission order)
+                # Use as_completed to process results as soon as they're ready, but track order
+                results_dict = {}  # Temporary storage for results
+                
+                # Process completed futures
+                for future in as_completed(future_to_cid):
+                    try:
+                        cid_int, obj = future.result()
+                        results_dict[cid_int] = obj
+                        completed_count += 1
+                        # Update progress
+                        self.progress.setValue(completed_count)
+                        self.progress.setFormat(f"Processing clusters with LLM... ({completed_count}/{total})")
+                        QtWidgets.QApplication.processEvents()
+                    except Exception as e:
+                        cid = future_to_cid[future]
+                        cid_int = int(cid)
+                        # Store error in results_dict
+                        results_dict[cid_int] = {'error': str(e)}
+                        completed_count += 1
+                        self.progress.setValue(completed_count)
+                        QtWidgets.QApplication.processEvents()
+                
+                # Now collect results in the original cluster order to maintain consistency
+                for cid in self._cluster_ids:
                     cid_int = int(cid)
-                    results[cid_int] = obj
-                    self._suggestions[cid_int] = obj
-                # Update progress
-                self.progress.setValue(idx)
-                QtWidgets.QApplication.processEvents()
+                    if cid_int in results_dict:
+                        obj = results_dict[cid_int]
+                        if obj is not None and 'error' not in obj:
+                            results[cid_int] = obj
+                            self._suggestions[cid_int] = obj
+                        elif obj is not None and 'error' in obj:
+                            # Error will be shown to user after all processing completes
+                            pass
+            
+            # Track errors for user notification
+            errors = []
+            for cid in self._cluster_ids:
+                cid_int = int(cid)
+                if cid_int in results_dict:
+                    obj = results_dict[cid_int]
+                    if obj is not None and 'error' in obj:
+                        errors.append((cid_int, obj['error']))
+            
             if results:
-                # Cache the results (using integer keys consistently)
-                if self._cache_dict is not None:
-                    self._cache_dict.update(results)
+                # Cache the results immediately (using integer keys consistently)
+                # This ensures cache persists even if dialog is closed without clicking "Apply Names"
+                self._save_results_to_cache(results)
                 self._render_choices(results)
                 self.apply_btn.setEnabled(True)
                 self.export_btn.setEnabled(True)
                 self.export_btn.show()
+            
+            # Show error notification if any clusters failed
+            if errors:
+                error_msg = f"The following clusters encountered errors:\n\n"
+                for cid, error in errors:
+                    error_msg += f"Cluster {cid}: {error}\n"
+                error_msg += f"\nTotal: {len(errors)} cluster(s) failed out of {len(self._cluster_ids)}"
+                QtWidgets.QMessageBox.warning(
+                    self,
+                    "LLM Processing Errors",
+                    error_msg
+                )
         except Exception as e:
             QtWidgets.QMessageBox.critical(self, "LLM Error", f"Error suggesting phenotypes: {str(e)}")
         finally:
@@ -10025,13 +10141,13 @@ class PhenotypeSuggestionDialog(QtWidgets.QDialog):
         # Use OpenAI official SDK per developer guide
         from openai import OpenAI
         
-        client = OpenAI(api_key=api_key, timeout=30.0)
+        # Increased timeout for LLM calls (120 seconds) - LLM responses can take time
+        client = OpenAI(api_key=api_key, timeout=120.0)
         data = payload.copy()
         # Append repair instruction as another system content block if needed
         input_payload = data.get('input')
         if repair and isinstance(input_payload, list):
             input_payload = input_payload + [{"role": "system", "content": [{"type": "input_text", "text": "Return valid JSON only, no prose."}]}]
-        # Debug to console: request meta
         try:
             pass
         except Exception:
@@ -10077,7 +10193,6 @@ class PhenotypeSuggestionDialog(QtWidgets.QDialog):
                 content = "\n".join([p for p in pieces if p]) or "{}"
             except Exception:
                 content = "{}"
-        # If response looks empty/minimal, dump a truncated raw view to console for debugging
         try:
             pass
         except Exception:

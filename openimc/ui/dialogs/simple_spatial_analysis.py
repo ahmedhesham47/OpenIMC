@@ -337,8 +337,7 @@ def _ripley_worker(args):
 
 class SimpleSpatialAnalysisDialog(QtWidgets.QDialog):
     """Simple Spatial Analysis Dialog - original implementation without squidpy."""
-    def __init__(self, feature_dataframe: pd.DataFrame, batch_corrected_dataframe=None, parent=None):
-        print("[DEBUG] SimpleSpatialAnalysisDialog.__init__: Starting initialization...")
+    def __init__(self, feature_dataframe: pd.DataFrame, batch_corrected_dataframe=None, clustered_cells_dataframe=None, parent=None):
         super().__init__(parent)
         self.setWindowTitle("Simple Spatial Analysis")
         self.setMinimumSize(900, 650)
@@ -350,12 +349,20 @@ class SimpleSpatialAnalysisDialog(QtWidgets.QDialog):
             dialog_height = int(parent_size.height() * 0.9)
             self.resize(dialog_width, dialog_height)
 
-        self.original_feature_dataframe = feature_dataframe
+        self.original_feature_dataframe = feature_dataframe  # Full dataset
         self.batch_corrected_dataframe = batch_corrected_dataframe
+        self.clustered_cells_dataframe = clustered_cells_dataframe  # Saved state only (for initialization)
+        
+        # ALWAYS start with full feature_dataframe - do NOT pre-filter
+        # Filtering will be applied dynamically when needed based on current clustering state
         if batch_corrected_dataframe is not None and not batch_corrected_dataframe.empty:
             self.feature_dataframe = batch_corrected_dataframe.copy()
         else:
             self.feature_dataframe = feature_dataframe.copy()
+        
+        # Note: clustered_cells_dataframe is stored but NOT used to filter feature_dataframe
+        # We want users to have access to all cells for new analyses
+        # Filtering happens dynamically in _get_filtered_dataframe() based on current clustering dialog state
         self.edge_df: Optional[pd.DataFrame] = None
         self.adj_matrices: Dict[str, sp.csr_matrix] = {} if sp else {}
         self.cell_id_to_gid: Dict[Tuple[str, int], int] = {}
@@ -1037,6 +1044,20 @@ class SimpleSpatialAnalysisDialog(QtWidgets.QDialog):
         random.seed(self.rng_seed)
         np.random.seed(self.rng_seed)
 
+        # Show progress dialog
+        progress_dlg = QtWidgets.QProgressDialog(
+            "Building spatial graph...",
+            None,
+            0,
+            0,
+            self
+        )
+        progress_dlg.setWindowTitle("Building Spatial Graph")
+        progress_dlg.setWindowModality(QtCore.Qt.WindowModal)
+        progress_dlg.setMinimumDuration(0)
+        progress_dlg.setValue(0)
+        QtWidgets.QApplication.processEvents()
+
         try:
             # Initialize global cell ID mapping
             self.cell_id_to_gid = {}
@@ -1164,11 +1185,13 @@ class SimpleSpatialAnalysisDialog(QtWidgets.QDialog):
             # Enable export graph button now that graph is built
             self._update_tab_states()
             
+            progress_dlg.close()
             return True
             
         except Exception as e:
             import traceback
             traceback.print_exc()
+            progress_dlg.close()
             QtWidgets.QMessageBox.critical(self, "Spatial Graph Error", f"Error: {str(e)}\n\nCheck console for detailed debug information.")
             return False
     
@@ -1195,6 +1218,20 @@ class SimpleSpatialAnalysisDialog(QtWidgets.QDialog):
         if self.edge_df is None or self.edge_df.empty:
             QtWidgets.QMessageBox.warning(self, "No Graph", "Please build the spatial graph first using the 'Build Graph' button.")
             return
+        
+        # Show progress dialog
+        progress_dlg = QtWidgets.QProgressDialog(
+            "Running enrichment analysis...",
+            None,
+            0,
+            0,
+            self
+        )
+        progress_dlg.setWindowTitle("Enrichment Analysis")
+        progress_dlg.setWindowModality(QtCore.Qt.WindowModal)
+        progress_dlg.setMinimumDuration(0)
+        progress_dlg.setValue(0)
+        QtWidgets.QApplication.processEvents()
             
         try:
             n_perm = int(self.n_perm_spin.value())
@@ -1227,9 +1264,12 @@ class SimpleSpatialAnalysisDialog(QtWidgets.QDialog):
             # Update visualization
             self._update_enrichment_plot()
             
+            progress_dlg.close()
+            
         except Exception as e:
             import traceback
             traceback.print_exc()
+            progress_dlg.close()
             QtWidgets.QMessageBox.critical(self, "Enrichment Analysis Error", f"Error: {str(e)}")
     
     def _run_distance_analysis(self):
@@ -1317,9 +1357,6 @@ class SimpleSpatialAnalysisDialog(QtWidgets.QDialog):
         try:
             # Get number of workers from UI
             n_workers = int(self.workers_spin.value())
-            print(f"[DEBUG] _compute_pairwise_enrichment: UI workers_spin value = {n_workers}")
-            print(f"[DEBUG] _compute_pairwise_enrichment: n_permutations = {n_perm}")
-            print(f"[DEBUG] _compute_pairwise_enrichment: Calling spatial_enrichment with n_workers={n_workers}")
             
             # Use core spatial_enrichment function with multiprocessing
             self.enrichment_df = spatial_enrichment(
@@ -1489,10 +1526,31 @@ class SimpleSpatialAnalysisDialog(QtWidgets.QDialog):
         if not selected_roi:
             QtWidgets.QMessageBox.warning(self, "No ROI Selected", "Please select an ROI to visualize.")
             return
-            
-        self._create_spatial_visualization(selected_roi, force_regenerate=True)
-        self.spatial_viz_run = True
-        self._update_tab_states()
+        
+        # Show progress dialog
+        progress_dlg = QtWidgets.QProgressDialog(
+            "Generating spatial visualization...",
+            None,
+            0,
+            0,
+            self
+        )
+        progress_dlg.setWindowTitle("Spatial Visualization")
+        progress_dlg.setWindowModality(QtCore.Qt.WindowModal)
+        progress_dlg.setMinimumDuration(0)
+        progress_dlg.setValue(0)
+        QtWidgets.QApplication.processEvents()
+        
+        try:
+            self._create_spatial_visualization(selected_roi, force_regenerate=True)
+            self.spatial_viz_run = True
+            self._update_tab_states()
+            progress_dlg.close()
+        except Exception as e:
+            import traceback
+            traceback.print_exc()
+            progress_dlg.close()
+            QtWidgets.QMessageBox.critical(self, "Visualization Error", f"Error: {str(e)}")
     
     def _on_spatial_viz_option_changed(self):
         """Handle spatial visualization option changes."""
@@ -1653,6 +1711,20 @@ class SimpleSpatialAnalysisDialog(QtWidgets.QDialog):
             QtWidgets.QMessageBox.warning(self, "igraph Required", 
                 "Community analysis requires igraph. Please install it: pip install python-igraph")
             return
+        
+        # Show progress dialog
+        progress_dlg = QtWidgets.QProgressDialog(
+            "Running community detection analysis...",
+            None,
+            0,
+            0,
+            self
+        )
+        progress_dlg.setWindowTitle("Community Analysis")
+        progress_dlg.setWindowModality(QtCore.Qt.WindowModal)
+        progress_dlg.setMinimumDuration(0)
+        progress_dlg.setValue(0)
+        QtWidgets.QApplication.processEvents()
             
         try:
             # Get filtered dataframe
@@ -1695,12 +1767,14 @@ class SimpleSpatialAnalysisDialog(QtWidgets.QDialog):
             self._update_community_plot(selected_roi, roi_df, community_labels)
             
             self.community_analysis_run = True
+            progress_dlg.close()
             QtWidgets.QMessageBox.information(self, "Community Analysis", 
                 f"Detected {len(set(community_labels))} communities in ROI {selected_roi}.")
             
         except Exception as e:
             import traceback
             traceback.print_exc()
+            progress_dlg.close()
             QtWidgets.QMessageBox.critical(self, "Community Analysis Error", f"Error: {str(e)}")
     
     def _update_community_plot(self, roi_id, roi_df, community_labels):
@@ -1986,10 +2060,10 @@ class SimpleSpatialAnalysisDialog(QtWidgets.QDialog):
             unique_pairs['nearest_B_cluster'].notna()
         ]
         
-        # Filter pairs based on selected clusters (show pairs where both clusters are selected)
+        # Filter pairs based on selected clusters (show pairs FROM selected clusters TO any cluster)
+        # This shows distances originating from the selected clusters
         unique_pairs = unique_pairs[
-            (unique_pairs['cell_A_cluster'].isin(selected_clusters)) &
-            (unique_pairs['nearest_B_cluster'].isin(selected_clusters))
+            unique_pairs['cell_A_cluster'].isin(selected_clusters)
         ]
         
         # Optionally filter out self-pairs (A→A)
@@ -2013,11 +2087,11 @@ class SimpleSpatialAnalysisDialog(QtWidgets.QDialog):
             
             if len(pair_data) > 0:
                 plot_data.append(pair_data)
-                # Format label: show "A → A" for self-pairs, "A → B" for cross-pairs
+                # Format label: show "A → nearest A" for self-pairs, "A → nearest B" for cross-pairs
                 if cluster_a == cluster_b:
-                    plot_labels.append(f"{self._get_cluster_display_name(cluster_a)} → {self._get_cluster_display_name(cluster_b)} (self)")
+                    plot_labels.append(f"{self._get_cluster_display_name(cluster_a)} → nearest {self._get_cluster_display_name(cluster_b)} (self)")
                 else:
-                    plot_labels.append(f"{self._get_cluster_display_name(cluster_a)} → {self._get_cluster_display_name(cluster_b)}")
+                    plot_labels.append(f"{self._get_cluster_display_name(cluster_a)} → nearest {self._get_cluster_display_name(cluster_b)}")
         
         if not plot_data:
             ax.text(0.5, 0.5, 'No data to display for selected clusters.', 
@@ -2036,9 +2110,13 @@ class SimpleSpatialAnalysisDialog(QtWidgets.QDialog):
             patch.set_alpha(0.7)
         
         ax.set_ylabel('Distance to Nearest Neighbor (µm)')
-        title = 'Distance Distribution: Nearest Neighbor Distances Between Cluster Pairs'
+        title = 'Distance to Nearest Neighbor: FROM Selected Cluster(s)'
         if selected_clusters:
-            title += f' (Showing {len(selected_clusters)} selected cluster{"s" if len(selected_clusters) > 1 else ""})'
+            cluster_names = [self._get_cluster_display_name(c) for c in selected_clusters]
+            if len(cluster_names) <= 3:
+                title += f'\nFrom: {", ".join(cluster_names)}'
+            else:
+                title += f'\nFrom: {len(selected_clusters)} clusters'
         if not show_self_pairs:
             title += ' (self-distances hidden)'
         ax.set_title(title)

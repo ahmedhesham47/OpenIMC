@@ -191,21 +191,14 @@ def dataframe_to_anndata(
         required_cols = ['centroid_x', 'centroid_y', 'cell_id']
         missing = [c for c in required_cols if c not in df.columns]
         if missing:
-            print(f"[DEBUG] dataframe_to_anndata: Missing required columns: {missing}")
             return None
         
         # Extract centroid coordinates
         centroid_coords = df[['centroid_x', 'centroid_y']].values
-        print(f"[DEBUG] dataframe_to_anndata: Centroid coords shape: {centroid_coords.shape}, "
-              f"range X: [{centroid_coords[:, 0].min():.2f}, {centroid_coords[:, 0].max():.2f}], "
-              f"range Y: [{centroid_coords[:, 1].min():.2f}, {centroid_coords[:, 1].max():.2f}]")
         
         # Convert coordinates from pixels to micrometers
         # Note: pixel_size_um should be the size of one pixel in micrometers
-        print(f"[DEBUG] dataframe_to_anndata: pixel_size_um: {pixel_size_um}")
         coords_um = centroid_coords * pixel_size_um
-        print(f"[DEBUG] dataframe_to_anndata: Converted coords (µm) range X: [{coords_um[:, 0].min():.2f}, {coords_um[:, 0].max():.2f}], "
-              f"range Y: [{coords_um[:, 1].min():.2f}, {coords_um[:, 1].max():.2f}]")
         
         # Identify feature columns (exclude metadata)
         metadata_cols = {
@@ -218,7 +211,6 @@ def dataframe_to_anndata(
         # Filter to only include _mean features (as per user requirement)
         all_feature_cols = [col for col in df.columns if col not in metadata_cols]
         feature_cols = [col for col in all_feature_cols if col.endswith('_mean')]
-        print(f"[DEBUG] dataframe_to_anndata: Found {len(feature_cols)} _mean features: {feature_cols[:5]}...")
         
         # Also include morphology features (they don't have _mean suffix)
         morpho_names = {
@@ -228,7 +220,6 @@ def dataframe_to_anndata(
         }
         morpho_cols = [col for col in all_feature_cols if col in morpho_names]
         feature_cols.extend(morpho_cols)
-        print(f"[DEBUG] dataframe_to_anndata: Added {len(morpho_cols)} morphology features. Total: {len(feature_cols)}")
         
         # Create AnnData object
         # X: feature matrix (intensity and morphology features)

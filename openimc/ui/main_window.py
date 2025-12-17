@@ -21,26 +21,30 @@
 # This must be done at the very top, before any other imports
 import os
 import sys
+import warnings
 from pathlib import Path
+
+# Suppress dask dataframe legacy implementation warning
+warnings.filterwarnings('ignore', category=FutureWarning, module='dask.dataframe')
+warnings.filterwarnings('ignore', category=FutureWarning, message='.*legacy.*Dask DataFrame.*')
+warnings.filterwarnings('ignore', category=FutureWarning, message='.*dataframe.query-planning.*')
+
 # Use direct assignment (not setdefault) to ensure it's set
 os.environ['DASK_DATAFRAME__QUERY_PLANNING'] = 'False'
 
 # Also configure dask directly if available (must be before any dask.dataframe import)
 # Check if dask.dataframe was already imported
 dask_dataframe_imported = 'dask.dataframe' in sys.modules
-if dask_dataframe_imported:
-    print("[DEBUG] main_window.py: WARNING - dask.dataframe already imported before configuration!")
 try:
     import dask
     # Configure before dask.dataframe can be imported
     dask.config.set({'dataframe.query-planning': False})
-    print("[DEBUG] main_window.py: Configured dask: dataframe.query-planning = False")
 except (ImportError, AttributeError) as e:
-    print(f"[DEBUG] main_window.py: Could not configure dask: {e}")
     pass
 
 from typing import Dict, List, Optional, Tuple, Union, Any
 import threading
+import copy
 from concurrent.futures import ThreadPoolExecutor, Future
 from datetime import datetime
 
@@ -161,7 +165,7 @@ from openimc.ui.dialogs.spillover_matrix_dialog import GenerateSpilloverMatrixDi
 from openimc.ui.dialogs.batch_correction_dialog import BatchCorrectionDialog
 from openimc.ui.dialogs.ometiff_format_dialog import OMETIFFFormatDialog
 from openimc.ui.dialogs.deconvolution_dialog import DeconvolutionDialog
-from openimc.ui.dialogs.pixel_correlation_dialog import PixelCorrelationDialog
+from openimc.ui.dialogs.pixel_correlation_dialog import PixelCorrelationDialog, ConditionROIWidget
 from openimc.core import deconvolution
 from openimc.utils.logger import get_logger
 from openimc.ui.mask_manager import DynamicMaskManager
@@ -7888,15 +7892,27 @@ class MainWindow(QtWidgets.QMainWindow):
                 return
             
             # Group acquisitions by file path
-            # Process files sequentially to avoid readimc file access issues, but process all acquisitions from each file in parallel
+            # IMPORTANT: Only group MCD files together. OME-TIFF files should be processed individually
+            # (one file per worker) since each OME-TIFF file is typically a single acquisition.
+            # MCD files need grouping to avoid file locking issues with readimc.
             from collections import defaultdict
             file_groups = defaultdict(list)
+            ometiff_tasks = []  # OME-TIFF tasks processed individually
+            
             for args in mp_args:
                 file_path = args[6]  # file_path is at index 6
-                file_groups[file_path].append(args)
+                loader_type = args[7]  # loader_type is at index 7
+                
+                # Only group MCD files. OME-TIFF files are processed individually
+                if loader_type == "mcd":
+                    file_groups[file_path].append(args)
+                else:
+                    # OME-TIFF: each file gets its own "group" (will be processed individually)
+                    ometiff_tasks.append(args)
             
             # Use multiprocessing for parallel feature extraction within each file
-            num_unique_files = len(file_groups)
+            # Count MCD file groups + individual OME-TIFF files
+            num_unique_files = len(file_groups) + len(ometiff_tasks)
             max_workers = max(1, min(mp.cpu_count() - 2, len(mp_args)))
             progress_dlg.update_progress(0, "Starting feature extraction", f"Processing {num_unique_files} files with up to {max_workers} workers")
             
@@ -7909,12 +7925,12 @@ class MainWindow(QtWidgets.QMainWindow):
                 # Use spawn context to avoid conflicts and hangs
                 ctx = mp.get_context('spawn')
                 
-                # Process each file sequentially, but all acquisitions from each file in parallel
+                # Process MCD files: each file sequentially, but all acquisitions from each file in parallel
                 file_num = 0
                 for file_path, file_args_list in file_groups.items():
                     file_num += 1
                     file_basename = os.path.basename(file_path)
-                    print(f"[main] Processing file {file_num}/{num_unique_files}: {file_basename} ({len(file_args_list)} acquisitions)")
+                    print(f"[main] Processing MCD file {file_num}/{num_unique_files}: {file_basename} ({len(file_args_list)} acquisitions)")
                     
                     with ctx.Pool(processes=min(max_workers, len(file_args_list))) as pool:
                         # Submit all acquisitions from this file
@@ -7962,7 +7978,60 @@ class MainWindow(QtWidgets.QMainWindow):
                             )
                             QtWidgets.QApplication.processEvents()
                     
-                    print(f"[main] Completed file {file_basename}: {completed_for_file}/{len(file_args_list)} acquisitions")
+                    print(f"[main] Completed MCD file {file_basename}: {completed_for_file}/{len(file_args_list)} acquisitions")
+                
+                # Process OME-TIFF files: each file individually (one file = one worker)
+                # OME-TIFF files don't need grouping since each file is typically a single acquisition
+                # and there are no file locking issues with OME-TIFF loaders
+                if ometiff_tasks:
+                    print(f"[main] Processing {len(ometiff_tasks)} OME-TIFF files individually")
+                    with ctx.Pool(processes=min(max_workers, len(ometiff_tasks))) as pool:
+                        futures = []
+                        for args in ometiff_tasks:
+                            (acq_id, mask, mask_path, selected_features, acq_info_dict, acq_label, 
+                             file_path_arg, loader_type, arcsinh_enabled, cofactor, denoise_source, 
+                             custom_denoise_settings, spillover_config, source_file, excluded_channels) = args
+                            future = pool.apply_async(
+                                _extract_features_worker,
+                                (acq_id, mask, mask_path, selected_features, acq_info_dict, acq_label, 
+                                 file_path_arg, loader_type, arcsinh_enabled, cofactor, denoise_source, 
+                                 custom_denoise_settings, spillover_config, source_file, excluded_channels)
+                            )
+                            futures.append((acq_id, future))
+                        
+                        # Collect results as they complete
+                        completed_ometiff = 0
+                        total_acquisitions = len(mp_args)
+                        mcd_acquisitions_processed = sum(len(args_list) for args_list in file_groups.values())
+                        
+                        for acq_idx, (acq_id, future) in enumerate(futures, 1):
+                            if progress_dlg.is_cancelled():
+                                pool.terminate()
+                                pool.join()
+                                break
+                            
+                            try:
+                                result = future.get(timeout=worker_timeout)
+                                if result is not None and not result.empty:
+                                    all_features.append(result)
+                                    completed_ometiff += 1
+                            except mp.TimeoutError:
+                                print(f"[main] [ERROR] Feature extraction timed out for OME-TIFF acquisition {acq_id} after {worker_timeout}s")
+                            except Exception as e:
+                                print(f"[main] [ERROR] Feature extraction failed for OME-TIFF acquisition {acq_id}: {e}")
+                                import traceback
+                                traceback.print_exc()
+                            
+                            # Update progress
+                            acquisitions_processed = mcd_acquisitions_processed + acq_idx
+                            progress_dlg.update_progress(
+                                acquisitions_processed,
+                                f"Processing OME-TIFF files...",
+                                f"Processed {acquisitions_processed}/{total_acquisitions} acquisitions ({len(all_features)} successful)"
+                            )
+                            QtWidgets.QApplication.processEvents()
+                        
+                        print(f"[main] Completed {completed_ometiff}/{len(ometiff_tasks)} OME-TIFF files")
                         
             except Exception as mp_error:
                 print(f"Multiprocessing failed, falling back to sequential processing: {mp_error}")
@@ -8496,6 +8565,7 @@ class MainWindow(QtWidgets.QMainWindow):
             self.feature_dataframe, 
             normalization_config, 
             batch_corrected_dataframe=self.batch_corrected_dataframe,
+            clustered_cells_dataframe=getattr(self, 'clustered_cells_dataframe', None),
             parent=self
         )
         # Make dialog non-modal so it can be closed and reopened without losing state
@@ -8506,6 +8576,10 @@ class MainWindow(QtWidgets.QMainWindow):
         # Restore saved clustering state if available
         if hasattr(self, '_saved_clustering_state') and self._saved_clustering_state:
             self._restore_clustering_state(self.clustering_dialog, self._saved_clustering_state)
+        
+        # Ensure llm_phenotype_cache is always initialized as a dict
+        if not hasattr(self.clustering_dialog, 'llm_phenotype_cache') or not isinstance(self.clustering_dialog.llm_phenotype_cache, dict):
+            self.clustering_dialog.llm_phenotype_cache = {}
         
         self.clustering_dialog.show()
         
@@ -8631,6 +8705,7 @@ class MainWindow(QtWidgets.QMainWindow):
         self.simple_spatial_dialog = SimpleSpatialAnalysisDialog(
             self.feature_dataframe, 
             batch_corrected_dataframe=self.batch_corrected_dataframe,
+            clustered_cells_dataframe=getattr(self, 'clustered_cells_dataframe', None),
             parent=self
         )
         self.simple_spatial_dialog.setModal(False)
@@ -8672,9 +8747,7 @@ class MainWindow(QtWidgets.QMainWindow):
             return
         
         # Check if AdvancedSpatialAnalysisDialog is available
-        print(f"[DEBUG] _open_advanced_spatial_dialog: AdvancedSpatialAnalysisDialog is None: {AdvancedSpatialAnalysisDialog is None}")
         if AdvancedSpatialAnalysisDialog is None:
-            print("[DEBUG] AdvancedSpatialAnalysisDialog is None - showing fallback dialog")
             reply = QtWidgets.QMessageBox.question(
                 self,
                 "Squidpy Not Available",
@@ -8702,16 +8775,14 @@ class MainWindow(QtWidgets.QMainWindow):
                 self.advanced_spatial_dialog = None
         
         # Create new advanced spatial analysis dialog
-        print("[DEBUG] Attempting to create AdvancedSpatialAnalysisDialog...")
         try:
             self.advanced_spatial_dialog = AdvancedSpatialAnalysisDialog(
                 self.feature_dataframe, 
                 batch_corrected_dataframe=self.batch_corrected_dataframe,
+                clustered_cells_dataframe=getattr(self, 'clustered_cells_dataframe', None),
                 parent=self
             )
-            print("[DEBUG] Successfully created AdvancedSpatialAnalysisDialog")
         except RuntimeError as e:
-            print(f"[DEBUG] RuntimeError caught when creating dialog: {e}")
             if "squidpy" in str(e).lower():
                 reply = QtWidgets.QMessageBox.question(
                     self,
@@ -8764,8 +8835,31 @@ class MainWindow(QtWidgets.QMainWindow):
                 "Please load data first before running QC analysis."
             )
             return
+        
+        # Check if dialog already exists
+        if hasattr(self, 'qc_dialog') and self.qc_dialog is not None:
+            try:
+                if self.qc_dialog.isVisible():
+                    self.qc_dialog.raise_()
+                    self.qc_dialog.activateWindow()
+                else:
+                    self.qc_dialog.show()
+                    self.qc_dialog.raise_()
+                    self.qc_dialog.activateWindow()
+                return
+            except (RuntimeError, AttributeError):
+                self.qc_dialog = None
+        
         dlg = QCAnalysisDialog(self)
-        dlg.exec_()
+        self.qc_dialog = dlg
+        dlg.setModal(False)
+        dlg.setAttribute(Qt.WA_DeleteOnClose, False)
+        
+        # Restore saved QC state if available (UI state is restored in dialog __init__)
+        # Additional state restoration for results tables is done after dialog creation
+        if hasattr(self, '_saved_qc_ui_state') and self._saved_qc_ui_state:
+            self._restore_qc_ui_state(dlg, self._saved_qc_ui_state)
+        dlg.show()
     
     def _open_pixel_correlation_dialog(self):
         """Open the pixel-level correlation analysis dialog."""
@@ -8779,8 +8873,31 @@ class MainWindow(QtWidgets.QMainWindow):
                 "Please load data first before running pixel-level correlation analysis."
             )
             return
+        
+        # Check if dialog already exists
+        if hasattr(self, 'pixel_correlation_dialog') and self.pixel_correlation_dialog is not None:
+            try:
+                if self.pixel_correlation_dialog.isVisible():
+                    self.pixel_correlation_dialog.raise_()
+                    self.pixel_correlation_dialog.activateWindow()
+                else:
+                    self.pixel_correlation_dialog.show()
+                    self.pixel_correlation_dialog.raise_()
+                    self.pixel_correlation_dialog.activateWindow()
+                return
+            except (RuntimeError, AttributeError):
+                self.pixel_correlation_dialog = None
+        
         dlg = PixelCorrelationDialog(self)
-        dlg.exec_()
+        self.pixel_correlation_dialog = dlg
+        dlg.setModal(False)
+        dlg.setAttribute(Qt.WA_DeleteOnClose, False)
+        
+        # Restore saved pixel correlation state if available
+        if hasattr(self, '_saved_pixel_correlation_state') and self._saved_pixel_correlation_state:
+            self._restore_pixel_correlation_state(dlg, self._saved_pixel_correlation_state)
+        
+        dlg.show()
     
     def _open_deconvolution_dialog(self):
         """Open the high resolution deconvolution dialog."""
@@ -9554,6 +9671,29 @@ class MainWindow(QtWidgets.QMainWindow):
             pass
         
         dlg = BatchCorrectionDialog(self.feature_dataframe, self)
+        
+        # If we have restored custom grouping and metadata files from a saved state,
+        # populate the dialog with them
+        if hasattr(self, 'batch_correction_custom_grouping') and self.batch_correction_custom_grouping:
+            dlg.custom_grouping = copy.deepcopy(self.batch_correction_custom_grouping)
+            # Update the custom grouping status label
+            if hasattr(dlg, 'custom_grouping_status'):
+                num_groups = len(set(self.batch_correction_custom_grouping.values()))
+                dlg.custom_grouping_status.setText(
+                    f"Restored: {len(self.batch_correction_custom_grouping)} acquisitions in {num_groups} groups"
+                )
+                dlg.custom_grouping_status.setVisible(True)
+            if hasattr(dlg, 'custom_grouping_btn'):
+                dlg.custom_grouping_btn.setVisible(True)
+        
+        if hasattr(self, 'batch_correction_metadata_files') and self.batch_correction_metadata_files:
+            dlg.metadata_files = copy.deepcopy(self.batch_correction_metadata_files)
+            # Update the metadata list UI if the dialog has this method
+            if hasattr(dlg, '_update_metadata_list'):
+                try:
+                    dlg._update_metadata_list()
+                except Exception as e:
+                    print(f"Warning: Could not update metadata list in dialog: {e}")
         if dlg.exec_() == QtWidgets.QDialog.Accepted:
             # Get combined dataframe (from loaded files or current)
             combined_df = dlg.get_combined_dataframe()
@@ -9574,6 +9714,19 @@ class MainWindow(QtWidgets.QMainWindow):
             if corrected_df is not None and not corrected_df.empty:
                 # Store batch-corrected features separately (keep original)
                 self.batch_corrected_dataframe = corrected_df
+                
+                # Store custom grouping and metadata files for state saving
+                if hasattr(dlg, 'custom_grouping') and dlg.custom_grouping:
+                    self.batch_correction_custom_grouping = copy.deepcopy(dlg.custom_grouping)
+                else:
+                    self.batch_correction_custom_grouping = None
+                
+                if hasattr(dlg, 'metadata_files') and dlg.metadata_files:
+                    # Store metadata files (dictionary with file_path as key)
+                    # Each entry contains 'filename_column' and 'dataframe'
+                    self.batch_correction_metadata_files = copy.deepcopy(dlg.metadata_files)
+                else:
+                    self.batch_correction_metadata_files = None
                 
                 # Save to file if requested
                 output_path = dlg.get_output_path()
@@ -9791,6 +9944,18 @@ class MainWindow(QtWidgets.QMainWindow):
             features["original"] = self.feature_dataframe
         if self.batch_corrected_dataframe is not None and not self.batch_corrected_dataframe.empty:
             features["batch_corrected"] = self.batch_corrected_dataframe
+        
+        # Save clustered cells dataframe (only cells used in clustering, excluding filtered cells)
+        # This is extracted from the clustering dialog if available
+        if hasattr(self, 'clustering_dialog') and self.clustering_dialog is not None:
+            dlg = self.clustering_dialog
+            if hasattr(dlg, 'clustered_data') and dlg.clustered_data is not None:
+                # Only include cells that were actually clustered (cluster != 0)
+                clustered_cells = dlg.clustered_data[dlg.clustered_data['cluster'] != 0].copy()
+                if not clustered_cells.empty:
+                    features["clustered_cells"] = clustered_cells
+                    print(f"[Save State] Saving clustered_cells dataframe with {len(clustered_cells)} cells")
+        
         state["features"] = features
         
         # Collect analysis module states
@@ -9806,6 +9971,21 @@ class MainWindow(QtWidgets.QMainWindow):
         # QC Analysis state
         if hasattr(self, 'qc_results_cache') and self.qc_results_cache:
             analysis_state["qc_analysis"] = self.qc_results_cache
+        
+        # Also save QC dialog UI state if dialog exists
+        if hasattr(self, 'qc_dialog') and self.qc_dialog is not None:
+            qc_ui_state = {}
+            dlg = self.qc_dialog
+            if hasattr(dlg, 'mode_combo'):
+                qc_ui_state["analysis_mode"] = dlg.mode_combo.currentText()
+            if hasattr(dlg, 'acq_combo'):
+                qc_ui_state["selected_acquisition"] = dlg.acq_combo.currentText()
+            if hasattr(dlg, 'workers_spin'):
+                qc_ui_state["num_workers"] = dlg.workers_spin.value()
+            if qc_ui_state:
+                if "qc_analysis" not in analysis_state:
+                    analysis_state["qc_analysis"] = {}
+                analysis_state["qc_analysis"]["ui_state"] = qc_ui_state
         
         # Clustering state
         if hasattr(self, 'clustering_dialog') and self.clustering_dialog is not None:
@@ -9824,7 +10004,10 @@ class MainWindow(QtWidgets.QMainWindow):
             analysis_state["batch_correction"] = batch_correction_state
         
         # Pixel Correlation state (if dialog exists and has results)
-        # Note: Pixel correlation results are typically not persistent
+        if hasattr(self, 'pixel_correlation_dialog') and self.pixel_correlation_dialog is not None:
+            pixel_correlation_state = self._collect_pixel_correlation_state()
+            if pixel_correlation_state:
+                analysis_state["pixel_correlation"] = pixel_correlation_state
         
         # Deconvolution state (if any)
         # Note: Deconvolution results are typically saved to files
@@ -9865,6 +10048,13 @@ class MainWindow(QtWidgets.QMainWindow):
         if hasattr(dlg, 'last_features_used'):
             state["features_used"] = dlg.last_features_used
         
+        # Collect actual clustering method and dendrogram mode (what was actually used)
+        if hasattr(dlg, 'actual_clustering_method') and dlg.actual_clustering_method:
+            state["actual_clustering_method"] = dlg.actual_clustering_method
+        
+        if hasattr(dlg, 'actual_dendrogram_mode') and dlg.actual_dendrogram_mode:
+            state["actual_dendrogram_mode"] = dlg.actual_dendrogram_mode
+        
         # Collect filter settings (excluded cells, area filters, etc.)
         if hasattr(dlg, 'filter_settings') and dlg.filter_settings is not None:
             state["filter_settings"] = dlg.filter_settings
@@ -9900,6 +10090,10 @@ class MainWindow(QtWidgets.QMainWindow):
         if hasattr(dlg, 'cluster_map_zscore_method'):
             state["cluster_map_zscore_method"] = dlg.cluster_map_zscore_method
         
+        # Collect heatmap scaling method
+        if hasattr(dlg, 'heatmap_scaling_combo'):
+            state["heatmap_scaling"] = dlg.heatmap_scaling_combo.currentText()
+        
         # Collect patient annotation settings
         if hasattr(dlg, 'patient_annotation_column'):
             state["patient_annotation_column"] = dlg.patient_annotation_column
@@ -9909,6 +10103,140 @@ class MainWindow(QtWidgets.QMainWindow):
         
         if hasattr(dlg, 'patient_legend_label'):
             state["patient_legend_label"] = dlg.patient_legend_label
+        
+        # Collect plot customization settings (font sizes, legend layout)
+        if hasattr(dlg, 'x_tick_fontsize'):
+            state["x_tick_fontsize"] = dlg.x_tick_fontsize
+        
+        if hasattr(dlg, 'y_tick_fontsize'):
+            state["y_tick_fontsize"] = dlg.y_tick_fontsize
+        
+        if hasattr(dlg, 'legend_fontsize'):
+            state["legend_fontsize"] = dlg.legend_fontsize
+        
+        if hasattr(dlg, 'legend_nrows'):
+            state["legend_nrows"] = dlg.legend_nrows
+        
+        if hasattr(dlg, 'legend_ncols'):
+            state["legend_ncols"] = dlg.legend_ncols
+        
+        # Collect LLM phenotype cache (always save it, even if empty, to preserve state)
+        if hasattr(dlg, 'llm_phenotype_cache'):
+            # Make a deep copy to ensure we capture the current state
+            cache_to_save = copy.deepcopy(dlg.llm_phenotype_cache) if dlg.llm_phenotype_cache else {}
+            state["llm_phenotype_cache"] = cache_to_save
+        
+        # Collect selected display features for heatmap (which features are shown in the heatmap)
+        if hasattr(dlg, 'selected_display_features') and dlg.selected_display_features is not None:
+            state["selected_display_features"] = list(dlg.selected_display_features)
+        
+        # Collect UMAP and t-SNE embeddings
+        if hasattr(dlg, 'umap_embedding') and dlg.umap_embedding is not None:
+            # Save as numpy array (will be serialized by state manager)
+            state["umap_embedding"] = dlg.umap_embedding
+            # Save the index that corresponds to the embedding
+            if hasattr(dlg, 'umap_index') and dlg.umap_index is not None:
+                state["umap_index"] = list(dlg.umap_index) if isinstance(dlg.umap_index, (list, pd.Index)) else dlg.umap_index.tolist()
+        
+        if hasattr(dlg, 'tsne_embedding') and dlg.tsne_embedding is not None:
+            # Save as numpy array (will be serialized by state manager)
+            state["tsne_embedding"] = dlg.tsne_embedding
+            # Save the index that corresponds to the embedding
+            if hasattr(dlg, 'tsne_index') and dlg.tsne_index is not None:
+                state["tsne_index"] = list(dlg.tsne_index) if isinstance(dlg.tsne_index, (list, pd.Index)) else dlg.tsne_index.tolist()
+        
+        # Collect UI element states
+        ui_state = {}
+        
+        # View selection
+        if hasattr(dlg, 'view_combo'):
+            ui_state["view"] = dlg.view_combo.currentText()
+        
+        # Feature set selection
+        if hasattr(dlg, 'feature_set_combo'):
+            ui_state["feature_set"] = dlg.feature_set_combo.currentText()
+        
+        # Clustering method and parameters
+        if hasattr(dlg, 'clustering_type'):
+            ui_state["clustering_type"] = dlg.clustering_type.currentText()
+        
+        if hasattr(dlg, 'n_clusters'):
+            ui_state["n_clusters"] = dlg.n_clusters.value()
+        
+        if hasattr(dlg, 'seed_spinbox'):
+            ui_state["seed"] = dlg.seed_spinbox.value()
+        
+        # Hierarchical clustering
+        if hasattr(dlg, 'hierarchical_method'):
+            ui_state["hierarchical_method"] = dlg.hierarchical_method.currentText()
+        
+        # Leiden clustering
+        if hasattr(dlg, 'resolution_radio') and hasattr(dlg, 'modularity_radio'):
+            ui_state["leiden_mode"] = "resolution" if dlg.resolution_radio.isChecked() else "modularity"
+        
+        if hasattr(dlg, 'n_neighbors_spinbox'):
+            ui_state["n_neighbors"] = dlg.n_neighbors_spinbox.value()
+        
+        if hasattr(dlg, 'resolution_spinbox'):
+            ui_state["resolution"] = dlg.resolution_spinbox.value()
+        
+        if hasattr(dlg, 'leiden_metric_combo'):
+            ui_state["leiden_metric"] = dlg.leiden_metric_combo.currentText()
+        
+        if hasattr(dlg, 'jaccard_checkbox'):
+            ui_state["jaccard_weighting"] = dlg.jaccard_checkbox.isChecked()
+        
+        # HDBSCAN clustering
+        if hasattr(dlg, 'min_cluster_size_spinbox'):
+            ui_state["min_cluster_size"] = dlg.min_cluster_size_spinbox.value()
+        
+        if hasattr(dlg, 'min_samples_spinbox'):
+            ui_state["min_samples"] = dlg.min_samples_spinbox.value()
+        
+        if hasattr(dlg, 'cluster_selection_combo'):
+            ui_state["cluster_selection_method"] = dlg.cluster_selection_combo.currentText()
+        
+        if hasattr(dlg, 'metric_combo'):
+            ui_state["metric"] = dlg.metric_combo.currentText()
+        
+        # Dendrogram mode
+        if hasattr(dlg, 'dendro_mode'):
+            ui_state["dendro_mode"] = dlg.dendro_mode.currentText()
+        
+        # Visualization settings
+        if hasattr(dlg, 'color_by_listwidget'):
+            selected_items = [item.text() for item in dlg.color_by_listwidget.selectedItems()]
+            ui_state["color_by"] = selected_items
+        
+        if hasattr(dlg, 'use_cohort_checkbox'):
+            ui_state["use_cohort_coloring"] = dlg.use_cohort_checkbox.isChecked()
+        
+        if hasattr(dlg, 'point_size_spinbox'):
+            ui_state["point_size"] = dlg.point_size_spinbox.value()
+        
+        if hasattr(dlg, 'point_alpha_spinbox'):
+            ui_state["point_alpha"] = dlg.point_alpha_spinbox.value()
+        
+        if hasattr(dlg, 'show_legend_checkbox'):
+            ui_state["show_legend"] = dlg.show_legend_checkbox.isChecked()
+        
+        if hasattr(dlg, 'group_by_combo'):
+            ui_state["group_by"] = dlg.group_by_combo.currentText()
+        
+        if hasattr(dlg, 'stacked_bars_view_type_combo'):
+            ui_state["stacked_bars_view_type"] = dlg.stacked_bars_view_type_combo.currentText()
+        
+        if hasattr(dlg, 'colormap_combo'):
+            ui_state["colormap"] = dlg.colormap_combo.currentText()
+        
+        if hasattr(dlg, 'top_n_spinbox'):
+            ui_state["top_n"] = dlg.top_n_spinbox.value()
+        
+        if hasattr(dlg, 'stacked_bars_filter_selection') and dlg.stacked_bars_filter_selection is not None:
+            ui_state["stacked_bars_filter_selection"] = list(dlg.stacked_bars_filter_selection)
+        
+        if ui_state:
+            state["ui_state"] = ui_state
         
         return state if state else None
     
@@ -9937,9 +10265,9 @@ class MainWindow(QtWidgets.QMainWindow):
         
         # Simple Spatial Analysis specific state
         if dialog_type == "simple":
-            # Graph data
+            # Graph data - save actual DataFrame
             if hasattr(dlg, 'edge_df') and dlg.edge_df is not None and not dlg.edge_df.empty:
-                state["has_edge_df"] = True  # Will be saved as DataFrame separately if needed
+                state["edge_df"] = dlg.edge_df
             
             # Graph metadata
             if hasattr(dlg, 'metadata') and dlg.metadata:
@@ -9952,15 +10280,15 @@ class MainWindow(QtWidgets.QMainWindow):
             if hasattr(dlg, 'gid_to_cell_id') and dlg.gid_to_cell_id:
                 state["gid_to_cell_id"] = {str(k): list(v) for k, v in dlg.gid_to_cell_id.items()}
             
-            # Analysis results DataFrames (flags indicate if they exist)
-            if hasattr(dlg, 'cluster_summary_df') and dlg.cluster_summary_df is not None:
-                state["has_cluster_summary_df"] = True
+            # Analysis results DataFrames - save actual DataFrames
+            if hasattr(dlg, 'cluster_summary_df') and dlg.cluster_summary_df is not None and not dlg.cluster_summary_df.empty:
+                state["cluster_summary_df"] = dlg.cluster_summary_df
             
-            if hasattr(dlg, 'enrichment_df') and dlg.enrichment_df is not None:
-                state["has_enrichment_df"] = True
+            if hasattr(dlg, 'enrichment_df') and dlg.enrichment_df is not None and not dlg.enrichment_df.empty:
+                state["enrichment_df"] = dlg.enrichment_df
             
-            if hasattr(dlg, 'distance_df') and dlg.distance_df is not None:
-                state["has_distance_df"] = True
+            if hasattr(dlg, 'distance_df') and dlg.distance_df is not None and not dlg.distance_df.empty:
+                state["distance_df"] = dlg.distance_df
             
             # Analysis flags
             if hasattr(dlg, 'enrichment_analysis_run'):
@@ -9986,9 +10314,9 @@ class MainWindow(QtWidgets.QMainWindow):
             if hasattr(dlg, 'rng_seed'):
                 state["rng_seed"] = dlg.rng_seed
             
-            # Spatial visualization cache (may be large, save flag only)
+            # Spatial visualization cache - save actual cache data
             if hasattr(dlg, 'spatial_viz_cache') and dlg.spatial_viz_cache:
-                state["has_spatial_viz_cache"] = True
+                state["spatial_viz_cache"] = dlg.spatial_viz_cache
         
         # Advanced Spatial Analysis specific state
         elif dialog_type == "advanced":
@@ -10006,15 +10334,44 @@ class MainWindow(QtWidgets.QMainWindow):
                     for roi_id, info in dlg.processed_rois.items()
                 }
             
-            # Aggregated results (may contain DataFrames)
+            # Aggregated results - save actual results (may contain DataFrames or TempAnnData objects)
             if hasattr(dlg, 'aggregated_results') and dlg.aggregated_results:
-                state["aggregated_results"] = dlg.aggregated_results
+                # Extract data from TempAnnData objects for serialization
+                serialized_aggregated = {}
+                for key, value in dlg.aggregated_results.items():
+                    # Check if it's a TempAnnData-like object (has uns, obs, _cluster_key attributes)
+                    if hasattr(value, 'uns') and hasattr(value, 'obs') and hasattr(value, '_cluster_key'):
+                        # Serialize TempAnnData object
+                        serialized_aggregated[key] = {
+                            "__type__": "TempAnnData",
+                            "uns": value.uns if hasattr(value, 'uns') else {},
+                            "obs": value.obs if hasattr(value, 'obs') else None,
+                            "_cluster_key": value._cluster_key if hasattr(value, '_cluster_key') else None,
+                            "_significant_counts": value._significant_counts if hasattr(value, '_significant_counts') else None
+                        }
+                    else:
+                        # Regular object - let state manager handle it
+                        serialized_aggregated[key] = value
+                state["aggregated_results"] = serialized_aggregated
             
             # Graph built flag
             if hasattr(dlg, 'spatial_graph_built'):
                 state["spatial_graph_built"] = dlg.spatial_graph_built
             
-            # AnnData cache exists flag (actual objects too large to save)
+            # Save graph construction parameters so we can rebuild the graphs
+            graph_params = {}
+            if hasattr(dlg, 'graph_method_combo'):
+                graph_params["method"] = dlg.graph_method_combo.currentText()
+            if hasattr(dlg, 'graph_k_spin'):
+                graph_params["k"] = dlg.graph_k_spin.value()
+            if hasattr(dlg, 'graph_radius_spin'):
+                graph_params["radius"] = dlg.graph_radius_spin.value()
+            if hasattr(dlg, 'seed_spinbox'):
+                graph_params["seed"] = dlg.seed_spinbox.value()
+            if graph_params:
+                state["graph_construction_params"] = graph_params
+            
+            # Save which ROIs had graphs built
             if hasattr(dlg, 'anndata_cache') and dlg.anndata_cache:
                 state["has_anndata_cache"] = True
                 state["anndata_cache_rois"] = list(dlg.anndata_cache.keys())
@@ -10027,24 +10384,262 @@ class MainWindow(QtWidgets.QMainWindow):
         # but we can save the state from the last correction if available
         state = {}
         
-        # Check if batch corrected dataframe exists (indicates correction was done)
+        # Save the actual batch corrected dataframe
         if hasattr(self, 'batch_corrected_dataframe') and self.batch_corrected_dataframe is not None:
-            state["has_batch_corrected_data"] = True
+            state["batch_corrected_dataframe"] = self.batch_corrected_dataframe
         
-        # Note: Custom grouping and metadata files are typically not persisted
-        # across sessions as they're dialog-specific. However, if we need to save them,
-        # we would need to store them in MainWindow when the dialog is accepted.
-        # For now, we'll save a flag that batch correction was applied.
+        # Save custom grouping (maps acquisition_id -> group_name)
+        if hasattr(self, 'batch_correction_custom_grouping') and self.batch_correction_custom_grouping:
+            state["custom_grouping"] = self.batch_correction_custom_grouping
+        
+        # Save metadata files (dictionary with file_path as key)
+        # Each entry contains 'filename_column' and 'dataframe'
+        if hasattr(self, 'batch_correction_metadata_files') and self.batch_correction_metadata_files:
+            state["metadata_files"] = self.batch_correction_metadata_files
         
         return state if state else None
     
     def _restore_batch_correction_state(self, state: Dict[str, Any]):
-        """Restore batch correction state."""
-        # Batch correction state is primarily the corrected dataframe,
-        # which is already restored in _restore_state when loading features.
-        # Custom grouping and metadata files would need to be restored if we
-        # decide to persist them in the future.
-        pass
+        """Restore batch correction state including custom grouping and metadata files."""
+        try:
+            # Restore batch corrected dataframe
+            if "batch_corrected_dataframe" in state and state["batch_corrected_dataframe"] is not None:
+                self.batch_corrected_dataframe = state["batch_corrected_dataframe"]
+                print(f"Restored batch corrected dataframe with {len(self.batch_corrected_dataframe)} cells")
+            
+            # Restore custom grouping
+            if "custom_grouping" in state and state["custom_grouping"]:
+                self.batch_correction_custom_grouping = state["custom_grouping"]
+                print(f"Restored custom grouping with {len(self.batch_correction_custom_grouping)} groups")
+            
+            # Restore metadata files
+            if "metadata_files" in state and state["metadata_files"]:
+                self.batch_correction_metadata_files = state["metadata_files"]
+                print(f"Restored {len(self.batch_correction_metadata_files)} metadata file(s)")
+        except Exception as e:
+            print(f"Warning: Could not fully restore batch correction state: {e}")
+            import traceback
+            traceback.print_exc()
+    
+    def _collect_pixel_correlation_state(self) -> Optional[Dict[str, Any]]:
+        """Collect pixel correlation dialog state."""
+        if not hasattr(self, 'pixel_correlation_dialog') or self.pixel_correlation_dialog is None:
+            return None
+        
+        dlg = self.pixel_correlation_dialog
+        state = {}
+        
+        # Save actual correlation results DataFrames
+        if hasattr(dlg, 'correlation_results') and dlg.correlation_results is not None and not dlg.correlation_results.empty:
+            state["correlation_results"] = dlg.correlation_results
+        
+        if hasattr(dlg, 'aggregated_results') and dlg.aggregated_results is not None and not dlg.aggregated_results.empty:
+            state["aggregated_results"] = dlg.aggregated_results
+        
+        # Save analysis settings
+        if hasattr(dlg, 'analyze_within_masks'):
+            state["analyze_within_masks"] = dlg.analyze_within_masks
+        if hasattr(dlg, 'use_conditions_chk'):
+            state["use_conditions"] = bool(dlg.use_conditions_chk.isChecked())
+        
+        # Save ROI items (list of tuples: acq_id, acq_name, file_path, loader_type)
+        if hasattr(dlg, 'roi_items') and dlg.roi_items:
+            state["roi_items"] = dlg.roi_items
+        
+        # Save condition widgets data if using conditions
+        if hasattr(dlg, 'condition_widgets') and dlg.condition_widgets:
+            condition_data = []
+            for widget in dlg.condition_widgets:
+                if hasattr(widget, 'get_condition_data'):
+                    condition_name, roi_items = widget.get_condition_data()
+                    condition_data.append({
+                        "condition_name": condition_name,
+                        "roi_items": roi_items
+                    })
+            if condition_data:
+                state["condition_data"] = condition_data
+        
+        # Save UI state
+        ui_state = {}
+        # PixelCorrelationDialog uses `scope_combo` and `channel_combo`
+        if hasattr(dlg, 'scope_combo'):
+            ui_state["scope"] = dlg.scope_combo.currentText()
+        if hasattr(dlg, 'channel_combo'):
+            ui_state["channel_selection"] = dlg.channel_combo.currentText()
+        # Persist explicitly selected channels if using "Select Channels..."
+        if hasattr(dlg, '_get_selected_channels'):
+            ui_state["selected_channels"] = dlg._get_selected_channels()
+        if hasattr(dlg, 'roi_list'):
+            # Save selected ROI items
+            selected_rois = []
+            for i in range(dlg.roi_list.count()):
+                item = dlg.roi_list.item(i)
+                if item.isSelected():
+                    selected_rois.append(item.text())
+            ui_state["selected_rois"] = selected_rois
+        
+        if ui_state:
+            state["ui_state"] = ui_state
+        
+        return state if state else None
+    
+    def _restore_pixel_correlation_state(self, dialog, state: Dict[str, Any]):
+        """Restore pixel correlation dialog state."""
+        try:
+            # Restore results first (so any UI refresh uses complete state)
+            if "correlation_results" in state and state["correlation_results"] is not None and hasattr(dialog, 'correlation_results'):
+                dialog.correlation_results = state["correlation_results"]
+            if "aggregated_results" in state and state["aggregated_results"] is not None and hasattr(dialog, 'aggregated_results'):
+                dialog.aggregated_results = state["aggregated_results"]
+            
+            # Restore ROI items
+            if "roi_items" in state and state["roi_items"]:
+                if hasattr(dialog, 'roi_items'):
+                    dialog.roi_items = state["roi_items"]
+                    # Update ROI list in UI
+                    if hasattr(dialog, 'roi_list'):
+                        dialog.roi_list.clear()
+                        for acq_id, acq_name, file_path, loader_type in dialog.roi_items:
+                            # Keep display friendly; exact format isn't critical as long as list reflects content.
+                            item_text = f"{acq_name} ({os.path.basename(file_path)})"
+                            item = QtWidgets.QListWidgetItem(item_text)
+                            item.setData(Qt.UserRole, (acq_id, acq_name, file_path, loader_type))
+                            dialog.roi_list.addItem(item)
+            
+            # Restore condition widgets data
+            if "condition_data" in state and state["condition_data"]:
+                if hasattr(dialog, 'condition_widgets'):
+                    # Clear existing conditions
+                    for widget in dialog.condition_widgets[:]:
+                        widget.setParent(None)
+                        dialog.condition_widgets.remove(widget)
+                    # Restore conditions
+                    for cond_data in state["condition_data"]:
+                        widget = ConditionROIWidget(dialog)
+                        widget.setParent(dialog.conditions_container)
+                        # Set condition name (ConditionROIWidget uses `name_edit`)
+                        if hasattr(widget, 'name_edit'):
+                            widget.name_edit.setText(cond_data.get("condition_name", "") or "")
+                        # Add ROI items to widget
+                        if hasattr(widget, 'roi_items'):
+                            widget.roi_items = cond_data.get("roi_items", [])
+                            # Update widget's ROI list if it has one
+                            if hasattr(widget, 'roi_list'):
+                                widget.roi_list.clear()
+                                for acq_id, acq_name, file_path, loader_type in widget.roi_items:
+                                    item_text = f"{acq_name} ({os.path.basename(file_path)})"
+                                    item = QtWidgets.QListWidgetItem(item_text)
+                                    item.setData(Qt.UserRole, (acq_id, acq_name, file_path, loader_type))
+                                    widget.roi_list.addItem(item)
+                        dialog.condition_widgets.append(widget)
+                        if hasattr(dialog, 'conditions_layout'):
+                            dialog.conditions_layout.addWidget(widget)
+            
+            # Restore whether conditions mode was enabled
+            use_conditions = bool(state.get("use_conditions")) or bool(state.get("condition_data"))
+            if hasattr(dialog, 'use_conditions_chk'):
+                dialog.use_conditions_chk.setChecked(use_conditions)
+                # Ensure correct visibility immediately
+                if hasattr(dialog, 'conditions_group'):
+                    dialog.conditions_group.setVisible(use_conditions)
+                if hasattr(dialog, 'roi_group'):
+                    dialog.roi_group.setVisible(not use_conditions)
+            
+            # Restore analysis settings
+            if "analyze_within_masks" in state:
+                if hasattr(dialog, 'analyze_within_masks'):
+                    dialog.analyze_within_masks = state["analyze_within_masks"]
+                    # Update UI to reflect the setting (`scope_combo` exists)
+                    if hasattr(dialog, 'scope_combo'):
+                        index = 0 if state["analyze_within_masks"] else 1
+                        dialog.scope_combo.setCurrentIndex(index)
+            
+            # Restore UI state
+            if "ui_state" in state:
+                ui_state = state["ui_state"]
+                if "scope" in ui_state and hasattr(dialog, 'scope_combo'):
+                    index = dialog.scope_combo.findText(ui_state["scope"])
+                    if index >= 0:
+                        dialog.scope_combo.setCurrentIndex(index)
+                if "channel_selection" in ui_state and hasattr(dialog, 'channel_combo'):
+                    index = dialog.channel_combo.findText(ui_state["channel_selection"])
+                    if index >= 0:
+                        dialog.channel_combo.setCurrentIndex(index)
+                
+                # Restore selected channels checks if in "Select Channels..." mode
+                if ui_state.get("selected_channels") is not None and hasattr(dialog, 'channel_list'):
+                    # Ensure the channel list is populated before applying checks
+                    if hasattr(dialog, '_populate_channel_list'):
+                        try:
+                            dialog._populate_channel_list()
+                        except Exception:
+                            pass
+                    selected = set(ui_state.get("selected_channels") or [])
+                    for i in range(dialog.channel_list.count()):
+                        item = dialog.channel_list.item(i)
+                        # Only toggle checkable items
+                        if item.flags() & Qt.ItemIsUserCheckable:
+                            item.setCheckState(Qt.Checked if item.text() in selected else Qt.Unchecked)
+                if "selected_rois" in ui_state and hasattr(dialog, 'roi_list'):
+                    # Restore selected ROIs
+                    for i in range(dialog.roi_list.count()):
+                        item = dialog.roi_list.item(i)
+                        if item.text() in ui_state["selected_rois"]:
+                            item.setSelected(True)
+            
+            # Recompute scope availability based on restored ROIs/masks
+            if hasattr(dialog, '_check_masks_available'):
+                try:
+                    dialog._check_masks_available()
+                except Exception:
+                    pass
+            
+            # Refresh results UI if any results exist
+            if hasattr(dialog, '_update_results_display') and getattr(dialog, 'aggregated_results', None) is not None:
+                try:
+                    dialog._update_results_display(use_conditions)
+                except Exception as e:
+                    print(f"Warning: Could not update pixel correlation results display: {e}")
+        except Exception as e:
+            print(f"Warning: Could not fully restore pixel correlation state: {e}")
+            import traceback
+            traceback.print_exc()
+    
+    def _restore_qc_ui_state(self, dialog, ui_state: Dict[str, Any]):
+        """Restore QC analysis dialog UI state."""
+        try:
+            # Restore analysis mode (pixel/cell)
+            if "analysis_mode" in ui_state and hasattr(dialog, 'mode_combo'):
+                index = dialog.mode_combo.findText(ui_state["analysis_mode"])
+                if index >= 0:
+                    dialog.mode_combo.setCurrentIndex(index)
+            
+            # Restore selected acquisition
+            if "selected_acquisition" in ui_state and hasattr(dialog, 'acq_combo'):
+                index = dialog.acq_combo.findText(ui_state["selected_acquisition"])
+                if index >= 0:
+                    dialog.acq_combo.setCurrentIndex(index)
+            
+            # Restore number of workers
+            if "num_workers" in ui_state and hasattr(dialog, 'workers_spin'):
+                dialog.workers_spin.setValue(ui_state["num_workers"])
+            
+            # Refresh QC results display if results are cached
+            if hasattr(dialog, 'qc_results_aggregated') and dialog.qc_results_aggregated is not None:
+                if hasattr(dialog, '_update_summary_table'):
+                    try:
+                        dialog._update_summary_table()
+                    except Exception:
+                        pass
+                if hasattr(dialog, '_update_plots'):
+                    try:
+                        dialog._update_plots()
+                    except Exception:
+                        pass
+        except Exception as e:
+            print(f"Warning: Could not fully restore QC UI state: {e}")
+            import traceback
+            traceback.print_exc()
     
     def _restore_state(self, loaded_state: Dict[str, Any], state_path: Path):
         """Restore application state from loaded data."""
@@ -10326,6 +10921,13 @@ class MainWindow(QtWidgets.QMainWindow):
         if "batch_corrected" in features:
             self.batch_corrected_dataframe = features["batch_corrected"]
         
+        # Restore clustered cells dataframe (cells actually used in clustering)
+        if "clustered_cells" in features:
+            self.clustered_cells_dataframe = features["clustered_cells"]
+            print(f"[Restore State] Restored clustered_cells dataframe with {len(self.clustered_cells_dataframe)} cells")
+        else:
+            self.clustered_cells_dataframe = None
+        
         # Restore analysis module states
         analysis = loaded_state.get("analysis", {})
         
@@ -10333,7 +10935,15 @@ class MainWindow(QtWidgets.QMainWindow):
         if "qc_analysis" in analysis:
             if not hasattr(self, 'qc_results_cache'):
                 self.qc_results_cache = {}
-            self.qc_results_cache.update(analysis["qc_analysis"])
+            qc_state = analysis["qc_analysis"]
+            # Separate UI state from cache data
+            if "ui_state" in qc_state:
+                self._saved_qc_ui_state = qc_state["ui_state"]
+                # Remove UI state from cache data
+                qc_cache = {k: v for k, v in qc_state.items() if k != "ui_state"}
+                self.qc_results_cache.update(qc_cache)
+            else:
+                self.qc_results_cache.update(qc_state)
         
         # Restore clustering state
         if "clustering" in analysis:
@@ -10357,6 +10967,13 @@ class MainWindow(QtWidgets.QMainWindow):
             batch_correction_state = analysis["batch_correction"]
             self._restore_batch_correction_state(batch_correction_state)
         
+        # Restore pixel correlation state (dialog restored when opened)
+        if "pixel_correlation" in analysis:
+            pixel_state = analysis["pixel_correlation"]
+            if not hasattr(self, '_saved_pixel_correlation_state'):
+                self._saved_pixel_correlation_state = {}
+            self._saved_pixel_correlation_state = pixel_state
+        
         # Update UI to reflect loaded state
         if self.feature_dataframe is not None:
             # Enable buttons that depend on features
@@ -10370,10 +10987,64 @@ class MainWindow(QtWidgets.QMainWindow):
     def _restore_clustering_state(self, dialog, state: Dict[str, Any]):
         """Restore clustering dialog state including all parameters."""
         try:
-            # Restore cluster labels if available
-            if "cluster_labels" in state and state["cluster_labels"] is not None:
-                if hasattr(dialog, 'cluster_labels'):
-                    dialog.cluster_labels = state["cluster_labels"]
+            # Restore clustered_data directly from saved clustered_cells dataframe
+            # This is the cleanest approach - we saved exactly what cells were clustered
+            if hasattr(self, 'clustered_cells_dataframe') and self.clustered_cells_dataframe is not None:
+                print(f"[Restore Clustering] Using clustered_cells_dataframe with {len(self.clustered_cells_dataframe)} cells")
+                dialog.clustered_data = self.clustered_cells_dataframe.copy()
+                dialog.clustered_data = dialog.clustered_data.sort_values('cluster')
+                dialog.clustered_data_unscaled = dialog.clustered_data.copy()
+                
+                # Extract cluster_labels for compatibility
+                if 'cluster' in dialog.clustered_data.columns:
+                    dialog.cluster_labels = dialog.clustered_data['cluster'].values
+                    print(f"[Restore Clustering] Unique clusters: {sorted(dialog.clustered_data['cluster'].unique())}")
+            else:
+                # Fallback: Use old method if clustered_cells_dataframe not available (backward compatibility)
+                print(f"[Restore Clustering] Fallback: clustered_cells_dataframe not found, using cluster_labels")
+                if "cluster_labels" in state and state["cluster_labels"] is not None:
+                    if hasattr(dialog, 'cluster_labels'):
+                        dialog.cluster_labels = state["cluster_labels"]
+                        # Apply cluster labels to feature_dataframe and create clustered_data
+                        if (hasattr(dialog, 'feature_dataframe') and dialog.feature_dataframe is not None and
+                            dialog.cluster_labels is not None):
+                            
+                            # Check if feature_dataframe already has a cluster column
+                            if 'cluster' in dialog.feature_dataframe.columns:
+                                print(f"[Restore Clustering] feature_dataframe already has cluster column")
+                                # Use existing cluster column, filter out cluster 0
+                                valid_cluster_mask = (dialog.feature_dataframe['cluster'] != 0) & (dialog.feature_dataframe['cluster'].notna())
+                                dialog.clustered_data = dialog.feature_dataframe[valid_cluster_mask].copy()
+                                print(f"[Restore Clustering] Created clustered_data with {len(dialog.clustered_data)} cells")
+                                dialog.clustered_data = dialog.clustered_data.sort_values('cluster')
+                                dialog.clustered_data_unscaled = dialog.clustered_data.copy()
+                            else:
+                                # Apply cluster_labels to feature_dataframe
+                                if isinstance(dialog.cluster_labels, pd.Series):
+                                    cluster_labels_array = dialog.cluster_labels.values
+                                elif isinstance(dialog.cluster_labels, np.ndarray):
+                                    cluster_labels_array = dialog.cluster_labels
+                                else:
+                                    cluster_labels_array = np.array(dialog.cluster_labels)
+                                
+                                if len(cluster_labels_array) == len(dialog.feature_dataframe):
+                                    dialog.feature_dataframe['cluster'] = cluster_labels_array.astype(int)
+                                    valid_cluster_mask = (dialog.feature_dataframe['cluster'] != 0) & (dialog.feature_dataframe['cluster'].notna())
+                                    dialog.clustered_data = dialog.feature_dataframe[valid_cluster_mask].copy()
+                                    dialog.clustered_data = dialog.clustered_data.sort_values('cluster')
+                                    dialog.clustered_data_unscaled = dialog.clustered_data.copy()
+                                elif hasattr(dialog, 'filter_settings') and dialog.filter_settings is not None:
+                                    # Try with filter settings
+                                    from openimc.ui.dialogs.clustering import CellClusteringDialog
+                                    if isinstance(dialog, CellClusteringDialog):
+                                        filtered_df = dialog._apply_filters(dialog.feature_dataframe.copy(), dialog.filter_settings)
+                                        if len(cluster_labels_array) == len(filtered_df):
+                                            dialog.feature_dataframe['cluster'] = 0
+                                            dialog.feature_dataframe.loc[filtered_df.index, 'cluster'] = cluster_labels_array.astype(int)
+                                            valid_cluster_mask = (dialog.feature_dataframe['cluster'] != 0) & (dialog.feature_dataframe['cluster'].notna())
+                                            dialog.clustered_data = dialog.feature_dataframe[valid_cluster_mask].copy()
+                                            dialog.clustered_data = dialog.clustered_data.sort_values('cluster')
+                                            dialog.clustered_data_unscaled = dialog.clustered_data.copy()
             
             # Restore normalization config
             if "normalization_config" in state and state["normalization_config"]:
@@ -10390,10 +11061,15 @@ class MainWindow(QtWidgets.QMainWindow):
                 if hasattr(dialog, 'filter_settings'):
                     dialog.filter_settings = state["filter_settings"]
             
-            # Restore scaling method (z-score/mad/none)
+            # Restore scaling method (z-score/mad/none) - both attribute and UI
             if "clustering_scaling_method" in state and state["clustering_scaling_method"]:
-                if hasattr(dialog, 'clustering_scaling_method'):
-                    dialog.clustering_scaling_method = state["clustering_scaling_method"]
+                dialog.clustering_scaling_method = state["clustering_scaling_method"]
+                # Also set the UI combo box
+                if hasattr(dialog, 'clustering_scaling_combo'):
+                    dialog.clustering_scaling_combo.blockSignals(True)
+                    dialog.clustering_scaling_combo.setCurrentText(state["clustering_scaling_method"])
+                    dialog.clustering_scaling_combo.blockSignals(False)
+                    print(f"[Restore Clustering] Restored clustering scaling method: {state['clustering_scaling_method']}")
             
             # Restore custom names
             if "feature_label_map" in state and state["feature_label_map"]:
@@ -10430,6 +11106,13 @@ class MainWindow(QtWidgets.QMainWindow):
                 if hasattr(dialog, 'cluster_map_zscore_method'):
                     dialog.cluster_map_zscore_method = state["cluster_map_zscore_method"]
             
+            # Restore heatmap scaling
+            if "heatmap_scaling" in state:
+                if hasattr(dialog, 'heatmap_scaling_combo'):
+                    dialog.heatmap_scaling_combo.blockSignals(True)
+                    dialog.heatmap_scaling_combo.setCurrentText(state["heatmap_scaling"])
+                    dialog.heatmap_scaling_combo.blockSignals(False)
+            
             # Restore patient annotation settings
             if "patient_annotation_column" in state:
                 if hasattr(dialog, 'patient_annotation_column'):
@@ -10443,6 +11126,22 @@ class MainWindow(QtWidgets.QMainWindow):
                 if hasattr(dialog, 'patient_legend_label'):
                     dialog.patient_legend_label = state["patient_legend_label"]
             
+            # Restore plot customization settings (font sizes, legend layout)
+            if "x_tick_fontsize" in state:
+                dialog.x_tick_fontsize = state["x_tick_fontsize"]
+            
+            if "y_tick_fontsize" in state:
+                dialog.y_tick_fontsize = state["y_tick_fontsize"]
+            
+            if "legend_fontsize" in state:
+                dialog.legend_fontsize = state["legend_fontsize"]
+            
+            if "legend_nrows" in state:
+                dialog.legend_nrows = state["legend_nrows"]
+            
+            if "legend_ncols" in state:
+                dialog.legend_ncols = state["legend_ncols"]
+            
             # Restore clustering method and parameters (for reference)
             if "clustering_method" in state:
                 if hasattr(dialog, 'last_clustering_method'):
@@ -10453,13 +11152,333 @@ class MainWindow(QtWidgets.QMainWindow):
                     dialog.last_clustering_params = state["clustering_parameters"]
             
             if "features_used" in state:
-                if hasattr(dialog, 'last_features_used'):
-                    dialog.last_features_used = state["features_used"]
+                # Initialize attribute if it doesn't exist
+                dialog.last_features_used = state["features_used"]
+            
+            # Restore actual clustering method and dendrogram mode (what was actually used)
+            if "actual_clustering_method" in state:
+                dialog.actual_clustering_method = state["actual_clustering_method"]
+            
+            if "actual_dendrogram_mode" in state:
+                dialog.actual_dendrogram_mode = state["actual_dendrogram_mode"]
+            
+            # Restore LLM phenotype cache
+            if "llm_phenotype_cache" in state:
+                cached_data = state["llm_phenotype_cache"]
+                if hasattr(dialog, 'llm_phenotype_cache'):
+                    # Restore cache, ensuring it's a proper dict
+                    if cached_data:
+                        dialog.llm_phenotype_cache = copy.deepcopy(cached_data)
+                    else:
+                        dialog.llm_phenotype_cache = {}
+            else:
+                # Ensure cache is initialized even if not in saved state
+                if hasattr(dialog, 'llm_phenotype_cache'):
+                    if not isinstance(dialog.llm_phenotype_cache, dict):
+                        dialog.llm_phenotype_cache = {}
+            
+            # Restore selected display features for heatmap
+            if "selected_display_features" in state and state["selected_display_features"]:
+                if hasattr(dialog, 'selected_display_features'):
+                    # Convert to set if it's a list
+                    if isinstance(state["selected_display_features"], list):
+                        dialog.selected_display_features = set(state["selected_display_features"])
+                    else:
+                        dialog.selected_display_features = state["selected_display_features"]
+            
+            # Restore UMAP and t-SNE embeddings
+            if "umap_embedding" in state and state["umap_embedding"] is not None:
+                if hasattr(dialog, 'umap_embedding'):
+                    dialog.umap_embedding = state["umap_embedding"]
+                    # Restore corresponding index if available
+                    if "umap_index" in state and state["umap_index"] is not None:
+                        if hasattr(dialog, 'umap_index'):
+                            dialog.umap_index = pd.Index(state["umap_index"])
+                            # Safety check: ensure umap_index aligns with clustered_data if it exists
+                            if hasattr(dialog, 'clustered_data') and dialog.clustered_data is not None:
+                                # UMAP should only include cells that were actually clustered
+                                # Filter umap_index to only include indices present in clustered_data
+                                valid_indices = [idx for idx in dialog.umap_index if idx in dialog.clustered_data.index]
+                                if len(valid_indices) != len(dialog.umap_index):
+                                    # Some indices in UMAP are not in clustered_data
+                                    # This can happen if cells were filtered out
+                                    if len(valid_indices) == len(dialog.umap_embedding):
+                                        # Perfect match - just update index
+                                        dialog.umap_index = pd.Index(valid_indices)
+                                    elif len(dialog.umap_embedding) == len(dialog.clustered_data):
+                                        # Embedding matches clustered_data size, use its index
+                                        dialog.umap_index = dialog.clustered_data.index
+                                    else:
+                                        # Can't reconcile - clear UMAP state to avoid errors
+                                        print(f"Warning: UMAP state mismatch - umap_embedding size: {len(dialog.umap_embedding)}, "
+                                              f"clustered_data size: {len(dialog.clustered_data)}, valid_indices: {len(valid_indices)}")
+                                        dialog.umap_embedding = None
+                                        dialog.umap_index = None
+                                elif len(dialog.umap_embedding) != len(dialog.umap_index):
+                                    # Embedding size doesn't match index size
+                                    print(f"Warning: UMAP embedding size ({len(dialog.umap_embedding)}) != "
+                                          f"index size ({len(dialog.umap_index)})")
+                                    # Try to reconcile
+                                    min_len = min(len(dialog.umap_embedding), len(dialog.umap_index))
+                                    dialog.umap_embedding = dialog.umap_embedding[:min_len]
+                                    dialog.umap_index = dialog.umap_index[:min_len]
+            
+            if "tsne_embedding" in state and state["tsne_embedding"] is not None:
+                if hasattr(dialog, 'tsne_embedding'):
+                    dialog.tsne_embedding = state["tsne_embedding"]
+                    # Restore corresponding index if available
+                    if "tsne_index" in state and state["tsne_index"] is not None:
+                        if hasattr(dialog, 'tsne_index'):
+                            dialog.tsne_index = pd.Index(state["tsne_index"])
+            
+            # Restore UI element states
+            if "ui_state" in state:
+                ui_state = state["ui_state"]
+                
+                # View selection
+                if "view" in ui_state and hasattr(dialog, 'view_combo'):
+                    index = dialog.view_combo.findText(ui_state["view"])
+                    if index >= 0:
+                        dialog.view_combo.blockSignals(True)
+                        dialog.view_combo.setCurrentIndex(index)
+                        dialog.view_combo.blockSignals(False)
+                
+                # Feature set selection
+                if "feature_set" in ui_state and hasattr(dialog, 'feature_set_combo'):
+                    dialog.feature_set_combo.blockSignals(True)
+                    dialog.feature_set_combo.setCurrentText(ui_state["feature_set"])
+                    dialog.feature_set_combo.blockSignals(False)
+                
+                # Clustering method and parameters
+                if "clustering_type" in ui_state and hasattr(dialog, 'clustering_type'):
+                    dialog.clustering_type.blockSignals(True)
+                    dialog.clustering_type.setCurrentText(ui_state["clustering_type"])
+                    dialog.clustering_type.blockSignals(False)
+                
+                if "n_clusters" in ui_state and hasattr(dialog, 'n_clusters'):
+                    dialog.n_clusters.setValue(ui_state["n_clusters"])
+                
+                if "seed" in ui_state and hasattr(dialog, 'seed_spinbox'):
+                    dialog.seed_spinbox.setValue(ui_state["seed"])
+                
+                # Hierarchical clustering
+                if "hierarchical_method" in ui_state and hasattr(dialog, 'hierarchical_method'):
+                    dialog.hierarchical_method.setCurrentText(ui_state["hierarchical_method"])
+                
+                # Leiden clustering
+                if "leiden_mode" in ui_state:
+                    if ui_state["leiden_mode"] == "resolution" and hasattr(dialog, 'resolution_radio'):
+                        dialog.resolution_radio.setChecked(True)
+                    elif hasattr(dialog, 'modularity_radio'):
+                        dialog.modularity_radio.setChecked(True)
+                
+                if "n_neighbors" in ui_state and hasattr(dialog, 'n_neighbors_spinbox'):
+                    dialog.n_neighbors_spinbox.setValue(ui_state["n_neighbors"])
+                
+                if "resolution" in ui_state and hasattr(dialog, 'resolution_spinbox'):
+                    dialog.resolution_spinbox.setValue(ui_state["resolution"])
+                
+                if "leiden_metric" in ui_state and hasattr(dialog, 'leiden_metric_combo'):
+                    dialog.leiden_metric_combo.setCurrentText(ui_state["leiden_metric"])
+                
+                if "jaccard_weighting" in ui_state and hasattr(dialog, 'jaccard_checkbox'):
+                    dialog.jaccard_checkbox.setChecked(ui_state["jaccard_weighting"])
+                
+                # HDBSCAN clustering
+                if "min_cluster_size" in ui_state and hasattr(dialog, 'min_cluster_size_spinbox'):
+                    dialog.min_cluster_size_spinbox.setValue(ui_state["min_cluster_size"])
+                
+                if "min_samples" in ui_state and hasattr(dialog, 'min_samples_spinbox'):
+                    dialog.min_samples_spinbox.setValue(ui_state["min_samples"])
+                
+                if "cluster_selection_method" in ui_state and hasattr(dialog, 'cluster_selection_combo'):
+                    dialog.cluster_selection_combo.setCurrentText(ui_state["cluster_selection_method"])
+                
+                if "metric" in ui_state and hasattr(dialog, 'metric_combo'):
+                    dialog.metric_combo.setCurrentText(ui_state["metric"])
+                
+                # Dendrogram mode
+                if "dendro_mode" in ui_state and hasattr(dialog, 'dendro_mode'):
+                    dialog.dendro_mode.setCurrentText(ui_state["dendro_mode"])
+                
+                # Visualization settings
+                if "color_by" in ui_state and hasattr(dialog, 'color_by_listwidget'):
+                    dialog.color_by_listwidget.clearSelection()
+                    for i in range(dialog.color_by_listwidget.count()):
+                        item = dialog.color_by_listwidget.item(i)
+                        if item.text() in ui_state["color_by"]:
+                            item.setSelected(True)
+                    # Trigger update
+                    if hasattr(dialog, '_on_color_by_changed'):
+                        dialog._on_color_by_changed()
+                
+                if "use_cohort_coloring" in ui_state and hasattr(dialog, 'use_cohort_checkbox'):
+                    dialog.use_cohort_checkbox.setChecked(ui_state["use_cohort_coloring"])
+                
+                if "point_size" in ui_state and hasattr(dialog, 'point_size_spinbox'):
+                    dialog.point_size_spinbox.setValue(ui_state["point_size"])
+                
+                if "point_alpha" in ui_state and hasattr(dialog, 'point_alpha_spinbox'):
+                    dialog.point_alpha_spinbox.setValue(ui_state["point_alpha"])
+                
+                if "show_legend" in ui_state and hasattr(dialog, 'show_legend_checkbox'):
+                    dialog.show_legend_checkbox.setChecked(ui_state["show_legend"])
+                
+                if "group_by" in ui_state and hasattr(dialog, 'group_by_combo'):
+                    index = dialog.group_by_combo.findText(ui_state["group_by"])
+                    if index >= 0:
+                        dialog.group_by_combo.setCurrentIndex(index)
+                
+                if "stacked_bars_view_type" in ui_state and hasattr(dialog, 'stacked_bars_view_type_combo'):
+                    dialog.stacked_bars_view_type_combo.setCurrentText(ui_state["stacked_bars_view_type"])
+                
+                if "colormap" in ui_state and hasattr(dialog, 'colormap_combo'):
+                    dialog.colormap_combo.setCurrentText(ui_state["colormap"])
+                
+                if "top_n" in ui_state and hasattr(dialog, 'top_n_spinbox'):
+                    dialog.top_n_spinbox.setValue(ui_state["top_n"])
+                
+                if "stacked_bars_filter_selection" in ui_state and hasattr(dialog, 'stacked_bars_filter_selection'):
+                    dialog.stacked_bars_filter_selection = set(ui_state["stacked_bars_filter_selection"])
+                
+                # Update clustering method UI to show/hide appropriate controls
+                if hasattr(dialog, '_on_clustering_type_changed'):
+                    try:
+                        dialog._on_clustering_type_changed()
+                    except Exception as e:
+                        print(f"Warning: Could not update clustering method UI: {e}")
+                
+                # Update Leiden mode UI if applicable
+                if hasattr(dialog, '_on_leiden_mode_changed'):
+                    try:
+                        dialog._on_leiden_mode_changed()
+                    except Exception as e:
+                        print(f"Warning: Could not update Leiden mode UI: {e}")
+            
+            # After restoring state, ensure clustered_data is properly set up and redraw heatmap
+            if (hasattr(dialog, 'cluster_labels') and dialog.cluster_labels is not None and
+                hasattr(dialog, 'feature_dataframe') and dialog.feature_dataframe is not None):
+                # Ensure clustered_data is set up from feature_dataframe with cluster column
+                if 'cluster' in dialog.feature_dataframe.columns:
+                    dialog.clustered_data = dialog.feature_dataframe.copy()
+                    dialog.clustered_data = dialog.clustered_data.sort_values('cluster')
+                    dialog.clustered_data_unscaled = dialog.clustered_data.copy()
+                
+                # Determine which view to restore
+                restored_view = None
+                if "ui_state" in state and "view" in state["ui_state"]:
+                    restored_view = state["ui_state"]["view"]
+                
+                # Redraw appropriate view if we have the necessary data
+                if hasattr(dialog, 'clustered_data') and dialog.clustered_data is not None:
+                    # Set view if specified, otherwise default to Heatmap if features are selected
+                    if restored_view and hasattr(dialog, 'view_combo'):
+                        dialog.view_combo.blockSignals(True)
+                        dialog.view_combo.setCurrentText(restored_view)
+                        dialog.view_combo.blockSignals(False)
+                    elif (hasattr(dialog, 'selected_display_features') and dialog.selected_display_features and
+                          hasattr(dialog, 'view_combo')):
+                        dialog.view_combo.blockSignals(True)
+                        dialog.view_combo.setCurrentText('Heatmap')
+                        dialog.view_combo.blockSignals(False)
+                    
+                    # Trigger appropriate view redraw
+                    if restored_view == 'Heatmap' or (not restored_view and dialog.selected_display_features):
+                        if hasattr(dialog, '_show_heatmap'):
+                            try:
+                                dialog._show_heatmap()
+                            except Exception as e:
+                                print(f"Warning: Could not redraw heatmap after state restoration: {e}")
+                    elif restored_view == 'UMAP' and hasattr(dialog, 'umap_embedding') and dialog.umap_embedding is not None:
+                        if hasattr(dialog, '_show_umap'):
+                            try:
+                                dialog._show_umap()
+                            except Exception as e:
+                                print(f"Warning: Could not redraw UMAP after state restoration: {e}")
+                    elif restored_view == 't-SNE' and hasattr(dialog, 'tsne_embedding') and dialog.tsne_embedding is not None:
+                        if hasattr(dialog, '_show_tsne'):
+                            try:
+                                dialog._show_tsne()
+                            except Exception as e:
+                                print(f"Warning: Could not redraw t-SNE after state restoration: {e}")
             
             # Note: Clustered data will be regenerated when needed
             # The cluster labels and all settings are the key state that needs to be restored
         except Exception as e:
             print(f"Warning: Could not fully restore clustering state: {e}")
+            import traceback
+            traceback.print_exc()
+    
+    def _rebuild_adj_matrices_for_simple_spatial(self, dialog):
+        """Rebuild adjacency matrices from edge_df for simple spatial analysis."""
+        try:
+            # Import scipy.sparse if available
+            try:
+                from scipy import sparse as sp
+                _HAVE_SPARSE = True
+            except ImportError:
+                _HAVE_SPARSE = False
+                print("Warning: scipy.sparse not available, cannot rebuild adjacency matrices")
+                return
+            
+            # Get filtered dataframe
+            filtered_df = dialog.feature_dataframe
+            roi_col = dialog._get_roi_column() if hasattr(dialog, '_get_roi_column') else None
+            
+            if not roi_col or roi_col not in filtered_df.columns:
+                # No ROI grouping, treat as single ROI
+                roi_groups = [(None, filtered_df)]
+            else:
+                roi_groups = list(filtered_df.groupby(roi_col))
+            
+            # Initialize adjacency matrices dict
+            dialog.adj_matrices = {}
+            global_id_counter = 0
+            
+            for roi_id, roi_df in roi_groups:
+                roi_id_str = str(roi_id) if roi_id is not None else "global"
+                roi_edges = dialog.edge_df[dialog.edge_df['roi_id'] == roi_id_str] if 'roi_id' in dialog.edge_df.columns else dialog.edge_df
+                
+                if roi_edges.empty:
+                    continue
+                
+                # Get cell IDs for this ROI
+                cell_ids = roi_df["cell_id"].astype(int).to_numpy() if 'cell_id' in roi_df.columns else roi_df.index.values
+                n_cells = len(cell_ids)
+                
+                # Build local cell_id to global_id mapping for this ROI
+                roi_cell_to_gid = {}
+                for cell_id in cell_ids:
+                    roi_cell_to_gid[cell_id] = global_id_counter
+                    global_id_counter += 1
+                
+                # Build adjacency matrix from edges
+                rows, cols, data = [], [], []
+                for _, edge in roi_edges.iterrows():
+                    src_cell_id = int(edge['cell_id_A'])
+                    dst_cell_id = int(edge['cell_id_B'])
+                    
+                    if src_cell_id in roi_cell_to_gid and dst_cell_id in roi_cell_to_gid:
+                        src_gid = roi_cell_to_gid[src_cell_id]
+                        dst_gid = roi_cell_to_gid[dst_cell_id]
+                        
+                        # Convert global IDs to local indices for this ROI
+                        src_local = src_gid - (global_id_counter - n_cells)
+                        dst_local = dst_gid - (global_id_counter - n_cells)
+                        
+                        # Add both directions (undirected graph)
+                        rows.extend([src_local, dst_local])
+                        cols.extend([dst_local, src_local])
+                        data.extend([1.0, 1.0])
+                
+                if rows:
+                    adj_matrix = sp.coo_matrix((data, (rows, cols)), shape=(n_cells, n_cells))
+                    dialog.adj_matrices[roi_id_str] = adj_matrix.tocsr()
+            
+            print(f"Rebuilt {len(dialog.adj_matrices)} adjacency matrices from edge DataFrame")
+            
+        except Exception as e:
+            print(f"Error rebuilding adjacency matrices: {e}")
             import traceback
             traceback.print_exc()
     
@@ -10475,6 +11494,11 @@ class MainWindow(QtWidgets.QMainWindow):
             
             # Simple Spatial Analysis specific restoration
             if dialog_type == "simple":
+                # Restore graph data - actual DataFrame
+                if "edge_df" in state and state["edge_df"] is not None:
+                    if hasattr(dialog, 'edge_df'):
+                        dialog.edge_df = state["edge_df"]
+                
                 # Restore metadata
                 if "metadata" in state and state["metadata"]:
                     if hasattr(dialog, 'metadata'):
@@ -10506,6 +11530,57 @@ class MainWindow(QtWidgets.QMainWindow):
                         except Exception as e:
                             print(f"Warning: Could not restore gid_to_cell_id: {e}")
                 
+                # Rebuild adjacency matrices from edge_df
+                # This is critical for enabling spatial analysis tabs
+                if hasattr(dialog, 'edge_df') and dialog.edge_df is not None and not dialog.edge_df.empty:
+                    try:
+                        self._rebuild_adj_matrices_for_simple_spatial(dialog)
+                    except Exception as e:
+                        print(f"Warning: Could not rebuild adjacency matrices: {e}")
+                        import traceback
+                        traceback.print_exc()
+                
+                # Restore analysis results DataFrames - actual DataFrames
+                if "cluster_summary_df" in state and state["cluster_summary_df"] is not None:
+                    if hasattr(dialog, 'cluster_summary_df'):
+                        dialog.cluster_summary_df = state["cluster_summary_df"]
+                        # Update UI if there's a method to display cluster summary
+                        if hasattr(dialog, '_update_cluster_summary_display'):
+                            try:
+                                dialog._update_cluster_summary_display()
+                            except Exception as e:
+                                print(f"Warning: Could not update cluster summary display: {e}")
+                
+                if "enrichment_df" in state and state["enrichment_df"] is not None:
+                    if hasattr(dialog, 'enrichment_df'):
+                        dialog.enrichment_df = state["enrichment_df"]
+                        # Update UI - call the correct method to display enrichment plot
+                        if hasattr(dialog, '_update_enrichment_plot'):
+                            try:
+                                dialog._update_enrichment_plot()
+                            except Exception as e:
+                                print(f"Warning: Could not update enrichment plot: {e}")
+                
+                if "distance_df" in state and state["distance_df"] is not None:
+                    if hasattr(dialog, 'distance_df'):
+                        dialog.distance_df = state["distance_df"]
+                        # Update UI - populate cluster list and update distance plot
+                        if hasattr(dialog, '_populate_distance_cluster_list'):
+                            try:
+                                dialog._populate_distance_cluster_list()
+                            except Exception as e:
+                                print(f"Warning: Could not populate distance cluster list: {e}")
+                        if hasattr(dialog, '_update_distance_plot'):
+                            try:
+                                dialog._update_distance_plot()
+                            except Exception as e:
+                                print(f"Warning: Could not update distance plot: {e}")
+                
+                # Restore spatial visualization cache
+                if "spatial_viz_cache" in state and state["spatial_viz_cache"]:
+                    if hasattr(dialog, 'spatial_viz_cache'):
+                        dialog.spatial_viz_cache = state["spatial_viz_cache"]
+                
                 # Restore analysis flags
                 if "enrichment_analysis_run" in state:
                     if hasattr(dialog, 'enrichment_analysis_run'):
@@ -10536,6 +11611,15 @@ class MainWindow(QtWidgets.QMainWindow):
                 if "rng_seed" in state:
                     if hasattr(dialog, 'rng_seed'):
                         dialog.rng_seed = state["rng_seed"]
+                
+                # Update tab states after restoring all state
+                # This is critical for enabling tabs and buttons based on restored data
+                if hasattr(dialog, '_update_tab_states'):
+                    try:
+                        dialog._update_tab_states()
+                        print("Updated tab states after spatial analysis state restoration")
+                    except Exception as e:
+                        print(f"Warning: Could not update tab states: {e}")
             
             # Advanced Spatial Analysis specific restoration
             elif dialog_type == "advanced":
@@ -10552,16 +11636,160 @@ class MainWindow(QtWidgets.QMainWindow):
                 # Restore aggregated results
                 if "aggregated_results" in state and state["aggregated_results"]:
                     if hasattr(dialog, 'aggregated_results'):
-                        dialog.aggregated_results = state["aggregated_results"]
+                        # Reconstruct TempAnnData objects if needed
+                        restored_aggregated = {}
+                        for key, value in state["aggregated_results"].items():
+                            # Check if it's a serialized TempAnnData object
+                            if isinstance(value, dict) and value.get("__type__") == "TempAnnData":
+                                # Reconstruct TempAnnData object
+                                class TempAnnData:
+                                    def __init__(self, matrix, cluster_key, obs, significant_counts=None):
+                                        self.uns = {'nhood_enrichment': {'zscore': matrix}}
+                                        self.obs = obs
+                                        self._cluster_key = cluster_key
+                                        self._significant_counts = significant_counts
+                                
+                                # Extract data from serialized format
+                                uns_data = value.get("uns", {})
+                                obs_data = value.get("obs")
+                                cluster_key = value.get("_cluster_key")
+                                significant_counts = value.get("_significant_counts")
+                                
+                                # Extract matrix from uns structure
+                                matrix = None
+                                if 'nhood_enrichment' in uns_data:
+                                    if isinstance(uns_data['nhood_enrichment'], dict):
+                                        matrix = uns_data['nhood_enrichment'].get('zscore')
+                                    else:
+                                        matrix = uns_data['nhood_enrichment']
+                                
+                                if matrix is not None and obs_data is not None and cluster_key is not None:
+                                    temp_adata = TempAnnData(matrix, cluster_key, obs_data, significant_counts)
+                                    restored_aggregated[key] = temp_adata
+                                else:
+                                    # Fallback: try to use value as-is if it's already an AnnData-like object
+                                    restored_aggregated[key] = value
+                            else:
+                                # Regular object - use as-is
+                                restored_aggregated[key] = value
+                        
+                        dialog.aggregated_results = restored_aggregated
                 
                 # Restore graph built flag
                 if "spatial_graph_built" in state:
                     if hasattr(dialog, 'spatial_graph_built'):
                         dialog.spatial_graph_built = state["spatial_graph_built"]
+                
+                # Restore graph construction parameters and rebuild graphs if they existed
+                if "graph_construction_params" in state and state["has_anndata_cache"]:
+                    graph_params = state["graph_construction_params"]
+                    
+                    # Set UI controls to saved values
+                    if "method" in graph_params and hasattr(dialog, 'graph_method_combo'):
+                        index = dialog.graph_method_combo.findText(graph_params["method"])
+                        if index >= 0:
+                            dialog.graph_method_combo.setCurrentIndex(index)
+                    
+                    if "k" in graph_params and hasattr(dialog, 'graph_k_spin'):
+                        dialog.graph_k_spin.setValue(graph_params["k"])
+                    
+                    if "radius" in graph_params and hasattr(dialog, 'graph_radius_spin'):
+                        dialog.graph_radius_spin.setValue(graph_params["radius"])
+                    
+                    if "seed" in graph_params and hasattr(dialog, 'seed_spinbox'):
+                        dialog.seed_spinbox.setValue(graph_params["seed"])
+                    
+                    # Rebuild spatial graphs with saved parameters
+                    # This is critical for enabling analysis tabs
+                    if hasattr(dialog, '_create_spatial_graph'):
+                        try:
+                            print("Rebuilding spatial graphs for advanced spatial analysis...")
+                            dialog._create_spatial_graph()
+                        except Exception as e:
+                            print(f"Warning: Could not rebuild spatial graphs: {e}")
+                            import traceback
+                            traceback.print_exc()
+                
+                # Refresh plots for analyses that have aggregated results
+                # This ensures visualizations are displayed when loading saved state
+                if hasattr(dialog, 'aggregated_results') and dialog.aggregated_results:
+                    try:
+                        # Refresh neighborhood enrichment plot if available
+                        if 'nhood_enrichment' in dialog.aggregated_results:
+                            if hasattr(dialog, '_plot_sq_nhood_enrichment'):
+                                # Set ROI combo to "All ROIs" to show aggregated results
+                                if hasattr(dialog, 'sq_nhood_roi_combo'):
+                                    # Find "All ROIs" option (usually index 0)
+                                    dialog.sq_nhood_roi_combo.setCurrentIndex(0)
+                                dialog._plot_sq_nhood_enrichment(dialog.aggregated_results['nhood_enrichment'])
+                                if hasattr(dialog, 'sq_nhood_save_btn'):
+                                    dialog.sq_nhood_save_btn.setEnabled(True)
+                                print("Refreshed neighborhood enrichment plot from saved state")
+                        
+                        # Refresh autocorrelation plot if available
+                        if 'autocorrelation' in dialog.aggregated_results:
+                            if hasattr(dialog, '_plot_sq_autocorrelation'):
+                                # Set ROI combo to "All ROIs" to show aggregated results
+                                if hasattr(dialog, 'sq_autocorr_roi_combo'):
+                                    dialog.sq_autocorr_roi_combo.setCurrentIndex(0)
+                                dialog._plot_sq_autocorrelation(dialog.aggregated_results['autocorrelation'])
+                                if hasattr(dialog, 'sq_autocorr_save_btn'):
+                                    dialog.sq_autocorr_save_btn.setEnabled(True)
+                                print("Refreshed autocorrelation plot from saved state")
+                    except Exception as e:
+                        print(f"Warning: Could not refresh plots from aggregated results: {e}")
+                        import traceback
+                        traceback.print_exc()
+                
+                # Update button states after restoring all state
+                # This ensures buttons are enabled/disabled based on restored data
+                if hasattr(dialog, '_update_button_states'):
+                    try:
+                        dialog._update_button_states()
+                        print("Updated button states after advanced spatial analysis state restoration")
+                    except Exception as e:
+                        print(f"Warning: Could not update button states: {e}")
+                
+                # Enable save buttons based on analysis_status
+                # This ensures save buttons reflect which analyses have been run
+                if hasattr(dialog, 'analysis_status') and dialog.analysis_status:
+                    try:
+                        # Check if any ROI has neighborhood enrichment
+                        has_nhood = any(
+                            roi_status.get('nhood_enrichment', False) 
+                            for roi_status in dialog.analysis_status.values()
+                        )
+                        if has_nhood and hasattr(dialog, 'sq_nhood_save_btn'):
+                            dialog.sq_nhood_save_btn.setEnabled(True)
+                        
+                        # Check if any ROI has co-occurrence
+                        has_cooccur = any(
+                            roi_status.get('co_occurrence', False) 
+                            for roi_status in dialog.analysis_status.values()
+                        )
+                        if has_cooccur and hasattr(dialog, 'sq_cooccur_save_btn'):
+                            dialog.sq_cooccur_save_btn.setEnabled(True)
+                        
+                        # Check if any ROI has autocorrelation
+                        has_autocorr = any(
+                            roi_status.get('autocorrelation', False) 
+                            for roi_status in dialog.analysis_status.values()
+                        )
+                        if has_autocorr and hasattr(dialog, 'sq_autocorr_save_btn'):
+                            dialog.sq_autocorr_save_btn.setEnabled(True)
+                        
+                        # Check if any ROI has ripley
+                        has_ripley = any(
+                            roi_status.get('ripley', False) 
+                            for roi_status in dialog.analysis_status.values()
+                        )
+                        if has_ripley and hasattr(dialog, 'sq_ripley_save_btn'):
+                            dialog.sq_ripley_save_btn.setEnabled(True)
+                    except Exception as e:
+                        print(f"Warning: Could not update save button states: {e}")
             
-            # Note: DataFrames (edge_df, enrichment_df, distance_df, etc.) and AnnData objects
-            # will need to be regenerated from the feature dataframe when the dialog is used.
-            # The flags and metadata are the key state that needs to be restored.
+            # Note: For advanced spatial, AnnData objects are rebuilt from the feature dataframe
+            # using the saved graph construction parameters.
         except Exception as e:
             print(f"Warning: Could not fully restore spatial state: {e}")
             import traceback

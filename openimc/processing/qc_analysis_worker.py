@@ -42,37 +42,45 @@ except ImportError:
 
 def qc_process_acquisition_worker(task_data):
     """Thin wrapper around core.qc_analysis for multiprocessing."""
-    print(f"[QC WORKER DEBUG] Starting worker, task_data length: {len(task_data)}")
     
-    # Handle both old format (without original_acq_id) and new format (with original_acq_id)
-    if len(task_data) == 8:
+    # Handle task format: (acq_id, original_acq_id, acq_name, channels, analysis_mode, mask_path, source_file, loader_type, acq_to_file_map)
+    if len(task_data) == 9:
+        acq_id, original_acq_id, acq_name, channels, analysis_mode, mask_path, loader_path, loader_type, _ = task_data
+    elif len(task_data) == 8:
+        # Old format (without loader_type): assume loader_type based on file extension
         acq_id, original_acq_id, acq_name, channels, analysis_mode, mask_path, loader_path, _ = task_data
-        print(f"[QC WORKER DEBUG] Using new format - unique ID: {acq_id}, original ID: {original_acq_id}")
+        # Determine loader_type from file extension
+        if loader_path.lower().endswith(('.mcd', '.mcdx')):
+            loader_type = "mcd"
+        elif os.path.isdir(loader_path):
+            loader_type = "ometiff"
+        else:
+            loader_type = "ometiff"  # Default assumption
     else:
-        # Old format: assume acq_id is the original ID (for backward compatibility)
+        # Very old format: assume acq_id is the original ID (for backward compatibility)
         acq_id, acq_name, channels, analysis_mode, mask_path, loader_path, _ = task_data
         original_acq_id = acq_id
-        print(f"[QC WORKER DEBUG] Using old format - acq_id: {acq_id}")
+        # Determine loader_type from file extension
+        if loader_path.lower().endswith(('.mcd', '.mcdx')):
+            loader_type = "mcd"
+        elif os.path.isdir(loader_path):
+            loader_type = "ometiff"
+        else:
+            loader_type = "ometiff"  # Default assumption
     
-    print(f"[QC WORKER DEBUG] Processing: {acq_name}, channels: {len(channels)}, mode: {analysis_mode}, file: {os.path.basename(loader_path) if loader_path else 'None'}")
     
     try:
         # Recreate loader (can't pickle loader objects)
         if loader_path and os.path.exists(loader_path):
-            print(f"[QC WORKER DEBUG] Opening loader for: {loader_path}")
             if loader_path.lower().endswith(('.mcd', '.mcdx')):
                 loader = MCDLoader()
                 loader.open(loader_path)
-                print(f"[QC WORKER DEBUG] Opened MCD loader successfully")
             elif os.path.isdir(loader_path):
                 loader = OMETIFFLoader(channel_format='CHW')
                 loader.open(loader_path)
-                print(f"[QC WORKER DEBUG] Opened OME-TIFF loader successfully")
             else:
-                print(f"[QC WORKER DEBUG] ERROR: Unknown file type: {loader_path}")
                 return []
         else:
-            print(f"[QC WORKER DEBUG] ERROR: Loader path invalid or doesn't exist: {loader_path}")
             return []
         
         try:
@@ -85,15 +93,11 @@ def qc_process_acquisition_worker(task_data):
                     return []
             
             # Get acquisition metadata from loader using original acquisition ID
-            print(f"[QC WORKER DEBUG] Getting channels for original_acq_id: {original_acq_id}")
             try:
                 all_channels = loader.get_channels(original_acq_id)
-                print(f"[QC WORKER DEBUG] Loader returned {len(all_channels) if all_channels else 0} channels")
                 if not all_channels:
-                    print(f"[QC WORKER DEBUG] WARNING: No channels returned from loader for {original_acq_id}")
-                    print(f"[QC WORKER DEBUG] Available acquisition IDs in loader: {list(getattr(loader, '_acq_channels', {}).keys())}")
+                    pass
             except Exception as e:
-                print(f"[QC WORKER DEBUG] ERROR getting channels: {e}")
                 import traceback
                 traceback.print_exc()
                 return []
@@ -103,7 +107,6 @@ def qc_process_acquisition_worker(task_data):
             well = getattr(loader, '_acq_well', {}).get(original_acq_id)
             size = getattr(loader, '_acq_size', {}).get(original_acq_id, (None, None))
             metadata = getattr(loader, '_acq_metadata', {}).get(original_acq_id, {})
-            print(f"[QC WORKER DEBUG] Metadata retrieved - well: {well}, size: {size}")
             
             # Filter channel_metals and channel_labels to match provided channels
             channel_metals = []
@@ -138,7 +141,6 @@ def qc_process_acquisition_worker(task_data):
             )
             
             # Call core function
-            print(f"[QC WORKER DEBUG] Calling qc_analysis with acquisition.id={acquisition.id}, {len(channels)} channels")
             try:
                 results_df = qc_analysis(
                     loader=loader,
@@ -147,27 +149,22 @@ def qc_process_acquisition_worker(task_data):
                     mode=analysis_mode,
                     mask=mask
                 )
-                print(f"[QC WORKER DEBUG] qc_analysis returned {len(results_df)} results")
             except Exception as e:
-                print(f"[QC WORKER DEBUG] ERROR in qc_analysis: {e}")
                 import traceback
                 traceback.print_exc()
                 return []
             
             # If we have a unique ID (different from original), update results to use it
             if acq_id != original_acq_id and not results_df.empty:
-                print(f"[QC WORKER DEBUG] Updating results acquisition_id from {original_acq_id} to {acq_id}")
                 results_df['acquisition_id'] = acq_id
             
             # Convert to list of dicts for GUI compatibility
             result_list = [row.to_dict() for _, row in results_df.iterrows()] if not results_df.empty else []
-            print(f"[QC WORKER DEBUG] Returning {len(result_list)} results for {acq_name}")
             return result_list
         finally:
             if hasattr(loader, 'close'):
                 loader.close()
     except Exception as e:
-        print(f"[QC WORKER DEBUG] EXCEPTION in QC analysis for {acq_name}: {e}")
         import traceback
         traceback.print_exc()
         return []

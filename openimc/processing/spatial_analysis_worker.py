@@ -50,15 +50,12 @@ def roi_enrichment_worker(args):
     roi_id, roi_df, roi_edges, cluster_col, n_perm, seed = args
     
     worker_pid = os.getpid()
-    print(f"[DEBUG] roi_enrichment_worker: PID {worker_pid} processing ROI {roi_id}, "
-          f"n_perm={n_perm}, n_edges={len(roi_edges)}, n_cells={len(roi_df)}")
     
     results = []
     
     # Get unique clusters
     unique_clusters = sorted(roi_df[cluster_col].dropna().unique())
     if len(unique_clusters) < 2:
-        print(f"[DEBUG] roi_enrichment_worker: PID {worker_pid} ROI {roi_id} has < 2 clusters, skipping")
         return results
     
     # Create cell_id to cluster mapping
@@ -85,7 +82,6 @@ def roi_enrichment_worker(args):
     total_edges = len(roi_edges)
     
     if total_edges == 0:
-        print(f"[DEBUG] roi_enrichment_worker: PID {worker_pid} ROI {roi_id} has no edges, skipping")
         return results
     
     # Process each cluster pair
@@ -156,9 +152,6 @@ def roi_enrichment_worker(args):
                 'n_permutations': n_perm
             })
     
-    print(f"[DEBUG] roi_enrichment_worker: PID {worker_pid} completed ROI {roi_id}, "
-          f"processed {len(results)} cluster pairs")
-    
     return results
 
 
@@ -187,8 +180,6 @@ def permutation_worker(args):
     roi_edges, roi_df, cluster_col, cluster_a, cluster_b, pair, observed, n_perm, seed = args
     
     worker_pid = os.getpid()
-    print(f"[DEBUG] permutation_worker: PID {worker_pid} processing cluster pair {cluster_a}-{cluster_b}, "
-          f"n_perm={n_perm}, n_edges={len(roi_edges)}, n_cells={len(roi_df)}")
     
     # Convert roi_edges to list of tuples for faster iteration
     edge_list = [(int(row['cell_id_A']), int(row['cell_id_B'])) 
@@ -233,9 +224,6 @@ def permutation_worker(args):
     else:
         z_score = 0.0
         p_value = 1.0
-    
-    print(f"[DEBUG] permutation_worker: PID {worker_pid} completed cluster pair {cluster_a}-{cluster_b}, "
-          f"observed={observed}, expected_mean={expected_mean:.2f}, z_score={z_score:.2f}, p_value={p_value:.4f}")
     
     return {
         'cluster_A': cluster_a,
