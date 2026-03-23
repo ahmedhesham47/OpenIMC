@@ -117,12 +117,15 @@ def _apply_denoise_to_channel(channel_img: np.ndarray, channel_name: str, denois
         method = hot_config.get("method", "median3")
         n_sd = float(hot_config.get("n_sd", 5.0))
         if method == "median3":
-            # 3x3 median filter
-            result = median(result, disk(1))
+            # 3x3 median filter (use footprint_rectangle for consistency with GUI)
+            try:
+                result = median(result, footprint=footprint_rectangle(3, 3).astype(bool))
+            except Exception:
+                result = ndi.median_filter(result, size=3)
         elif method == "n_sd_local_median":
             # Replace pixels above N*local_std over local median
             try:
-                local_median = median(result, disk(1))
+                local_median = median(result, footprint=footprint_rectangle(3, 3).astype(bool))
             except Exception:
                 local_median = ndi.median_filter(result, size=3)
             diff = result - local_median
@@ -154,10 +157,9 @@ def _apply_denoise_to_channel(channel_img: np.ndarray, channel_name: str, denois
             selem = disk(radius)
             result = morphology.black_tophat(result, selem)
         elif method == "rolling_ball" and _HAVE_ROLLING_BALL:
-            # Approximate rolling-ball via top-hat background estimate
-            selem = disk(radius)
-            background = morphology.white_tophat(result, selem)
-            result = result - background
+            # Use skimage rolling_ball to estimate and subtract background
+            background = _sk_rolling_ball(result, radius=radius)
+            result = np.clip(result - background, 0, None)
 
     return result
 

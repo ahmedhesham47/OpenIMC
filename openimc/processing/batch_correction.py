@@ -488,6 +488,15 @@ def apply_bbknn_correction(
         adata.obs[batch_var] = batch_labels
         
         # Apply BBKNN
+        import warnings
+        warnings.warn(
+            "BBKNN batch correction in OpenIMC uses graph-based smoothing to project "
+            "corrections back to feature space. This is an approximation of standard "
+            "BBKNN integration (which operates on neighborhood graphs in scanpy). "
+            "Results may be over-smoothed compared to Combat or Harmony.",
+            UserWarning,
+            stacklevel=2
+        )
         bbknn.bbknn(
             adata,
             batch_key=batch_var,

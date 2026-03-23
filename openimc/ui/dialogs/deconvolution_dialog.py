@@ -599,157 +599,140 @@ class DeconvolutionDialog(QtWidgets.QDialog):
         """Create the Apply High Resolution Deconvolution tab (existing functionality)."""
         tab = QtWidgets.QWidget()
         
-        # Main layout
+        # Main layout — tight margins, no scroll needed with compact design
         main_layout = QtWidgets.QVBoxLayout(tab)
-        main_layout.setContentsMargins(10, 10, 10, 10)
-        main_layout.setSpacing(8)
+        main_layout.setContentsMargins(8, 8, 8, 8)
+        main_layout.setSpacing(4)
         
-        # Create scroll area
-        scroll_area = QtWidgets.QScrollArea()
-        scroll_area.setWidgetResizable(True)
-        scroll_area.setHorizontalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
-        scroll_area.setVerticalScrollBarPolicy(Qt.ScrollBarAsNeeded)
-        
-        # Create widget to hold the scrollable content
-        scroll_content = QtWidgets.QWidget()
-        layout = QtWidgets.QVBoxLayout(scroll_content)
-        layout.setContentsMargins(5, 5, 5, 5)
-        layout.setSpacing(6)
-        
-        # Information note
-        info_group = QtWidgets.QGroupBox("Information")
-        info_layout = QtWidgets.QVBoxLayout(info_group)
+        # Brief info label (not a group box — saves vertical space)
         info_label = QtWidgets.QLabel(
-            "This deconvolution method is optimized for high resolution IMC images with step sizes of 333 nm and 500 nm. "
-            "The deconvolution uses Richardson-Lucy deconvolution with a circular kernel optimized for IMC data.\n\n"
-            "Works with both MCD files and OME-TIFF directories."
+            "Richardson-Lucy deconvolution for HR-IMC (333 nm / 500 nm step size). "
+            "Works with MCD files and OME-TIFF directories."
         )
         info_label.setWordWrap(True)
-        info_label.setStyleSheet("QLabel { color: #0066cc; font-style: italic; }")
-        info_layout.addWidget(info_label)
-        layout.addWidget(info_group)
+        info_label.setStyleSheet("QLabel { color: #0066cc; font-style: italic; font-size: 9pt; padding: 2px 0; }")
+        main_layout.addWidget(info_label)
         
-        # Acquisition selection
-        acq_group = QtWidgets.QGroupBox("Acquisition Selection")
+        # ── Acquisition selection ──────────────────────────
+        acq_group = QtWidgets.QGroupBox("Acquisition")
         acq_layout = QtWidgets.QVBoxLayout(acq_group)
+        acq_layout.setContentsMargins(8, 4, 8, 4)
+        acq_layout.setSpacing(2)
         
-        self.single_roi_radio = QtWidgets.QRadioButton("Single ROI (Current Acquisition)")
-        self.whole_slide_radio = QtWidgets.QRadioButton("Whole Slide (All Acquisitions)")
+        radio_row = QtWidgets.QHBoxLayout()
+        self.single_roi_radio = QtWidgets.QRadioButton("Single ROI")
+        self.whole_slide_radio = QtWidgets.QRadioButton("Whole Slide")
         self.single_roi_radio.setChecked(True)
+        radio_row.addWidget(self.single_roi_radio)
+        radio_row.addWidget(self.whole_slide_radio)
+        radio_row.addStretch()
+        acq_layout.addLayout(radio_row)
         
-        acq_layout.addWidget(self.single_roi_radio)
-        acq_layout.addWidget(self.whole_slide_radio)
-        
-        # Current acquisition info
         self.acq_info_label = QtWidgets.QLabel("")
+        self.acq_info_label.setStyleSheet("QLabel { color: #444; font-size: 9pt; }")
         acq_layout.addWidget(self.acq_info_label)
         
-        layout.addWidget(acq_group)
+        main_layout.addWidget(acq_group)
         
-        # Output directory selection
-        dir_group = QtWidgets.QGroupBox("Output Directory")
-        dir_layout = QtWidgets.QVBoxLayout(dir_group)
-        
+        # ── Output directory (compact single row) ─────────
         dir_row = QtWidgets.QHBoxLayout()
+        dir_row.setSpacing(4)
+        dir_row.addWidget(QtWidgets.QLabel("Output:"))
         self.dir_label = QtWidgets.QLabel("No directory selected")
         self.dir_label.setStyleSheet("QLabel { color: #666; }")
-        dir_row.addWidget(self.dir_label)
-        dir_row.addStretch()
-        
-        self.browse_btn = QtWidgets.QPushButton("Browse...")
+        self.dir_label.setMinimumWidth(100)
+        dir_row.addWidget(self.dir_label, 1)
+        self.browse_btn = QtWidgets.QPushButton("Browse…")
+        self.browse_btn.setFixedWidth(80)
         self.browse_btn.clicked.connect(self._browse_directory)
         dir_row.addWidget(self.browse_btn)
+        main_layout.addLayout(dir_row)
         
-        dir_layout.addLayout(dir_row)
-        layout.addWidget(dir_group)
+        # ── Parameters (form layout for alignment) ────────
+        params_group = QtWidgets.QGroupBox("Parameters")
+        params_form = QtWidgets.QFormLayout(params_group)
+        params_form.setContentsMargins(8, 4, 8, 4)
+        params_form.setSpacing(4)
+        params_form.setLabelAlignment(Qt.AlignRight | Qt.AlignVCenter)
         
-        # Deconvolution parameters
-        params_group = QtWidgets.QGroupBox("Deconvolution Parameters")
-        params_layout = QtWidgets.QVBoxLayout(params_group)
+        # Step size
+        self.step_size_combo = QtWidgets.QComboBox()
+        self.step_size_combo.addItem("0.333 µm (333 nm)", 333)
+        self.step_size_combo.addItem("0.500 µm (500 nm)", 500)
+        self.step_size_combo.setCurrentIndex(0)
+        params_form.addRow("Step Size:", self.step_size_combo)
         
-        # x0 parameter (hidden when kernel is loaded)
-        self.x0_layout = QtWidgets.QHBoxLayout()
-        self.x0_layout.addWidget(QtWidgets.QLabel("x0 parameter:"))
+        # x0
         self.x0_spin = QtWidgets.QDoubleSpinBox()
         self.x0_spin.setRange(1.0, 20.0)
         self.x0_spin.setValue(7.0)
         self.x0_spin.setDecimals(1)
         self.x0_spin.setSingleStep(0.5)
-        self.x0_layout.addWidget(self.x0_spin)
-        self.x0_layout.addStretch()
-        params_layout.addLayout(self.x0_layout)
+        params_form.addRow("x0:", self.x0_spin)
         
-        # Iterations parameter
-        iter_layout = QtWidgets.QHBoxLayout()
-        iter_layout.addWidget(QtWidgets.QLabel("Iterations:"))
+        # Iterations
         self.iterations_spin = QtWidgets.QSpinBox()
         self.iterations_spin.setRange(1, 20)
-        self.iterations_spin.setValue(4)
-        iter_layout.addWidget(self.iterations_spin)
-        iter_layout.addStretch()
-        params_layout.addLayout(iter_layout)
+        self.iterations_spin.setValue(7)
+        params_form.addRow("Iterations:", self.iterations_spin)
         
-        # Separator
-        separator = QtWidgets.QFrame()
-        separator.setFrameShape(QtWidgets.QFrame.HLine)
-        separator.setFrameShadow(QtWidgets.QFrame.Sunken)
-        params_layout.addWidget(separator)
+        # Output format
+        format_row = QtWidgets.QHBoxLayout()
+        self.float_radio = QtWidgets.QRadioButton("Float32")
+        self.uint16_radio = QtWidgets.QRadioButton("UInt16")
+        self.float_radio.setChecked(True)
+        format_row.addWidget(self.float_radio)
+        format_row.addWidget(self.uint16_radio)
+        format_row.addStretch()
+        params_form.addRow("Format:", format_row)
         
-        # Deconvolution parameters (passes and contributions) - moved into parameters section
+        main_layout.addWidget(params_group)
+        
+        # ── Custom kernel parameters (collapsible-feel) ───
+        kernel_group = QtWidgets.QGroupBox("Custom Deconvolution Parameters (optional)")
+        kernel_layout = QtWidgets.QVBoxLayout(kernel_group)
+        kernel_layout.setContentsMargins(8, 4, 8, 4)
+        kernel_layout.setSpacing(3)
+        
         kernel_info = QtWidgets.QLabel(
-            "Load deconvolution parameters (passes_arr, contribs_arr, kernel_dim, region_data_full, and sigmoidal loss parameters) "
-            "generated from the Experimental Design tab. Kernels will be computed per-channel using I0 from each channel's max intensity."
+            "Load passes/contributions arrays generated from the Experimental Design tab. "
+            "If not loaded, built-in Bodenmiller defaults for the selected step size are used."
         )
         kernel_info.setWordWrap(True)
         kernel_info.setStyleSheet("QLabel { color: #666; font-size: 9pt; }")
-        params_layout.addWidget(kernel_info)
+        kernel_layout.addWidget(kernel_info)
         
-        kernel_file_layout = QtWidgets.QHBoxLayout()
-        self.kernel_file_label = QtWidgets.QLabel("No deconvolution parameters loaded (using defaults)")
+        kernel_file_row = QtWidgets.QHBoxLayout()
+        kernel_file_row.setSpacing(4)
+        self.kernel_file_label = QtWidgets.QLabel("Using defaults")
         self.kernel_file_label.setStyleSheet("QLabel { color: #666; }")
-        kernel_file_layout.addWidget(self.kernel_file_label)
-        kernel_file_layout.addStretch()
+        kernel_file_row.addWidget(self.kernel_file_label, 1)
         
-        self.load_kernel_file_btn = QtWidgets.QPushButton("Load Deconvolution Parameters...")
+        self.load_kernel_file_btn = QtWidgets.QPushButton("Load…")
+        self.load_kernel_file_btn.setFixedWidth(60)
         self.load_kernel_file_btn.clicked.connect(self._load_kernel_arrays_for_deconv)
-        kernel_file_layout.addWidget(self.load_kernel_file_btn)
+        kernel_file_row.addWidget(self.load_kernel_file_btn)
         
         self.clear_kernel_btn = QtWidgets.QPushButton("Clear")
+        self.clear_kernel_btn.setFixedWidth(50)
         self.clear_kernel_btn.clicked.connect(self._clear_kernel_arrays)
         self.clear_kernel_btn.setEnabled(False)
-        kernel_file_layout.addWidget(self.clear_kernel_btn)
+        kernel_file_row.addWidget(self.clear_kernel_btn)
         
-        params_layout.addLayout(kernel_file_layout)
+        kernel_layout.addLayout(kernel_file_row)
+        main_layout.addWidget(kernel_group)
         
-        layout.addWidget(params_group)
+        # Push buttons to the bottom
+        main_layout.addStretch(1)
         
-        # Output format
-        format_group = QtWidgets.QGroupBox("Output Format")
-        format_layout = QtWidgets.QVBoxLayout(format_group)
-        
-        self.float_radio = QtWidgets.QRadioButton("Float (32-bit, preferred)")
-        self.uint16_radio = QtWidgets.QRadioButton("16-bit unsigned integer")
-        self.float_radio.setChecked(True)
-        
-        format_layout.addWidget(self.float_radio)
-        format_layout.addWidget(self.uint16_radio)
-        
-        layout.addWidget(format_group)
-        
-        # Set scroll content widget
-        scroll_area.setWidget(scroll_content)
-        
-        # Add scroll area to main layout
-        main_layout.addWidget(scroll_area, 1)
-        
-        # Buttons (outside scroll area)
+        # ── Action buttons ────────────────────────────────
         button_layout = QtWidgets.QHBoxLayout()
+        button_layout.addStretch()
         self.deconvolve_btn = QtWidgets.QPushButton("Deconvolve")
-        self.deconvolve_btn.setEnabled(False)  # Disabled until directory is selected
+        self.deconvolve_btn.setEnabled(False)
         self.deconvolve_btn.clicked.connect(self._on_deconvolve_clicked)
         self.cancel_deconv_btn = QtWidgets.QPushButton("Cancel")
         self.cancel_deconv_btn.clicked.connect(self.reject)
-        
         button_layout.addWidget(self.deconvolve_btn)
         button_layout.addWidget(self.cancel_deconv_btn)
         main_layout.addLayout(button_layout)
@@ -833,6 +816,10 @@ class DeconvolutionDialog(QtWidgets.QDialog):
     def get_output_format(self):
         """Get the output format: 'float' or 'uint16'."""
         return "float" if self.float_radio.isChecked() else "uint16"
+    
+    def get_resolution(self):
+        """Get the HR-IMC resolution in nm (333 or 500)."""
+        return self.step_size_combo.currentData()
     
     # Experimental Design tab methods
     def _populate_channels(self):

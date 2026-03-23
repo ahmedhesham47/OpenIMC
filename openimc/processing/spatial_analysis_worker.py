@@ -101,13 +101,18 @@ def roi_enrichment_worker(args):
             n_b = len(cells_b)
             
             # Expected number of edges (proportional to cluster sizes)
-            expected = (n_a * n_b / (total_cells * (total_cells - 1) / 2)) * total_edges
+            if cluster_a == cluster_b:
+                # Self-pair: number of possible edges within group = n_a*(n_a-1)/2
+                expected = (n_a * (n_a - 1) / (total_cells * (total_cells - 1))) * total_edges
+            else:
+                # Cross-pair: number of possible edges between groups = n_a*n_b
+                expected = (2 * n_a * n_b / (total_cells * (total_cells - 1))) * total_edges
             
             # Permutation test for this cluster pair
             permuted_counts = []
             for perm_idx in range(n_perm):
-                # Use a different seed for each permutation to ensure reproducibility
-                np.random.seed(seed + perm_idx)
+                # Use a different seed per pair AND permutation for independent null distributions
+                np.random.seed(seed + i * len(unique_clusters) * n_perm + j * n_perm + perm_idx)
                 # Shuffle cluster labels
                 shuffled_clusters = cluster_values.copy()
                 np.random.shuffle(shuffled_clusters)
@@ -435,19 +440,39 @@ def ripley_worker(args):
     # Point density
     lambda_density = n_points / roi_area if roi_area > 0 else 0
     
+    # Compute bounding box for isotropic edge correction
+    bbox_min = np.min(coords_um, axis=0)  # [x_min, y_min]
+    bbox_max = np.max(coords_um, axis=0)  # [x_max, y_max]
+    
     # Compute K function for this cluster
     for r in radius_steps:
-        # Count points within radius r with edge correction
-        k_sum = 0
+        # Count points within radius r with isotropic edge correction
+        k_sum = 0.0
         for i, point in enumerate(cluster_coords):
             distances = np.sqrt(np.sum((cluster_coords - point)**2, axis=1))
             # Exclude the point itself
-            within_radius = (distances <= r) & (distances > 0)
-            count = np.sum(within_radius)
+            within_radius = np.where((distances <= r) & (distances > 0))[0]
             
-            # Simple edge correction: if point is near boundary, weight by area
-            # For now, use simple correction (can be improved)
-            k_sum += count
+            for j_idx in within_radius:
+                dist_ij = distances[j_idx]
+                # Isotropic edge correction: fraction of circle of radius dist_ij
+                # centered at point that lies within the rectangular ROI
+                # Uses Ripley's isotropic correction for rectangular windows
+                dx_min = point[0] - bbox_min[0]
+                dx_max = bbox_max[0] - point[0]
+                dy_min = point[1] - bbox_min[1]
+                dy_max = bbox_max[1] - point[1]
+                
+                # Count how many boundary edges are closer than dist_ij
+                theta = 2 * np.pi  # full circle
+                for d_edge in [dx_min, dx_max, dy_min, dy_max]:
+                    if d_edge < dist_ij:
+                        # Subtract the arc outside the boundary
+                        theta -= 2 * np.arccos(np.clip(d_edge / dist_ij, -1, 1))
+                
+                # Clamp to avoid division by zero
+                weight = max(theta / (2 * np.pi), 0.01)
+                k_sum += 1.0 / weight
         
         # K(r) = (1 / lambda) * average count
         k_value = (k_sum / n_points) / lambda_density if lambda_density > 0 else 0

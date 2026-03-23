@@ -33,7 +33,7 @@ from scipy.ndimage import distance_transform_edt
 try:
     from skimage import morphology, filters, segmentation
     from skimage.filters import gaussian, median, sobel, scharr
-    from skimage.morphology import disk, remove_small_objects, label
+    from skimage.morphology import disk, remove_small_objects, label, footprint_rectangle
     from skimage.feature import peak_local_max
     from skimage.measure import regionprops
     from skimage.restoration import denoise_nl_means, estimate_sigma
@@ -83,9 +83,16 @@ def _apply_preprocessing_pipeline(
             method = hot_config.get("method", "median3")
             n_sd = float(hot_config.get("n_sd", 5.0))
             if method == "median3":
-                result = median(result, disk(1))
+                # Use footprint_rectangle for consistency with GUI
+                try:
+                    result = median(result, footprint=footprint_rectangle(3, 3).astype(bool))
+                except Exception:
+                    result = ndi.median_filter(result, size=3)
             elif method == "n_sd_local_median":
-                local_median = median(result, disk(1))
+                try:
+                    local_median = median(result, footprint=footprint_rectangle(3, 3).astype(bool))
+                except Exception:
+                    local_median = ndi.median_filter(result, size=3)
                 diff = result - local_median
                 local_var = ndi.uniform_filter(diff * diff, size=3)
                 local_std = np.sqrt(np.maximum(local_var, 1e-8))

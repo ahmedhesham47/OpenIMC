@@ -37,7 +37,7 @@ except ImportError:
 def RLD_HRIMC_circle(
     image_stack: np.ndarray,
     x0: float = 7.0,
-    iterations: int = 4,
+    iterations: int = 7,
     output_format: str = "float",
     passes: np.ndarray = None,
     contributions: np.ndarray = None,
@@ -47,6 +47,7 @@ def RLD_HRIMC_circle(
     kernel_dim: int = None,
     region_data_full: list = None,
     I0: float = None,
+    resolution: int = 333,
 ) -> np.ndarray:
     """
     Apply Richardson-Lucy deconvolution to high resolution IMC image stack.
@@ -65,11 +66,12 @@ def RLD_HRIMC_circle(
          using the same index grouping as the original HR-IMC code.
     4. Legacy hard-coded HR-IMC kernel (default):
        - If none of the above are provided, uses hard-coded arrays.
+       - Uses `resolution` to select between 333 nm and 500 nm defaults.
     
     Args:
         image_stack: Image stack with shape (C, H, W) or (H, W, C)
         x0: Parameter for kernel calculation (default: 7.0)
-        iterations: Number of Richardson-Lucy iterations (default: 4)
+        iterations: Number of Richardson-Lucy iterations (default: 7)
         output_format: Output format, either 'float' or 'uint16' (default: 'float')
         passes: Optional array of pass counts (legacy format)
         contributions: Optional array of contributions (legacy format)
@@ -79,6 +81,9 @@ def RLD_HRIMC_circle(
         kernel_dim: Optional kernel dimension (for new format)
         region_data_full: Optional list of region data dicts (for new format)
         I0: Optional I0 value for sigmoidal loss. If None, uses max intensity per channel.
+        resolution: HR-IMC resolution in nm (333 or 500). Selects the default
+            Passes/Contributions arrays when no custom kernel is provided.
+            Default: 333.
     
     Returns:
         Deconvolved image stack with same shape as input (except for border cropping)
@@ -130,6 +135,8 @@ def RLD_HRIMC_circle(
     use_new_region_format = False
     use_direct_kernel = False
     use_legacy_format = False
+    # Track which resolution-specific index grouping to use for legacy mode
+    legacy_resolution = resolution
     
     if kernel is not None:
         # Direct kernel override (any size)
@@ -157,52 +164,70 @@ def RLD_HRIMC_circle(
         Contributions = contributions / contributions.sum()
         Passes = passes
     else:
-        # Legacy hard-coded arrays from original HR-IMC code
+        # Legacy hard-coded arrays from original HR-IMC code (Bodenmiller)
         use_legacy_format = True
-        Passes = np.array([
-            7,6,5,8,7,
-            7,8,7,6,6,
-            7,9,8,7,8,
-            8,7,7,6,6,
-            7,6,6,5,5,
-            6,6,5,5,4,
-            4,6,4,5,3,
-            4,5,6,6,5,
-            4,5,5,4,3,
-            4,4,3,6,5,
-            4,5,5,4,4,
-            3,3,4,4,3,
-            3,2,4,3,2,
-            2,1,1,3,2,
-            2,1,1,3,3,
-            2,2,2,2,1,
-            1,1,1,3,2,
-            1,2,2,1,1,
-            2,1,1,4,3,
-            2,1
-        ], dtype=float)
-        Contributions = np.array([
-            0.02,0.00108,0.00108,0.0034,0.0196,
-            0.0196,0.0034,0.0034,0.0196,0.0196,
-            0.0034,0.00223,0.00223,0.00223,0.0034,
-            0.0034,0.0034,0.0034,0.0034,0.0034,
-            0.0196,0.00106,0.0196,0.00106,0.0196,
-            0.00108,0.00106,0.00106,0.00106,0.00106,
-            0.00108,0.0196,0.00106,0.0196,0.00106,
-            0.0196,0.0196,0.0034,0.0034,0.0196,
-            0.0196,0.0034,0.0034,0.0196,0.0196,
-            0.0034,0.0034,0.0196,0.00223,0.00223,
-            0.00223,0.0034,0.0034,0.0034,0.0034,
-            0.0034,0.0034,0.0196,0.00108,0.0196,
-            0.00106,0.0196,0.00108,0.00106,0.00106,
-            0.00106,0.00106,0.00108,0.0196,0.00106,
-            0.0196,0.00106,0.0196,0.0034,0.0034,
-            0.0196,0.0196,0.0034,0.0034,0.0196,
-            0.0196,0.0034,0.0034,0.00223,0.00223,
-            0.00223,0.0034,0.0034,0.0034,0.0034,
-            0.00108,0.00196,0.00108,0.00219,0.00219,
-            0.00219,0.00219
-        ], dtype=float)
+        if resolution == 333:
+            # 333 nm HR-IMC defaults
+            Passes = np.array([
+                7,6,5,8,7,
+                7,8,7,6,6,
+                7,9,8,7,8,
+                8,7,7,6,6,
+                7,6,6,5,5,
+                6,6,5,5,4,
+                4,6,4,5,3,
+                4,5,6,6,5,
+                4,5,5,4,3,
+                4,4,3,6,5,
+                4,5,5,4,4,
+                3,3,4,4,3,
+                3,2,4,3,2,
+                2,1,1,3,2,
+                2,1,1,3,3,
+                2,2,2,2,1,
+                1,1,1,3,2,
+                1,2,2,1,1,
+                2,1,1,4,3,
+                2,1
+            ], dtype=float)
+            Contributions = np.array([
+                0.0196,0.00107,0.00107,0.0034,0.0196,
+                0.0196,0.0034,0.0034,0.0196,0.0196,
+                0.0034,0.00223,0.00223,0.00223,0.0034,
+                0.0034,0.0034,0.0034,0.0034,0.0034,
+                0.0196,0.00107,0.0196,0.00107,0.0196,
+                0.00107,0.00107,0.00107,0.00107,0.00107,
+                0.00107,0.0196,0.00107,0.0196,0.00107,
+                0.0196,0.0196,0.0034,0.0034,0.0196,
+                0.0196,0.0034,0.0034,0.0196,0.0196,
+                0.0034,0.0034,0.0196,0.00223,0.00223,
+                0.00223,0.0034,0.0034,0.0034,0.0034,
+                0.0034,0.0034,0.0196,0.00107,0.0196,
+                0.00107,0.0196,0.00107,0.00107,0.00107,
+                0.00107,0.00107,0.00107,0.0196,0.00107,
+                0.0196,0.00107,0.0196,0.0034,0.0034,
+                0.0196,0.0196,0.0034,0.0034,0.0196,
+                0.0196,0.0034,0.0034,0.00223,0.00223,
+                0.00223,0.0034,0.0034,0.0034,0.0034,
+                0.00107,0.0196,0.00107,0.00219,0.00219,
+                0.00219,0.00219
+            ], dtype=float)
+        else:
+            # 500 nm HR-IMC defaults
+            Passes = np.array([
+                4, 4,3,2,2,2,
+                2, 4,3,2,2,2,
+                4,3,2,2,2,2,1,2,1,2,1,1,
+                2,1,1,1,1, 2,
+                2,1,1,1,1, 1
+            ], dtype=float)
+            Contributions = np.array([
+                0.02575, 0.02575,0.0406,0.0406,0.01435,0.02575,
+                0.02575, 0.02575,0.0406,0.01435,0.0406,0.02575,
+                0.02575,0.0406,0.01435,0.0406,0.02575,0.01435,0.01435,0.0406,0.0406,0.02575,0.01435,0.02575,
+                0.02575,0.0406,0.01435,0.0406,0.02575, 0.02575,
+                0.02575,0.0406,0.0406,0.01435,0.02575, 0.02575
+            ], dtype=float)
         Contributions = Contributions / Contributions.sum()
     
     # Process each channel
@@ -266,23 +291,37 @@ def RLD_HRIMC_circle(
                                                [0.0, 1.0, 0.0],
                                                [0.0, 0.0, 0.0]], dtype=np.float32)
                 else:
-                    # Original 3×3 aggregation mapping, preserving backward compatibility
-                    result = list((
-                        (y_array[3] + y_array[4] + y_array[11] + y_array[14] + y_array[15] + y_array[20]) / total_sum, 
-                        (y_array[0] + y_array[5] + y_array[6] + y_array[7] + y_array[8] + y_array[12] + y_array[16] + y_array[17] + y_array[22]) / total_sum, 
-                        (y_array[9] + y_array[10] + y_array[13] + y_array[18] + y_array[19] + y_array[24]) / total_sum,
-                        (y_array[31] + y_array[36] + y_array[37] + y_array[38] + y_array[39] + y_array[48] + y_array[51] + y_array[52] + y_array[57]) / total_sum, 
-                        (y_array[33] + y_array[40] + y_array[41] + y_array[42] + y_array[43] + y_array[49] + y_array[53] + y_array[54] + y_array[59]) / total_sum, 
-                        (y_array[35] + y_array[44] + y_array[45] + y_array[46] + y_array[47] + y_array[50] + y_array[55] + y_array[56] + y_array[61]) / total_sum, 
-                        (y_array[68] + y_array[73] + y_array[74] + y_array[75] + y_array[83] + y_array[86]) / total_sum, 
-                        (y_array[70] + y_array[76] + y_array[77] + y_array[78] + y_array[79] + y_array[84] + y_array[87] + y_array[88] + y_array[91]) / total_sum, 
-                        (y_array[72] + y_array[80] + y_array[81] + y_array[82] + y_array[85] + y_array[89]) / total_sum, 
-                    ))
+                    if legacy_resolution == 333:
+                        # 333 nm: 3×3 aggregation mapping (from Bodenmiller)
+                        result = list((
+                            (y_array[3] + y_array[4] + y_array[11] + y_array[14] + y_array[15] + y_array[20]) / total_sum, 
+                            (y_array[0] + y_array[5] + y_array[6] + y_array[7] + y_array[8] + y_array[12] + y_array[16] + y_array[17] + y_array[22]) / total_sum, 
+                            (y_array[9] + y_array[10] + y_array[13] + y_array[18] + y_array[19] + y_array[24]) / total_sum,
+                            (y_array[31] + y_array[36] + y_array[37] + y_array[38] + y_array[39] + y_array[48] + y_array[51] + y_array[52] + y_array[57]) / total_sum, 
+                            (y_array[33] + y_array[40] + y_array[41] + y_array[42] + y_array[43] + y_array[49] + y_array[53] + y_array[54] + y_array[59]) / total_sum, 
+                            (y_array[35] + y_array[44] + y_array[45] + y_array[46] + y_array[47] + y_array[50] + y_array[55] + y_array[56] + y_array[61]) / total_sum, 
+                            (y_array[68] + y_array[73] + y_array[74] + y_array[75] + y_array[83] + y_array[86]) / total_sum, 
+                            (y_array[70] + y_array[76] + y_array[77] + y_array[78] + y_array[79] + y_array[84] + y_array[87] + y_array[88] + y_array[91]) / total_sum, 
+                            (y_array[72] + y_array[80] + y_array[81] + y_array[82] + y_array[85] + y_array[89]) / total_sum, 
+                        ))
+                    else:
+                        # 500 nm: 3×3 aggregation mapping (from Bodenmiller)
+                        result = list((
+                            (y_array[0]) / total_sum,
+                            (np.sum(y_array[1:6])) / total_sum,
+                            (y_array[6]) / total_sum,
+                            (np.sum(y_array[7:12])) / total_sum,
+                            (np.sum(y_array[12:24])) / total_sum,
+                            (np.sum(y_array[24:29])) / total_sum,
+                            (y_array[29]) / total_sum,
+                            (np.sum(y_array[30:35])) / total_sum,
+                            (y_array[35]) / total_sum,
+                        ))
                     channel_kernel = np.array(result, dtype=np.float32)
                     channel_kernel = channel_kernel / channel_kernel.sum()
                     channel_kernel = channel_kernel.reshape(3, 3)
         
-        # Normalize layer for RL
+        # Normalize layer to [0, 1] for RL
         layer_min = layer_data.min()
         layer_max = layer_data.max()
         if layer_max > layer_min:
@@ -294,9 +333,10 @@ def RLD_HRIMC_circle(
         # RL deconvolution
         deconvolved_image = richardson_lucy(layer_norm, channel_kernel, num_iter=iterations)
         
-        # Denormalize back
-        if layer_max > layer_min:
-            deconvolved_image = deconvolved_image * (layer_max - layer_min) + layer_min
+        # Convert to uint16 per-channel (matching Bodenmiller approach):
+        # img_as_uint clips to [0, 1] then scales to [0, 65535], preserving
+        # RL sharpening peaks rather than compressing dynamic range.
+        deconvolved_image = img_as_uint(deconvolved_image)
         
         # Verify deconvolved image shape
         if deconvolved_image.shape != (height, width):
@@ -359,34 +399,14 @@ def RLD_HRIMC_circle(
     if final_c != n_channels:
         raise ValueError(f"Final channel count mismatch: expected {n_channels}, got {final_c}")
     
-    # Convert format if needed
+    # Each channel was already converted to uint16 per-channel via img_as_uint
+    # (matching Bodenmiller approach: clip [0,1] -> scale to [0,65535]).
     if output_format == "uint16":
-        # Convert to uint16, scaling to full uint16 range
-        # Find min and max across all channels
-        stack_min = float(np.min(processed_stack_cropped))
-        stack_max = float(np.max(processed_stack_cropped))
-        
-        if stack_max > stack_min:
-            # Scale to [0, 65535] range for uint16
-            # First normalize to [0, 1]
-            normalized = (processed_stack_cropped - stack_min) / (stack_max - stack_min)
-            # Then scale to uint16 range
-            processed_stack_cropped = (normalized * 65535.0).astype(np.uint16)
-        elif stack_max == stack_min and stack_max >= 0:
-            # All values are the same and non-negative
-            # Scale to uint16 range if value is in [0, 1], otherwise clip
-            if stack_max <= 1.0:
-                processed_stack_cropped = (processed_stack_cropped * 65535.0).astype(np.uint16)
-            else:
-                # Clip to uint16 max
-                processed_stack_cropped = np.clip(processed_stack_cropped, 0, 65535).astype(np.uint16)
-        else:
-            # All values are the same and possibly negative
-            # Set to zero
-            processed_stack_cropped = np.zeros_like(processed_stack_cropped, dtype=np.uint16)
+        # Already uint16 from per-channel img_as_uint
+        processed_stack_cropped = processed_stack_cropped.astype(np.uint16)
     else:
-        # Keep as float32
-        processed_stack_cropped = processed_stack_cropped.astype(np.float32)
+        # Convert to float32, normalizing from uint16 range back to [0, 1]
+        processed_stack_cropped = processed_stack_cropped.astype(np.float32) / 65535.0
     
     return processed_stack_cropped
 
@@ -396,7 +416,7 @@ def deconvolve_acquisition_from_mcd(
     acq_id: str,
     output_dir: str,
     x0: float = 7.0,
-    iterations: int = 4,
+    iterations: int = 7,
     output_format: str = "float",
     channel_names: list = None,
     source_file_path: str = None,
@@ -412,7 +432,8 @@ def deconvolve_acquisition_from_mcd(
     contribs_arr: np.ndarray = None,
     kernel_dim: int = None,
     region_data_full: list = None,
-    I0: float = None
+    I0: float = None,
+    resolution: int = 333,
 ) -> str:
     """
     Deconvolve a single acquisition from an MCD file and save as OME-TIFF.
@@ -522,7 +543,8 @@ def deconvolve_acquisition_from_mcd(
             contribs_arr=contribs_arr,
             kernel_dim=kernel_dim,
             region_data_full=region_data_full,
-            I0=I0
+            I0=I0,
+            resolution=resolution
         )  # Returns (C, H, W)
         print(f"Deconvolution complete: output shape={deconvolved_stack.shape}, dtype={deconvolved_stack.dtype}")
         
@@ -649,7 +671,7 @@ def deconvolve_acquisition_from_ometiff(
     acq_id: str,
     output_dir: str,
     x0: float = 7.0,
-    iterations: int = 4,
+    iterations: int = 7,
     output_format: str = "float",
     channel_names: list = None,
     source_file_path: str = None,
@@ -665,7 +687,8 @@ def deconvolve_acquisition_from_ometiff(
     contribs_arr: np.ndarray = None,
     kernel_dim: int = None,
     region_data_full: list = None,
-    I0: float = None
+    I0: float = None,
+    resolution: int = 333,
 ) -> str:
     """
     Deconvolve a single acquisition from an OME-TIFF file and save as OME-TIFF.
@@ -828,7 +851,8 @@ def deconvolve_acquisition_from_ometiff(
         output_format=output_format,
         passes=passes,
         contributions=contributions,
-        kernel=kernel
+        kernel=kernel,
+        resolution=resolution
     )  # Returns (C, H, W)
     print(f"Deconvolution complete: output shape={deconvolved_stack.shape}, dtype={deconvolved_stack.dtype}")
     
@@ -926,7 +950,7 @@ def deconvolve_acquisition(
     acq_id: str,
     output_dir: str,
     x0: float = 7.0,
-    iterations: int = 4,
+    iterations: int = 7,
     output_format: str = "float",
     channel_names: list = None,
     source_file_path: str = None,
@@ -944,7 +968,8 @@ def deconvolve_acquisition(
     contribs_arr: np.ndarray = None,
     kernel_dim: int = None,
     region_data_full: list = None,
-    I0: float = None
+    I0: float = None,
+    resolution: int = 333,
 ) -> str:
     """
     Deconvolve a single acquisition from an MCD file or OME-TIFF file and save as OME-TIFF.
@@ -988,7 +1013,8 @@ def deconvolve_acquisition(
             contribs_arr=contribs_arr,
             kernel_dim=kernel_dim,
             region_data_full=region_data_full,
-            I0=I0
+            I0=I0,
+            resolution=resolution
         )
     elif loader_type == "ometiff":
         return deconvolve_acquisition_from_ometiff(
@@ -1012,7 +1038,8 @@ def deconvolve_acquisition(
             contribs_arr=contribs_arr,
             kernel_dim=kernel_dim,
             region_data_full=region_data_full,
-            I0=I0
+            I0=I0,
+            resolution=resolution
         )
     else:
         raise ValueError(f"Unknown loader type: {loader_type}")

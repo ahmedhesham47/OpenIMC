@@ -691,6 +691,13 @@ def use_cellsize_gaging_custom(
             raise ImportError("CellSAM not installed. segment_cellular_image not available.")
         labels = segment_cellular_image(inp, model=model, normalize=False, device=device)[0]
     
+    # Handle case where CellSAM fails to detect any cells
+    if labels is None:
+        raise ValueError(
+            "CellSAM failed to detect any cells during cell size gauging. "
+            "Try lowering --bbox-threshold (e.g., 0.1) or using --low-contrast-enhancement"
+        )
+    
     return labels
 
 
@@ -755,22 +762,33 @@ def cellsam_pipeline_custom(
     
     inp = da.from_array(img, chunks=chunks)
     
-    if use_wsi:
-        if gauge_cell_size:
-            labels = use_cellsize_gaging_custom(
-                inp, model, device, block_size=block_size, overlap=overlap,
-                iou_depth=iou_depth, iou_threshold=iou_threshold,
-                bbox_threshold=bbox_threshold
-            )
-        else:
-            labels = segment_wsi_custom(
-                inp, model, block_size, overlap, iou_depth, iou_threshold,
-                bbox_threshold, normalize=True
-            )
+    # gauge_cell_size can be used with or without use_wsi
+    if gauge_cell_size:
+        # Gauge cell size first, then decide on best segmentation approach
+        labels = use_cellsize_gaging_custom(
+            inp, model, device, block_size=block_size, overlap=overlap,
+            iou_depth=iou_depth, iou_threshold=iou_threshold,
+            bbox_threshold=bbox_threshold
+        )
+    elif use_wsi:
+        labels = segment_wsi_custom(
+            inp, model, block_size, overlap, iou_depth, iou_threshold,
+            bbox_threshold, normalize=True
+        )
     else:
         if not _HAVE_CELLSAM or segment_cellular_image is None:
             raise ImportError("CellSAM not installed. segment_cellular_image not available.")
         labels = segment_cellular_image(inp, model=model, normalize=True, device=device)[0]
+    
+    # Handle case where CellSAM fails to detect any cells (returns None)
+    if labels is None:
+        raise ValueError(
+            "CellSAM failed to detect any cells. This can happen if:\n"
+            "  1. The image has very low contrast - try --low-contrast-enhancement\n"
+            "  2. The bbox_threshold is too high - try lowering --bbox-threshold (e.g., 0.1)\n"
+            "  3. The nuclear/cytoplasm channels don't show clear cell boundaries\n"
+            "  4. For images with many cells (>500), try adding --use-wsi"
+        )
     
     return labels
 

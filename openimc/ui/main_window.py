@@ -5556,6 +5556,11 @@ class MainWindow(QtWidgets.QMainWindow):
                 
                 progress_dlg.update_progress(20, "Running segmentation", "Processing...")
                 
+                # Get normalization settings from preprocessing_config
+                norm_method = preprocessing_config.get('normalization_method', 'channelwise_minmax') if preprocessing_config else 'channelwise_minmax'
+                arcsinh_cofactor = preprocessing_config.get('arcsinh_cofactor', 1.0) if preprocessing_config else 1.0
+                percentile_params = preprocessing_config.get('percentile_params', (1.0, 99.0)) if preprocessing_config else (1.0, 99.0)
+                
                 # Call core.segment()
                 if core_method == "cellsam":
                     mask = segment(
@@ -5566,7 +5571,9 @@ class MainWindow(QtWidgets.QMainWindow):
                         cyto_channels=cyto_channels,
                         output_dir=masks_directory if save_masks else None,
                         denoise_settings=denoise_settings,
-                        normalization_method="None",  # No normalization for segmentation
+                        normalization_method=norm_method,
+                        arcsinh_cofactor=arcsinh_cofactor,
+                        percentile_params=percentile_params,
                         nuclear_combo_method=nuclear_combo_method,
                         cyto_combo_method=cyto_combo_method,
                         nuclear_weights=nuclear_weights,
@@ -5586,7 +5593,9 @@ class MainWindow(QtWidgets.QMainWindow):
                         cyto_channels=cyto_channels,
                         output_dir=masks_directory if save_masks else None,
                         denoise_settings=denoise_settings,
-                        normalization_method="None",  # No normalization for segmentation
+                        normalization_method=norm_method,
+                        arcsinh_cofactor=arcsinh_cofactor,
+                        percentile_params=percentile_params,
                         nuclear_combo_method=nuclear_combo_method,
                         cyto_combo_method=cyto_combo_method,
                         nuclear_weights=nuclear_weights,
@@ -8943,6 +8952,7 @@ class MainWindow(QtWidgets.QMainWindow):
         x0 = dlg.get_x0()
         iterations = dlg.get_iterations()
         output_format = dlg.get_output_format()
+        resolution = dlg.get_resolution()
         passes, contributions, psf_kernel, passes_arr, contribs_arr, kernel_dim, region_data_full, sigmoidal_params = dlg.get_deconv_passes_contributions()
         
         # Create and show progress dialog
@@ -8953,12 +8963,12 @@ class MainWindow(QtWidgets.QMainWindow):
             if acq_type == "single":
                 success = self._deconvolve_single_acquisition(
                     output_dir, progress_dlg, x0, iterations, output_format, passes, contributions, psf_kernel,
-                    passes_arr, contribs_arr, kernel_dim, region_data_full, None
+                    passes_arr, contribs_arr, kernel_dim, region_data_full, None, resolution
                 )
             else:
                 success = self._deconvolve_whole_slide(
                     output_dir, progress_dlg, x0, iterations, output_format, passes, contributions, psf_kernel,
-                    passes_arr, contribs_arr, kernel_dim, region_data_full, None
+                    passes_arr, contribs_arr, kernel_dim, region_data_full, None, resolution
                 )
             
             progress_dlg.close()
@@ -8997,7 +9007,7 @@ class MainWindow(QtWidgets.QMainWindow):
                                      x0: float, iterations: int, output_format: str,
                                      passes=None, contributions=None, kernel=None,
                                      passes_arr=None, contribs_arr=None, kernel_dim=None,
-                                     region_data_full=None, I0=None) -> bool:
+                                     region_data_full=None, I0=None, resolution=333) -> bool:
         """Deconvolve the currently selected acquisition."""
         if not self.current_acq_id:
             raise ValueError("No acquisition selected")
@@ -9121,7 +9131,8 @@ class MainWindow(QtWidgets.QMainWindow):
                 contribs_arr=contribs_arr,
                 kernel_dim=kernel_dim,
                 region_data_full=region_data_full,
-                I0=None  # Will be computed per channel from max intensity
+                I0=None,  # Will be computed per channel from max intensity
+                resolution=resolution
             )
             
             output_path = str(output_path)  # Convert Path to string for compatibility
@@ -9168,7 +9179,7 @@ class MainWindow(QtWidgets.QMainWindow):
                                 x0: float, iterations: int, output_format: str,
                                 passes=None, contributions=None, kernel=None,
                                 passes_arr=None, contribs_arr=None, kernel_dim=None,
-                                region_data_full=None, I0=None) -> bool:
+                                region_data_full=None, I0=None, resolution=333) -> bool:
         """Deconvolve all acquisitions. Uses multiprocessing for many ROIs."""
         if not self.acquisitions:
             raise ValueError("No acquisitions found")
@@ -9269,7 +9280,7 @@ class MainWindow(QtWidgets.QMainWindow):
                     loader_type, acq_info_dict, data_path, source_file_path, acq.id,
                     output_dir, x0, iterations, output_format,
                     passes, contributions, kernel,
-                    passes_arr, contribs_arr, kernel_dim, region_data_full, I0
+                    passes_arr, contribs_arr, kernel_dim, region_data_full, I0, resolution
                 ))
             
             # Worker function for multiprocessing
@@ -9277,7 +9288,7 @@ class MainWindow(QtWidgets.QMainWindow):
                 (loader_type, acq_info_dict, data_path, source_file_path, unique_acq_id,
                  output_dir, x0, iterations, output_format,
                  passes, contributions, kernel,
-                 passes_arr, contribs_arr, kernel_dim, region_data_full, I0) = args
+                 passes_arr, contribs_arr, kernel_dim, region_data_full, I0, resolution) = args
                 
                 try:
                     # Create loader in worker process (loaders are not pickleable)
@@ -9315,7 +9326,8 @@ class MainWindow(QtWidgets.QMainWindow):
                             contribs_arr=contribs_arr,
                             kernel_dim=kernel_dim,
                             region_data_full=region_data_full,
-                            I0=I0
+                            I0=I0,
+                            resolution=resolution
                         )
                         return (unique_acq_id, True, None)
                     finally:
@@ -9479,7 +9491,8 @@ class MainWindow(QtWidgets.QMainWindow):
                     contribs_arr=contribs_arr,
                     kernel_dim=kernel_dim,
                     region_data_full=region_data_full,
-                    I0=I0
+                    I0=I0,
+                    resolution=resolution
                 )
                 
                 processed += 1

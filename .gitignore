@@ -42,3 +42,7 @@ figures/Figure2_BloodBased/*.mcd
 figures/Figure2_BloodBased/masks/
 figures/Figure2_BloodBased/cellpose_masks/
 figures/Figure3_Jackson/*.csv
+
+.vscode/
+build/
+figures/Reproducibility/

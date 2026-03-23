@@ -583,12 +583,24 @@ def segment(
         
         # Use well name if available, otherwise use acquisition name
         if acquisition.well:
-            output_filename = f"{acquisition.well}_segmentation_masks.tif"
+            label = acquisition.well
         else:
-            output_filename = f"{acquisition.name}_segmentation_masks.tif"
+            label = acquisition.name
+        
+        # Sanitize label for filename (replace invalid characters)
+        safe_label = "".join(c if c.isalnum() or c in "._-" else "_" for c in label)
+        
+        # Include source file prefix to match GUI format for compatibility
+        if acquisition.source_file:
+            source_basename = Path(acquisition.source_file).stem
+            safe_source = "".join(c if c.isalnum() or c in "._-" else "_" for c in source_basename)
+            output_filename = f"{safe_source}_{safe_label}_segmentation_masks.tif"
+        else:
+            output_filename = f"{safe_label}_segmentation_masks.tif"
+        
         output_path = output_dir / output_filename
         
-        tifffile.imwrite(str(output_path), mask.astype(np.uint16), compression='lzw')
+        tifffile.imwrite(str(output_path), mask.astype(np.uint32), compression='lzw')
     
     return mask
 
@@ -886,7 +898,10 @@ def cluster(
     else:
         # Auto-detect: exclude non-feature columns (matching GUI)
         exclude_cols = {'label', 'acquisition_id', 'acquisition_name', 'well', 'cluster', 'cell_id',
-                       'source_file', 'source_well', 'acquisition_label'}
+                       'source_file', 'source_well', 'acquisition_label',
+                       'centroid_x', 'centroid_y', 'area', 'area_um2', 'perimeter', 'perimeter_um',
+                       'eccentricity', 'solidity', 'circularity', 'major_axis_length',
+                       'minor_axis_length', 'orientation', 'extent', 'convex_area', 'euler_number'}
         cluster_columns = [col for col in features_df.columns if col not in exclude_cols]
     print(f"[CORE.CLUSTER] Column selection: {len(cluster_columns)} columns, took {time.time() - t0:.3f}s")
     
@@ -910,7 +925,7 @@ def cluster(
     if scaling == 'zscore':
         # Z-score normalization: (x - mean) / std
         data_means = data.mean()
-        data_stds = data.std(ddof=0)
+        data_stds = data.std(ddof=1)
         
         # Handle columns with zero variance or NaN std/mean
         zero_var_cols = (data_stds == 0) | data_stds.isna() | data_means.isna()
@@ -1605,7 +1620,7 @@ def _detect_spatial_communities(
         g.es['weight'] = weights
     
     # Run community detection with seed
-    partition = leidenalg.find_partition(g, leidenalg.ModularityVertexPartition, seed=seed)
+    partition = leidenalg.find_partition(g, leidenalg.ModularityVertexPartition, weights='weight', seed=seed)
     communities = partition.membership
     
     # Map community labels back to dataframe
@@ -1653,7 +1668,7 @@ def _detect_spatial_communities_global(
     g.es['weight'] = weights
     
     # Run community detection with seed
-    partition = leidenalg.find_partition(g, leidenalg.ModularityVertexPartition, seed=seed)
+    partition = leidenalg.find_partition(g, leidenalg.ModularityVertexPartition, weights='weight', seed=seed)
     communities = partition.membership
     
     # Map community labels back to dataframe
@@ -2311,7 +2326,7 @@ def deconvolution(
     acquisition: AcquisitionInfo,
     output_dir: Union[str, Path],
     x0: float = 7.0,
-    iterations: int = 4,
+    iterations: int = 7,
     output_format: str = "float",
     loader_path: Optional[Union[str, Path]] = None,
     source_file_path: Optional[Union[str, Path]] = None,
@@ -2323,7 +2338,8 @@ def deconvolution(
     contribs_arr: Optional[np.ndarray] = None,
     kernel_dim: Optional[int] = None,
     region_data_full: Optional[list] = None,
-    I0: Optional[float] = None
+    I0: Optional[float] = None,
+    resolution: int = 333,
 ) -> Path:
     """Apply Richardson-Lucy deconvolution to high resolution IMC images.
     
@@ -2335,8 +2351,9 @@ def deconvolution(
         acquisition: Acquisition information
         output_dir: Output directory for deconvolved images
         x0: Parameter for kernel calculation (default: 7.0)
-        iterations: Number of Richardson-Lucy iterations (default: 4)
+        iterations: Number of Richardson-Lucy iterations (default: 7)
         output_format: Output format ('float' or 'uint16', default: 'float')
+        resolution: HR-IMC resolution in nm (333 or 500, default: 333)
         loader_path: Optional explicit path to loader file/directory (if loader doesn't have file_path/directory attribute)
         source_file_path: Optional source file path for filename generation (defaults to loader_path)
         unique_acq_id: Optional unique acquisition ID for filename generation (defaults to acquisition.id)
@@ -2461,7 +2478,8 @@ def deconvolution(
         contribs_arr=contribs_arr,
         kernel_dim=kernel_dim,
         region_data_full=region_data_full,
-        I0=I0
+        I0=I0,
+        resolution=resolution
     )
     
     return Path(output_path)

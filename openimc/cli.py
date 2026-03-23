@@ -24,6 +24,7 @@ This module provides CLI commands for HPC/batch processing without the GUI.
 All commands can be accessed via the ``openimc`` command-line tool.
 
 Available Commands:
+    - info: Display MCD file information (acquisitions, channels)
     - preprocess: Denoise and export images to OME-TIFF format
     - segment: Perform cell segmentation using various methods (CellSAM, Cellpose, Watershed)
     - extract-features: Extract morphological and intensity features from segmented cells
@@ -194,6 +195,106 @@ def build_denoise_settings_for_all_channels(
     return denoise_settings
 
 
+def info_command(args):
+    """Display information about an MCD file including acquisitions and channels.
+    
+    This command provides a quick way to inspect the contents of an MCD file
+    without loading the full image data. It lists all acquisitions and their
+    associated channel names, which is useful for determining the correct
+    channel names to use with other commands like segment or extract-features.
+    
+    Args:
+        args: Command-line arguments containing:
+            - input: Path to input MCD file
+            - acquisition: Optional acquisition ID or name to show details for
+            - format: Output format ('table' or 'json')
+    
+    Examples:
+        List all acquisitions and channels::
+        
+            openimc info input.mcd
+        
+        Show details for a specific acquisition::
+        
+            openimc info input.mcd --acquisition "ROI_001"
+        
+        Output as JSON for scripting::
+        
+            openimc info input.mcd --format json
+    """
+    input_path = Path(args.input)
+    
+    if not input_path.exists():
+        print(f"Error: Input file not found: {input_path}")
+        sys.exit(1)
+    
+    if not input_path.suffix.lower() == '.mcd':
+        print(f"Error: Input must be an MCD file, got: {input_path.suffix}")
+        sys.exit(1)
+    
+    # Load the MCD file
+    loader = MCDLoader()
+    try:
+        loader.open(str(input_path))
+        acquisitions = loader.list_acquisitions(str(input_path))
+        
+        # Filter by acquisition if specified
+        if args.acquisition:
+            filtered = [a for a in acquisitions 
+                       if a.name == args.acquisition or a.id == args.acquisition]
+            if not filtered:
+                print(f"Error: Acquisition '{args.acquisition}' not found.")
+                print(f"Available acquisitions: {', '.join(a.name for a in acquisitions)}")
+                sys.exit(1)
+            acquisitions = filtered
+        
+        # Output format
+        if args.format == 'json':
+            output = []
+            for acq in acquisitions:
+                output.append({
+                    'id': acq.id,
+                    'name': acq.name,
+                    'well': acq.well,
+                    'size': {'height': acq.size[0], 'width': acq.size[1]},
+                    'num_channels': len(acq.channels),
+                    'channels': acq.channels,
+                    'channel_metals': acq.channel_metals,
+                    'channel_labels': acq.channel_labels
+                })
+            print(json.dumps(output, indent=2))
+        else:
+            # Table format (default)
+            print(f"\n{'='*60}")
+            print(f"MCD File: {input_path.name}")
+            print(f"{'='*60}")
+            print(f"Total acquisitions: {len(acquisitions)}")
+            
+            for acq in acquisitions:
+                print(f"\n{'-'*60}")
+                print(f"Acquisition: {acq.name}")
+                print(f"  ID: {acq.id}")
+                if acq.well:
+                    print(f"  Well: {acq.well}")
+                if acq.size[0] and acq.size[1]:
+                    print(f"  Size: {acq.size[1]} x {acq.size[0]} (W x H)")
+                print(f"  Channels ({len(acq.channels)}):")
+                
+                # Print channels in a nice formatted way
+                for i, (ch, metal, label) in enumerate(zip(acq.channels, acq.channel_metals, acq.channel_labels)):
+                    print(f"    {i+1:3d}. {ch}")
+                    if args.verbose:
+                        print(f"         Metal: {metal}, Label: {label}")
+            
+            print(f"\n{'='*60}")
+            print("\nTip: Use channel names (e.g., '{example}') with --nuclear-channels".format(
+                example=acquisitions[0].channels[0] if acquisitions and acquisitions[0].channels else 'DNA1_Ir191'
+            ))
+    
+    finally:
+        loader.close()
+
+
 def preprocess_command(args):
     """Preprocess images: denoising and export to OME-TIFF.
     
@@ -292,26 +393,38 @@ def segment_command(args):
             - cytoplasm_channels: Optional comma-separated list of cytoplasm channels
             - acquisition: Optional acquisition ID or name (uses first if not specified)
             - denoise: Optional flag to apply denoising before segmentation
-            - arcsinh: Optional flag to apply arcsinh normalization
+            - normalization_method: Intensity normalization method (default: channelwise_minmax)
+                - "channelwise_minmax": Min-max scaling per channel (recommended, same as GUI default)
+                - "None": No normalization
+                - "arcsinh": Arcsinh transformation
+                - "percentile_clip": Percentile clipping
             - arcsinh_cofactor: Arcsinh cofactor (default: 1.0)
+            - percentile_low/high: Percentile bounds for percentile_clip (default: 1.0, 99.0)
             - Various method-specific parameters (model, diameter, thresholds, etc.)
     
     Examples:
-        Segment using Cellpose::
+        Segment using Cellpose with default channelwise_minmax normalization::
         
             openimc segment input.mcd output/ --method cellpose \\
                 --nuclear-channels DAPI --model cyto3 --gpu-id 0
         
-        Segment using Watershed::
+        Segment using CellSAM with no normalization::
+        
+            openimc segment input.mcd output/ --method cellsam \\
+                --nuclear-channels DNA1 --normalization-method None
+        
+        Segment using Watershed with arcsinh normalization::
         
             openimc segment input.mcd output/ --method watershed \\
-                --nuclear-channels DNA1 --cytoplasm-channels CK8_CK18
+                --nuclear-channels DNA1 --cytoplasm-channels CK8_CK18 \\
+                --normalization-method arcsinh --arcsinh-cofactor 5.0
     """
     print(f"Loading data from: {args.input}")
     loader, loader_type = load_mcd(args.input, channel_format=getattr(args, 'channel_format', 'CHW'))
     
     try:
-        acquisitions = loader.list_acquisitions()
+        # Pass input path so acquisitions have source_file set (needed for proper mask naming)
+        acquisitions = loader.list_acquisitions(source_file=args.input)
         
         # Get acquisition (use first if not specified)
         if args.acquisition:
@@ -363,6 +476,13 @@ def segment_command(args):
         for acq in acquisitions:
                 print(f"\nProcessing acquisition: {acq.name} (ID: {acq.id})")
                     
+                # Determine normalization method (--arcsinh flag is deprecated but still supported)
+                if args.arcsinh and args.normalization_method == 'channelwise_minmax':
+                    # User used deprecated --arcsinh flag, honor it
+                    norm_method = 'arcsinh'
+                else:
+                    norm_method = args.normalization_method
+                
                 # Use core segment function
                 mask = segment(
                     loader=loader,
@@ -372,9 +492,9 @@ def segment_command(args):
                     cyto_channels=cyto_channels if cyto_channels else None,
                     output_dir=output_dir,
                     denoise_settings=denoise_settings,
-                    normalization_method='arcsinh' if args.arcsinh else 'None',
-                    arcsinh_cofactor=args.arcsinh_cofactor if args.arcsinh else 1.0,
-                    percentile_params=(1.0, 99.0),
+                    normalization_method=norm_method,
+                    arcsinh_cofactor=args.arcsinh_cofactor,
+                    percentile_params=(args.percentile_low, args.percentile_high),
                     nuclear_combo_method=args.nuclear_fusion_method,
                     cyto_combo_method=args.cyto_fusion_method,
                     nuclear_weights=nuclear_weights,
@@ -397,7 +517,8 @@ def segment_command(args):
                     compactness=args.compactness
                 )
                 
-                print(f"  ✓ Segmentation complete: {np.max(mask)} cells detected")
+                n_cells = len(np.unique(mask)) - 1  # Subtract 1 for background (label 0)
+                print(f"  ✓ Segmentation complete: {n_cells} cells detected")
         
         print(f"\n✓ Segmentation complete! Output saved to: {output_dir}")
         
@@ -1073,7 +1194,8 @@ def deconvolution_command(args):
                 output_dir=output_dir,
                 x0=args.x0,
                 iterations=args.iterations,
-                output_format=args.output_format
+                output_format=args.output_format,
+                resolution=args.resolution
             )
             
             print(f"  Saved to: {output_path}")
@@ -1858,14 +1980,15 @@ def workflow_command(args):
                     acq_id=acq.id,
                     output_dir=str(deconv_output),
                     x0=deconv_config.get('x0', 7.0),
-                    iterations=deconv_config.get('iterations', 4),
+                    iterations=deconv_config.get('iterations', 7),
                     output_format=deconv_config.get('output_format', 'float'),
                     channel_names=channels,
                     source_file_path=acq.source_file,
                     unique_acq_id=acq.id,
                     loader_type=loader_type,
                     channel_format=config.get('channel_format', 'CHW'),
-                    well_name=acq.well
+                    well_name=acq.well,
+                    resolution=deconv_config.get('resolution', 333)
                 )
                 print(f"  ✓ Saved: {output_path}")
         finally:
@@ -2325,6 +2448,14 @@ Examples:
     
     subparsers = parser.add_subparsers(dest='command', help='Command to run')
     
+    # Info command - list acquisitions and channels
+    info_parser = subparsers.add_parser('info', help='Display MCD file information (acquisitions, channels)')
+    info_parser.add_argument('input', help='Input MCD file')
+    info_parser.add_argument('--acquisition', type=str, help='Show details for a specific acquisition (by ID or name)')
+    info_parser.add_argument('--format', choices=['table', 'json'], default='table', help='Output format (default: table)')
+    info_parser.add_argument('--verbose', '-v', action='store_true', help='Show additional channel details (metal and label separately)')
+    info_parser.set_defaults(func=info_command)
+    
     # Preprocess command
     preprocess_parser = subparsers.add_parser('preprocess', help='Preprocess images (denoising, export to OME-TIFF). Note: arcsinh normalization is not applied to exported images.')
     preprocess_parser.add_argument('input', help='Input MCD file or OME-TIFF directory')
@@ -2366,8 +2497,11 @@ Examples:
     segment_parser.add_argument('--use-wsi', action='store_true', help='Use WSI mode for CellSAM (for ROIs with >500 cells, increases processing time)')
     segment_parser.add_argument('--low-contrast-enhancement', action='store_true', help='Enable low contrast enhancement for CellSAM (for poor contrast images)')
     segment_parser.add_argument('--gauge-cell-size', action='store_true', help='Enable gauge cell size for CellSAM (runs twice: estimates error, then returns mask)')
-    segment_parser.add_argument('--arcsinh', action='store_true', help='Apply arcsinh normalization before segmentation')
-    segment_parser.add_argument('--arcsinh-cofactor', type=float, default=1.0, help='Arcsinh cofactor (default: 1.0)')
+    segment_parser.add_argument('--normalization-method', choices=['None', 'channelwise_minmax', 'arcsinh', 'percentile_clip'], default='channelwise_minmax', help='Intensity normalization method (default: channelwise_minmax, same as GUI)')
+    segment_parser.add_argument('--arcsinh', action='store_true', help='(Deprecated) Use --normalization-method arcsinh instead. Apply arcsinh normalization before segmentation')
+    segment_parser.add_argument('--arcsinh-cofactor', type=float, default=1.0, help='Arcsinh cofactor for arcsinh normalization (default: 1.0)')
+    segment_parser.add_argument('--percentile-low', type=float, default=1.0, help='Low percentile for percentile_clip normalization (default: 1.0)')
+    segment_parser.add_argument('--percentile-high', type=float, default=99.0, help='High percentile for percentile_clip normalization (default: 99.0)')
     segment_parser.add_argument('--denoise', choices=['all'], help='Apply denoising to all channels (use "all" for hot pixel removal on all channels)')
     segment_parser.add_argument('--denoise-method', choices=['median3', 'n_sd_local_median'], default='median3', help='Hot pixel removal method: median3 (3x3 median filter) or n_sd_local_median (replace pixels above N SD over local median, default: median3)')
     segment_parser.add_argument('--denoise-n-sd', type=float, default=5.0, help='Number of standard deviations for n_sd_local_median method only (ignored for median3, default: 5.0)')
@@ -2597,8 +2731,9 @@ Examples:
     deconv_parser.add_argument('--channel-format', choices=['CHW', 'HWC'], default='CHW', help='Channel format for OME-TIFF files (default: CHW)')
     deconv_parser.add_argument('--acquisition', type=str, help='Acquisition ID or name (processes all if not specified)')
     deconv_parser.add_argument('--x0', type=float, default=7.0, help='Parameter for kernel calculation (default: 7.0)')
-    deconv_parser.add_argument('--iterations', type=int, default=4, help='Number of Richardson-Lucy iterations (default: 4)')
+    deconv_parser.add_argument('--iterations', type=int, default=7, help='Number of Richardson-Lucy iterations (default: 7)')
     deconv_parser.add_argument('--output-format', choices=['float', 'uint16'], default='float', help='Output format (default: float)')
+    deconv_parser.add_argument('--resolution', type=int, choices=[333, 500], default=333, help='HR-IMC resolution in nm (default: 333)')
     deconv_parser.add_argument('--workers', type=int, default=None, help=f'Number of parallel workers (default: {get_default_workers()})')
     deconv_parser.set_defaults(func=deconvolution_command)
     
