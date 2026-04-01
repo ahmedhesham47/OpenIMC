@@ -287,6 +287,51 @@ class CellClusteringDialog(QtWidgets.QDialog):
         
         # Check if cluster columns exist and auto-draw heatmap if they do
         self._check_and_auto_draw_heatmap()
+
+    def _get_logging_dataframe(self):
+        """Return the dataframe that best represents the current clustering context."""
+        if self.clustered_data is not None and not self.clustered_data.empty:
+            return self.clustered_data
+        if self.feature_dataframe is not None and not self.feature_dataframe.empty:
+            return self.feature_dataframe
+        return None
+
+    def _get_logging_acquisitions(self) -> List[str]:
+        """Collect acquisition IDs for analysis-step logging."""
+        df = self._get_logging_dataframe()
+        if df is None or 'acquisition_id' not in df.columns:
+            return []
+        return [str(v) for v in df['acquisition_id'].dropna().unique().tolist()]
+
+    def _get_source_files_for_logging(self) -> List[str]:
+        """Collect source file basenames for analysis-step logging."""
+        df = self._get_logging_dataframe()
+        source_files = []
+        if df is not None and 'source_file' in df.columns:
+            seen = set()
+            for value in df['source_file'].dropna().tolist():
+                basename = os.path.basename(str(value))
+                if basename and basename not in seen:
+                    seen.add(basename)
+                    source_files.append(basename)
+
+        if not source_files and self.parent() is not None and hasattr(self.parent(), 'current_path'):
+            current_path = getattr(self.parent(), 'current_path', None)
+            if current_path:
+                source_files = [os.path.basename(current_path)]
+
+        return source_files
+
+    def _get_source_file_summary_for_logging(self):
+        """Return a compact human-readable source file summary for log headers."""
+        source_files = self._get_source_files_for_logging()
+        if not source_files:
+            return None
+        if len(source_files) == 1:
+            return source_files[0]
+        if len(source_files) <= 3:
+            return ", ".join(source_files)
+        return ", ".join(source_files[:3]) + f" and {len(source_files) - 3} more"
     
     def _check_and_auto_draw_heatmap(self):
         """Check if cluster columns exist and auto-draw heatmap if they do.
@@ -1181,7 +1226,8 @@ class CellClusteringDialog(QtWidgets.QDialog):
                 "include_morphological": include_morpho,
                 "scaling_method": scaling_method,
                 "distance_metric": "euclidean",
-                "n_cells": int(len(self.clustered_data)) if self.clustered_data is not None else 0
+                "n_cells": int(len(self.clustered_data)) if self.clustered_data is not None else 0,
+                "source_files": self._get_source_files_for_logging(),
             }
             
             if cluster_method == "leiden":
@@ -1209,15 +1255,8 @@ class CellClusteringDialog(QtWidgets.QDialog):
                 params["seed"] = self.seed_spinbox.value()
             
             # Get acquisition IDs from clustered data
-            acquisitions = []
-            if self.clustered_data is not None and 'acquisition_id' in self.clustered_data.columns:
-                acquisitions = list(self.clustered_data['acquisition_id'].unique())
-            
-            # Get source file name from parent if available
-            source_file = None
-            if self.parent() is not None and hasattr(self.parent(), 'current_path'):
-                import os
-                source_file = os.path.basename(self.parent().current_path) if self.parent().current_path else None
+            acquisitions = self._get_logging_acquisitions()
+            source_file = self._get_source_file_summary_for_logging()
             
             logger.log_clustering(
                 method=cluster_method,
@@ -6696,21 +6735,11 @@ class CellClusteringDialog(QtWidgets.QDialog):
             
             # Log gating operation
             logger = get_logger()
-            acquisitions = []
-            if self.feature_dataframe is not None and 'acquisition_id' in self.feature_dataframe.columns:
-                acquisitions = list(self.feature_dataframe['acquisition_id'].unique())
-            
-            # Get source file name from parent if available
-            source_file = None
-            if self.parent() is not None and hasattr(self.parent(), 'current_path'):
-                import os
-                source_file = os.path.basename(self.parent().current_path) if self.parent().current_path else None
-            
             logger.log_gating(
                 gating_rules=self.gating_rules,
-                acquisitions=acquisitions,
+                acquisitions=self._get_logging_acquisitions(),
                 notes=f"Applied {len(self.gating_rules)} gating rules",
-                source_file=source_file
+                source_file=self._get_source_file_summary_for_logging()
             )
             
             QtWidgets.QMessageBox.information(self, "Gating Applied", "Manual phenotypes assigned using gating rules.")
@@ -6913,22 +6942,12 @@ class CellClusteringDialog(QtWidgets.QDialog):
             
             # Log annotation operation
             logger = get_logger()
-            acquisitions = []
-            if self.clustered_data is not None and 'acquisition_id' in self.clustered_data.columns:
-                acquisitions = list(self.clustered_data['acquisition_id'].unique())
-            
-            # Get source file name from parent if available
-            source_file = None
-            if self.parent() is not None and hasattr(self.parent(), 'current_path'):
-                import os
-                source_file = os.path.basename(self.parent().current_path) if self.parent().current_path else None
-            
             logger.log_class_annotation(
                 annotation_map=self.cluster_annotation_map,
                 method="manual",
-                acquisitions=acquisitions,
+                acquisitions=self._get_logging_acquisitions(),
                 notes=f"Annotated {len(self.cluster_annotation_map)} clusters",
-                source_file=source_file
+                source_file=self._get_source_file_summary_for_logging()
             )
             
             QtWidgets.QMessageBox.information(self, "Annotations Applied", "Cluster annotations have been applied.")

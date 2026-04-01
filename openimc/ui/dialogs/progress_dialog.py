@@ -17,6 +17,8 @@
 # You should have received a copy of the GNU General Public License
 # along with this program.  If not, see <https://www.gnu.org/licenses/>.
 
+from typing import Optional
+
 from PyQt5 import QtWidgets
 from PyQt5.QtCore import Qt
 
@@ -34,6 +36,7 @@ class ProgressDialog(QtWidgets.QDialog):
         layout = QtWidgets.QVBoxLayout(self)
         self.status_label = QtWidgets.QLabel("Preparing export...")
         self.status_label.setAlignment(Qt.AlignCenter)
+        self.status_label.setWordWrap(True)
         layout.addWidget(self.status_label)
 
         self.progress_bar = QtWidgets.QProgressBar()
@@ -43,6 +46,7 @@ class ProgressDialog(QtWidgets.QDialog):
 
         self.details_label = QtWidgets.QLabel("")
         self.details_label.setAlignment(Qt.AlignCenter)
+        self.details_label.setWordWrap(True)
         self.details_label.setStyleSheet("QLabel { color: #666; }")
         layout.addWidget(self.details_label)
 
@@ -66,6 +70,21 @@ class ProgressDialog(QtWidgets.QDialog):
     def set_maximum(self, maximum: int):
         self.progress_bar.setMaximum(maximum)
 
+    def set_cancel_enabled(self, enabled: bool):
+        self.cancel_btn.setEnabled(enabled)
+
     def is_cancelled(self) -> bool:
         return self.cancelled
 
+
+def close_progress_dialog(progress_dialog: Optional[QtWidgets.QDialog]) -> None:
+    """Close a progress dialog and flush pending UI updates."""
+    if progress_dialog is None:
+        return
+
+    progress_dialog.hide()
+    progress_dialog.close()
+
+    app = QtWidgets.QApplication.instance()
+    if app is not None:
+        app.processEvents()

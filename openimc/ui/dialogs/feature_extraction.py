@@ -788,7 +788,12 @@ class FeatureExtractionDialog(QtWidgets.QDialog):
     
     def get_denoise_source(self):
         """Get the selected denoising source."""
-        return self.denoise_source_combo.currentText()
+        source = self.denoise_source_combo.currentText()
+        if source == "Viewer":
+            return "viewer"
+        if source == "Custom":
+            return "custom"
+        return "none"
     
     def get_custom_denoise_settings(self):
         """Get the custom denoising settings."""
@@ -802,6 +807,11 @@ class FeatureExtractionDialog(QtWidgets.QDialog):
                 'method': self._spillover_method or 'pgd'
             }
         return None
+
+    def get_spillover_file_path(self):
+        """Get the selected spillover matrix path, if any."""
+        file_path = self.spillover_file_edit.text().strip()
+        return file_path or None
     
     def _populate_channel_exclusion_list(self):
         """Populate the channel exclusion list with available channels."""

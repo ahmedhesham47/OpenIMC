@@ -50,6 +50,7 @@ dependencies = [
     "openai>=1.42.0",
     "combat>=0.1.0",
     "harmonypy>=0.0.9",
+    "dask==2024.11.2",
     "pyyaml",
 ]
 
@@ -126,4 +127,3 @@ exclude_lines = [
     "if TYPE_CHECKING:",
     "@abstractmethod",
 ]
-

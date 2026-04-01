@@ -128,7 +128,7 @@ from openimc.ui.utils import (
     combine_channels,
     additive_blend_channels,
 )
-from openimc.ui.dialogs.progress_dialog import ProgressDialog
+from openimc.ui.dialogs.progress_dialog import ProgressDialog, close_progress_dialog
 from openimc.ui.dialogs.gpu_selection_dialog import GPUSelectionDialog
 from openimc.ui.dialogs.preprocessing_dialog import PreprocessingDialog
 from openimc.ui.dialogs.segmentation_dialog import SegmentationDialog
@@ -4477,6 +4477,37 @@ class MainWindow(QtWidgets.QMainWindow):
                 photometric='minisblack'
             )
         
+        export_params = {
+            "export_scope": "single_acquisition",
+            "include_metadata": include_metadata,
+            "denoise_source": denoise_source,
+            "denoise_used": self._get_relevant_denoise_settings(
+                denoise_source,
+                custom_denoise_settings=custom_denoise_settings,
+                relevant_channels=channel_names
+            ) is not None,
+            "normalization_method": normalization_method,
+            "percentile_params": list(percentile_params) if normalization_method == "percentile_clip" else None,
+            "channels_exported": channel_names,
+            "exported_acquisitions": [self.current_acq_id],
+            "source_files": self._get_source_files_for_logging([self.current_acq_id]),
+            "output_format": "OME-TIFF",
+        }
+        denoise_settings = self._get_relevant_denoise_settings(
+            denoise_source,
+            custom_denoise_settings=custom_denoise_settings,
+            relevant_channels=channel_names
+        )
+        if denoise_settings:
+            export_params["denoise_settings"] = denoise_settings
+        self._log_export_operation(
+            "ome_tiff",
+            export_params,
+            output_path,
+            acquisitions=[self.current_acq_id],
+            notes=f"Exported {len(channel_names)} channels from {acq_info.name} to OME-TIFF"
+        )
+        
         return True
     
     def _export_whole_slide(self, output_dir: str, include_metadata: bool, 
@@ -4486,6 +4517,9 @@ class MainWindow(QtWidgets.QMainWindow):
                           percentile_params: Tuple[float, float]) -> bool:
         """Export all acquisitions from the slide."""
         total_acquisitions = len(self.acquisitions)
+        exported_acq_ids = []
+        channel_counts_by_acquisition = {}
+        reference_channel_names = None
         
         # Process each acquisition
         for acq_idx, acq_info in enumerate(self.acquisitions):
@@ -4671,6 +4705,43 @@ class MainWindow(QtWidgets.QMainWindow):
                     ome=True,
                     photometric='minisblack'
                 )
+            
+            exported_acq_ids.append(acq_info.id)
+            channel_counts_by_acquisition[acq_info.id] = len(channel_names)
+            if reference_channel_names is None:
+                reference_channel_names = list(channel_names)
+        
+        if exported_acq_ids:
+            export_params = {
+                "export_scope": "whole_slide",
+                "include_metadata": include_metadata,
+                "denoise_source": denoise_source,
+                "denoise_used": self._get_relevant_denoise_settings(
+                    denoise_source,
+                    custom_denoise_settings=custom_denoise_settings
+                ) is not None,
+                "normalization_method": normalization_method,
+                "percentile_params": list(percentile_params) if normalization_method == "percentile_clip" else None,
+                "n_exported_acquisitions": len(exported_acq_ids),
+                "exported_acquisitions": exported_acq_ids,
+                "channel_counts_by_acquisition": channel_counts_by_acquisition,
+                "channels_exported": reference_channel_names or [],
+                "source_files": self._get_source_files_for_logging(exported_acq_ids),
+                "output_format": "OME-TIFF",
+            }
+            denoise_settings = self._get_relevant_denoise_settings(
+                denoise_source,
+                custom_denoise_settings=custom_denoise_settings
+            )
+            if denoise_settings:
+                export_params["denoise_settings"] = denoise_settings
+            self._log_export_operation(
+                "ome_tiff",
+                export_params,
+                output_dir,
+                acquisitions=exported_acq_ids,
+                notes=f"Exported {len(exported_acq_ids)} acquisitions to OME-TIFF"
+            )
         
         return True
     
@@ -4706,6 +4777,19 @@ class MainWindow(QtWidgets.QMainWindow):
             
             # Generate panel.csv
             output_path = get_panel(acq_info, file_path)
+            self._log_export_operation(
+                "panel_csv",
+                {
+                    "export_scope": "single_acquisition",
+                    "channels_exported": list(getattr(acq_info, 'channels', []) or []),
+                    "exported_acquisitions": [self.current_acq_id],
+                    "source_files": self._get_source_files_for_logging([self.current_acq_id]),
+                    "output_format": "CSV",
+                },
+                output_path,
+                acquisitions=[self.current_acq_id],
+                notes=f"Exported panel.csv for {acq_info.name}"
+            )
             
             QtWidgets.QMessageBox.information(
                 self, "Export Complete",
@@ -5013,6 +5097,167 @@ class MainWindow(QtWidgets.QMainWindow):
         
         return filename
 
+    def _get_source_files_for_logging(self, acquisition_ids: Optional[List[str]] = None) -> List[str]:
+        """Collect unique source file labels for the provided acquisitions."""
+        source_files = []
+        seen = set()
+
+        def add_path(file_path: Optional[str]):
+            if not file_path:
+                return
+            if os.path.isdir(file_path):
+                label = os.path.basename(file_path.rstrip(os.sep)) or file_path
+            else:
+                label = os.path.basename(file_path)
+            if label and label not in seen:
+                seen.add(label)
+                source_files.append(label)
+
+        if acquisition_ids:
+            for acq_id in acquisition_ids:
+                acq_info = self._get_acquisition_info(acq_id)
+                if acq_info is not None and getattr(acq_info, 'source_file', None):
+                    add_path(acq_info.source_file)
+                elif acq_id in self.acq_to_file:
+                    add_path(self.acq_to_file[acq_id])
+        elif self.acq_to_file:
+            for file_path in self.acq_to_file.values():
+                add_path(file_path)
+        elif self.current_path:
+            add_path(self.current_path)
+
+        return source_files
+
+    def _get_source_file_summary_for_logging(self, acquisition_ids: Optional[List[str]] = None) -> Optional[str]:
+        """Return a compact source-file summary for logger headers."""
+        source_files = self._get_source_files_for_logging(acquisition_ids)
+        if not source_files:
+            return None
+        if len(source_files) == 1:
+            return source_files[0]
+        if len(source_files) <= 3:
+            return ", ".join(source_files)
+        return ", ".join(source_files[:3]) + f" and {len(source_files) - 3} more"
+
+    def _get_relevant_denoise_settings(
+        self,
+        denoise_source: str,
+        custom_denoise_settings: Optional[Dict[str, Dict[str, dict]]] = None,
+        relevant_channels: Optional[List[str]] = None
+    ) -> Optional[Dict[str, Dict[str, dict]]]:
+        """Return denoise settings that were actually relevant to an operation."""
+        normalized_source = (denoise_source or "none").lower()
+        if "viewer" in normalized_source:
+            normalized_source = "viewer"
+        elif "custom" in normalized_source:
+            normalized_source = "custom"
+        else:
+            normalized_source = "none"
+        if normalized_source == "viewer":
+            settings = getattr(self, 'channel_denoise', {}) or {}
+        elif normalized_source == "custom":
+            settings = custom_denoise_settings or {}
+        else:
+            return None
+
+        if relevant_channels:
+            channels = []
+            seen = set()
+            for channel in relevant_channels:
+                if channel and channel not in seen:
+                    seen.add(channel)
+                    channels.append(channel)
+        else:
+            channels = list(settings.keys())
+
+        filtered_settings = {}
+        for channel in channels:
+            channel_settings = settings.get(channel)
+            if not isinstance(channel_settings, dict):
+                continue
+            cleaned = {
+                step_name: step_config
+                for step_name, step_config in channel_settings.items()
+                if step_config
+            }
+            if cleaned:
+                filtered_settings[channel] = cleaned
+
+        return filtered_settings or None
+
+    def _build_segmentation_log_params(
+        self,
+        preprocessing_config: Optional[dict],
+        denoise_source: str,
+        custom_denoise_settings: Optional[Dict[str, Dict[str, dict]]],
+        acquisitions: Optional[List[str]] = None,
+        *,
+        show_overlay: bool = True,
+        save_masks: bool = False,
+        masks_directory: Optional[str] = None,
+        segment_scope: str = "current_acquisition"
+    ) -> Dict[str, Any]:
+        """Build shared segmentation metadata for analysis-step logging."""
+        config = preprocessing_config or {}
+        nuclear_channels = list(config.get('nuclear_channels') or [])
+        cyto_channels = list(config.get('cyto_channels') or [])
+        relevant_channels = nuclear_channels + [ch for ch in cyto_channels if ch not in nuclear_channels]
+        normalized_source = (denoise_source or "none").lower()
+        if "viewer" in normalized_source:
+            normalized_source = "viewer"
+        elif "custom" in normalized_source:
+            normalized_source = "custom"
+        else:
+            normalized_source = "none"
+        denoise_settings = self._get_relevant_denoise_settings(
+            normalized_source,
+            custom_denoise_settings=custom_denoise_settings,
+            relevant_channels=relevant_channels
+        )
+
+        params = {
+            "segment_scope": segment_scope,
+            "show_overlay": bool(show_overlay),
+            "save_masks": bool(save_masks),
+            "masks_directory": masks_directory if save_masks else None,
+            "normalization_method": config.get('normalization_method'),
+            "arcsinh_cofactor": config.get('arcsinh_cofactor') if config.get('normalization_method') == 'arcsinh' else None,
+            "percentile_params": list(config.get('percentile_params')) if config.get('normalization_method') == 'percentile_clip' and config.get('percentile_params') is not None else None,
+            "nuclear_channels": nuclear_channels,
+            "cyto_channels": cyto_channels,
+            "nuclear_combo_method": config.get('nuclear_combo_method'),
+            "cyto_combo_method": config.get('cyto_combo_method'),
+            "nuclear_weights": config.get('nuclear_weights'),
+            "cyto_weights": config.get('cyto_weights'),
+            "selected_channel_count": len(relevant_channels),
+            "input_mode": "combined" if (nuclear_channels and cyto_channels) else ("nuclear" if nuclear_channels else ("cyto" if cyto_channels else "unknown")),
+            "denoise_source": normalized_source,
+            "denoise_used": denoise_settings is not None,
+            "source_files": self._get_source_files_for_logging(acquisitions),
+        }
+        if denoise_settings:
+            params["denoise_settings"] = denoise_settings
+        return params
+
+    def _log_export_operation(
+        self,
+        export_type: str,
+        parameters: Dict[str, Any],
+        output_path: str,
+        acquisitions: Optional[List[str]] = None,
+        notes: Optional[str] = None
+    ) -> None:
+        """Write a structured export entry to the methods log."""
+        logger = get_logger()
+        logger.log_export(
+            export_type=export_type,
+            parameters=parameters,
+            output_path=output_path,
+            acquisitions=acquisitions or [],
+            notes=notes,
+            source_file=self._get_source_file_summary_for_logging(acquisitions)
+        )
+
     # ---------- Segmentation ----------
     def _run_segmentation(self):
         """Run cell segmentation using Cellpose."""
@@ -5282,36 +5527,30 @@ class MainWindow(QtWidgets.QMainWindow):
                     
                     # Get project path
                     project_path = dlg.get_project_path()
-                    
-                    # Get preprocessing config if available
-                    nuclear_channels = preprocessing_config.get('nuclear_channels', []) if preprocessing_config else []
-                    cyto_channels = preprocessing_config.get('cyto_channels', []) if preprocessing_config else []
-                    
-                    params = {
-                        "method": "ilastik",
-                        "project_path": project_path,
-                        "nuclear_channels": nuclear_channels,
-                        "cyto_channels": cyto_channels,
-                        "n_cells": int(n_cells)
-                    }
-                    
-                    # Add denoising info if available
                     denoise_source = seg_dlg.get_denoise_source()
                     custom_denoise_settings = seg_dlg.get_custom_denoise_settings()
-                    if denoise_source == "custom" and custom_denoise_settings:
-                        params["denoise_settings"] = custom_denoise_settings
-                    else:
-                        params["denoise_source"] = denoise_source
-                    
-                    # Get source file name
-                    source_file = os.path.basename(self.current_path) if self.current_path else None
+                    params = self._build_segmentation_log_params(
+                        preprocessing_config,
+                        denoise_source,
+                        custom_denoise_settings,
+                        acquisitions=[self.current_acq_id],
+                        show_overlay=True,
+                        save_masks=False,
+                        masks_directory=None,
+                        segment_scope="current_acquisition"
+                    )
+                    params.update({
+                        "method": "ilastik",
+                        "project_path": project_path,
+                        "n_cells": int(n_cells),
+                    })
                     
                     logger.log_segmentation(
                         method="ilastik",
                         parameters=params,
                         acquisitions=[self.current_acq_id],
                         notes=f"Ilastik segmented {n_cells} cells/regions",
-                        source_file=source_file
+                        source_file=self._get_source_file_summary_for_logging([self.current_acq_id])
                     )
                     
                     # Show overlay
@@ -5453,12 +5692,19 @@ class MainWindow(QtWidgets.QMainWindow):
                 # Log watershed segmentation
                 logger = get_logger()
                 n_cells = len(np.unique(masks[0])) - 1
-                params = {
+                params = self._build_segmentation_log_params(
+                    preprocessing_config,
+                    denoise_source,
+                    custom_denoise_settings,
+                    acquisitions=[self.current_acq_id],
+                    show_overlay=show_overlay,
+                    save_masks=save_masks,
+                    masks_directory=masks_directory,
+                    segment_scope="current_acquisition"
+                )
+                params.update({
                     "method": "watershed",
-                    "nuclear_channels": nuclear_channels,
-                    "cyto_channels": cyto_channels,
                     "nuclear_fusion_method": nuclear_fusion_method,
-                    "nuclear_weights": nuclear_weights,
                     "seed_threshold_method": seed_threshold_method,
                     "min_seed_area": min_seed_area,
                     "min_distance_peaks": min_distance_peaks,
@@ -5472,21 +5718,15 @@ class MainWindow(QtWidgets.QMainWindow):
                     "tile_size": tile_size,
                     "tile_overlap": tile_overlap,
                     "rng_seed": rng_seed,
-                    "n_cells": int(n_cells)
-                }
-                if denoise_source == "custom" and custom_denoise_settings:
-                    params["denoise_settings"] = custom_denoise_settings
-                else:
-                    params["denoise_source"] = denoise_source
-                
-                source_file = os.path.basename(self.current_path) if self.current_path else None
+                    "n_cells": int(n_cells),
+                })
                 logger.log_segmentation(
                     method="watershed",
                     parameters=params,
                     acquisitions=[self.current_acq_id],
                     output_path=masks_directory if save_masks else None,
                     notes=f"Segmented {n_cells} cells",
-                    source_file=source_file
+                    source_file=self._get_source_file_summary_for_logging([self.current_acq_id])
                 )
                 
             else:
@@ -5615,37 +5855,36 @@ class MainWindow(QtWidgets.QMainWindow):
                 # Log segmentation for Cellpose and CellSAM
                 logger = get_logger()
                 n_cells = len(np.unique(masks[0])) - 1
-                
+                params = self._build_segmentation_log_params(
+                    preprocessing_config,
+                    denoise_source,
+                    custom_denoise_settings,
+                    acquisitions=[self.current_acq_id],
+                    show_overlay=show_overlay,
+                    save_masks=save_masks,
+                    masks_directory=masks_directory,
+                    segment_scope="current_acquisition"
+                )
                 if core_method == "cellsam":
-                    params = {
+                    params.update({
                         "method": "cellsam",
                         "bbox_threshold": bbox_threshold,
                         "use_wsi": use_wsi,
                         "low_contrast_enhancement": low_contrast_enhancement,
                         "gauge_cell_size": gauge_cell_size,
-                        "nuclear_channels": nuclear_channels,
-                        "cyto_channels": cyto_channels,
-                        "input_mode": "combined" if (nuclear_channels and cyto_channels) else ("nuclear" if nuclear_channels else "cyto"),
-                        "n_cells": int(n_cells)
-                    }
+                        "n_cells": int(n_cells),
+                    })
                 else:  # cellpose
-                    params = {
+                    params.update({
+                        "method": "cellpose",
                         "model_type": cellpose_model,
                         "diameter": diameter,
                         "flow_threshold": flow_threshold,
                         "cellprob_threshold": cellprob_threshold,
                         "gpu_id": str(gpu_id) if gpu_id is not None else None,
-                        "nuclear_channels": nuclear_channels,
-                        "cyto_channels": cyto_channels,
-                        "n_cells": int(n_cells)
-                    }
+                        "n_cells": int(n_cells),
+                    })
                 
-                if denoise_source == "custom" and custom_denoise_settings:
-                    params["denoise_settings"] = custom_denoise_settings
-                else:
-                    params["denoise_source"] = denoise_source
-                
-                source_file = os.path.basename(self.current_path) if self.current_path else None
                 method_name = "cellsam" if core_method == "cellsam" else "cellpose"
                 logger.log_segmentation(
                     method=method_name,
@@ -5653,7 +5892,7 @@ class MainWindow(QtWidgets.QMainWindow):
                     acquisitions=[self.current_acq_id],
                     output_path=masks_directory if save_masks else None,
                     notes=f"Segmented {n_cells} cells",
-                    source_file=source_file
+                    source_file=self._get_source_file_summary_for_logging([self.current_acq_id])
                 )
             
             progress_dlg.update_progress(80, "Processing results", "Creating segmentation masks...")
@@ -5757,7 +5996,7 @@ class MainWindow(QtWidgets.QMainWindow):
         if model == "Classical Watershed":
             self._perform_watershed_batch_segmentation(
                 preprocessing_config, denoise_source, custom_denoise_settings, 
-                save_masks, masks_directory, dlg, progress_dlg, total_acquisitions,
+                save_masks, masks_directory, show_overlay, dlg, progress_dlg, total_acquisitions,
                 acquisitions_to_process=acquisitions_to_process
             )
             return
@@ -5766,7 +6005,7 @@ class MainWindow(QtWidgets.QMainWindow):
         if model == "DeepCell CellSAM":
             self._perform_cellsam_batch_segmentation(
                 preprocessing_config, denoise_source, custom_denoise_settings, 
-                save_masks, masks_directory, dlg, progress_dlg, total_acquisitions,
+                save_masks, masks_directory, show_overlay, dlg, progress_dlg, total_acquisitions,
                 acquisitions_to_process=acquisitions_to_process
             )
             return
@@ -5798,6 +6037,9 @@ class MainWindow(QtWidgets.QMainWindow):
             
             # Process acquisitions sequentially
             successful_segmentations = 0
+            successful_acq_ids = []
+            failed_acq_ids = []
+            cell_counts_by_acquisition = {}
             
             for acq_idx, acq in enumerate(acquisitions_to_process):
                 if progress_dlg.is_cancelled():
@@ -5896,6 +6138,9 @@ class MainWindow(QtWidgets.QMainWindow):
                     if acq_id in self.cluster_color_map:
                         del self.cluster_color_map[acq_id]
                     
+                    n_cells = int(len(np.unique(mask)) - 1)
+                    successful_acq_ids.append(acq_id)
+                    cell_counts_by_acquisition[acq_id] = n_cells
                     successful_segmentations += 1
                     
                     # Update progress
@@ -5907,8 +6152,42 @@ class MainWindow(QtWidgets.QMainWindow):
                     
                 except Exception as e:
                     print(f"Error segmenting acquisition {acq.name}: {e}")
+                    failed_acq_ids.append(acq.id)
                     # Continue with next acquisition
                     continue
+
+            if successful_acq_ids:
+                params = self._build_segmentation_log_params(
+                    preprocessing_config,
+                    denoise_source,
+                    custom_denoise_settings,
+                    acquisitions=successful_acq_ids,
+                    show_overlay=show_overlay,
+                    save_masks=save_masks,
+                    masks_directory=masks_directory,
+                    segment_scope="batch"
+                )
+                params.update({
+                    "method": "cellpose",
+                    "model_type": "nuclei" if model == "nuclei" else "cyto3",
+                    "diameter": diameter,
+                    "flow_threshold": flow_threshold,
+                    "cellprob_threshold": cellprob_threshold,
+                    "gpu_id": str(gpu_device) if gpu_device is not None else None,
+                    "n_requested_acquisitions": total_acquisitions,
+                    "n_successful_acquisitions": len(successful_acq_ids),
+                    "successful_acquisitions": successful_acq_ids,
+                    "failed_acquisitions": failed_acq_ids,
+                    "cell_counts_by_acquisition": cell_counts_by_acquisition,
+                })
+                get_logger().log_segmentation(
+                    method="cellpose",
+                    parameters=params,
+                    acquisitions=successful_acq_ids,
+                    output_path=masks_directory if save_masks else None,
+                    notes=f"Batch-segmented {len(successful_acq_ids)} of {total_acquisitions} acquisitions",
+                    source_file=self._get_source_file_summary_for_logging(successful_acq_ids)
+                )
             
             progress_dlg.update_progress(total_acquisitions, "Batch segmentation complete", 
                                        f"Successfully segmented {successful_segmentations}/{total_acquisitions} acquisitions")
@@ -5931,7 +6210,7 @@ class MainWindow(QtWidgets.QMainWindow):
     
     def _perform_cellsam_batch_segmentation(self, preprocessing_config: dict, denoise_source: str, 
                                             custom_denoise_settings: dict, save_masks: bool, 
-                                            masks_directory: str, dlg, progress_dlg, total_acquisitions: int,
+                                            masks_directory: str, show_overlay: bool, dlg, progress_dlg, total_acquisitions: int,
                                             acquisitions_to_process: List = None):
         """Perform sequential batch segmentation for CellSAM (one acquisition at a time)."""
         if acquisitions_to_process is None:
@@ -6009,6 +6288,9 @@ class MainWindow(QtWidgets.QMainWindow):
             
             # Process each acquisition sequentially
             successful_segmentations = 0
+            successful_acq_ids = []
+            failed_acq_ids = []
+            cell_counts_by_acquisition = {}
             
             for acq_idx, acq in enumerate(acquisitions_to_process):
                 if progress_dlg.is_cancelled():
@@ -6117,6 +6399,9 @@ class MainWindow(QtWidgets.QMainWindow):
                     if acq_id in self.cluster_color_map:
                         del self.cluster_color_map[acq_id]
                     
+                    n_cells = int(len(np.unique(mask)) - 1)
+                    successful_acq_ids.append(acq_id)
+                    cell_counts_by_acquisition[acq_id] = n_cells
                     successful_segmentations += 1
                     
                     # Update progress
@@ -6128,8 +6413,41 @@ class MainWindow(QtWidgets.QMainWindow):
                     
                 except Exception as e:
                     print(f"Error segmenting acquisition {acq_name} ({acq_id}): {e}")
+                    failed_acq_ids.append(acq_id)
                     # Continue with next acquisition
                     continue
+
+            if successful_acq_ids:
+                params = self._build_segmentation_log_params(
+                    preprocessing_config,
+                    denoise_source,
+                    custom_denoise_settings,
+                    acquisitions=successful_acq_ids,
+                    show_overlay=show_overlay,
+                    save_masks=save_masks,
+                    masks_directory=masks_directory,
+                    segment_scope="batch"
+                )
+                params.update({
+                    "method": "cellsam",
+                    "bbox_threshold": bbox_threshold,
+                    "use_wsi": use_wsi,
+                    "low_contrast_enhancement": low_contrast_enhancement,
+                    "gauge_cell_size": gauge_cell_size,
+                    "n_requested_acquisitions": total_acquisitions,
+                    "n_successful_acquisitions": len(successful_acq_ids),
+                    "successful_acquisitions": successful_acq_ids,
+                    "failed_acquisitions": failed_acq_ids,
+                    "cell_counts_by_acquisition": cell_counts_by_acquisition,
+                })
+                get_logger().log_segmentation(
+                    method="cellsam",
+                    parameters=params,
+                    acquisitions=successful_acq_ids,
+                    output_path=masks_directory if save_masks else None,
+                    notes=f"Batch-segmented {len(successful_acq_ids)} of {total_acquisitions} acquisitions",
+                    source_file=self._get_source_file_summary_for_logging(successful_acq_ids)
+                )
             
             progress_dlg.update_progress(
                 total_acquisitions, 
@@ -6165,7 +6483,7 @@ class MainWindow(QtWidgets.QMainWindow):
     
     def _perform_watershed_batch_segmentation(self, preprocessing_config: dict, denoise_source: str, 
                                                custom_denoise_settings: dict, save_masks: bool, 
-                                               masks_directory: str, dlg, progress_dlg, total_acquisitions: int,
+                                               masks_directory: str, show_overlay: bool, dlg, progress_dlg, total_acquisitions: int,
                                                acquisitions_to_process: List = None):
         """Perform sequential batch segmentation for Classical Watershed (one acquisition at a time)."""
         if acquisitions_to_process is None:
@@ -6216,6 +6534,9 @@ class MainWindow(QtWidgets.QMainWindow):
             
             # Process each acquisition sequentially
             successful_segmentations = 0
+            successful_acq_ids = []
+            failed_acq_ids = []
+            cell_counts_by_acquisition = {}
             
             for acq_idx, acq in enumerate(acquisitions_to_process):
                 if progress_dlg.is_cancelled():
@@ -6308,10 +6629,12 @@ class MainWindow(QtWidgets.QMainWindow):
                     if acq_id in self.cluster_color_map:
                         del self.cluster_color_map[acq_id]
                     
+                    n_cells = int(len(np.unique(mask)) - 1)
+                    successful_acq_ids.append(acq_id)
+                    cell_counts_by_acquisition[acq_id] = n_cells
                     successful_segmentations += 1
                     
                     # Update progress
-                    n_cells = len(np.unique(mask)) - 1
                     progress_dlg.update_progress(
                         successful_segmentations,
                         f"Completed {acq_name}",
@@ -6320,8 +6643,51 @@ class MainWindow(QtWidgets.QMainWindow):
                     
                 except Exception as e:
                     print(f"Error segmenting acquisition {acq_name} ({acq_id}): {e}")
+                    failed_acq_ids.append(acq_id)
                     # Continue with next acquisition
                     continue
+
+            if successful_acq_ids:
+                params = self._build_segmentation_log_params(
+                    preprocessing_config,
+                    denoise_source,
+                    custom_denoise_settings,
+                    acquisitions=successful_acq_ids,
+                    show_overlay=show_overlay,
+                    save_masks=save_masks,
+                    masks_directory=masks_directory,
+                    segment_scope="batch"
+                )
+                params.update({
+                    "method": "watershed",
+                    "nuclear_fusion_method": nuclear_fusion_method,
+                    "seed_threshold_method": seed_threshold_method,
+                    "min_seed_area": min_seed_area,
+                    "min_distance_peaks": min_distance_peaks,
+                    "membrane_fusion_method": membrane_fusion_method,
+                    "membrane_weights": cyto_weights,
+                    "boundary_method": boundary_method,
+                    "boundary_sigma": boundary_sigma,
+                    "compactness": compactness,
+                    "min_cell_area": min_cell_area,
+                    "max_cell_area": max_cell_area,
+                    "tile_size": tile_size,
+                    "tile_overlap": tile_overlap,
+                    "rng_seed": rng_seed,
+                    "n_requested_acquisitions": total_acquisitions,
+                    "n_successful_acquisitions": len(successful_acq_ids),
+                    "successful_acquisitions": successful_acq_ids,
+                    "failed_acquisitions": failed_acq_ids,
+                    "cell_counts_by_acquisition": cell_counts_by_acquisition,
+                })
+                get_logger().log_segmentation(
+                    method="watershed",
+                    parameters=params,
+                    acquisitions=successful_acq_ids,
+                    output_path=masks_directory if save_masks else None,
+                    notes=f"Batch-segmented {len(successful_acq_ids)} of {total_acquisitions} acquisitions",
+                    source_file=self._get_source_file_summary_for_logging(successful_acq_ids)
+                )
             
             progress_dlg.update_progress(
                 total_acquisitions, 
@@ -7769,6 +8135,7 @@ class MainWindow(QtWidgets.QMainWindow):
         denoise_source = dlg.get_denoise_source()
         custom_denoise_settings = dlg.get_custom_denoise_settings()
         spillover_config = dlg.get_spillover_config()
+        spillover_matrix_path = dlg.get_spillover_file_path()
         
         # Get excluded channels
         excluded_channels = dlg.get_excluded_channels()
@@ -7778,7 +8145,8 @@ class MainWindow(QtWidgets.QMainWindow):
             'normalization_config': normalization_config,
             'denoise_source': denoise_source,
             'custom_denoise_settings': custom_denoise_settings,
-            'spillover_config': spillover_config
+            'spillover_config': spillover_config,
+            'spillover_matrix_path': spillover_matrix_path,
         }
         
         if not selected_acquisitions:
@@ -7791,7 +8159,17 @@ class MainWindow(QtWidgets.QMainWindow):
         
         # Perform feature extraction
         try:
-            self._perform_feature_extraction(selected_acquisitions, selected_features, output_path, normalization_config, denoise_source, custom_denoise_settings, spillover_config, excluded_channels)
+            self._perform_feature_extraction(
+                selected_acquisitions,
+                selected_features,
+                output_path,
+                normalization_config,
+                denoise_source,
+                custom_denoise_settings,
+                spillover_config,
+                spillover_matrix_path,
+                excluded_channels
+            )
         except Exception as e:
             QtWidgets.QMessageBox.critical(
                 self, 
@@ -7800,7 +8178,7 @@ class MainWindow(QtWidgets.QMainWindow):
             )
     
 
-    def _perform_feature_extraction(self, selected_acquisitions, selected_features, output_path, normalization_config, denoise_source, custom_denoise_settings, spillover_config=None, excluded_channels=None):
+    def _perform_feature_extraction(self, selected_acquisitions, selected_features, output_path, normalization_config, denoise_source, custom_denoise_settings, spillover_config=None, spillover_matrix_path=None, excluded_channels=None):
         """Perform the actual feature extraction using multiprocessing.
         
         This now parallelizes both image loading and feature extraction for better performance.
@@ -7816,7 +8194,6 @@ class MainWindow(QtWidgets.QMainWindow):
         
         # Create progress dialog
         progress_dlg = ProgressDialog("Feature Extraction", self)
-        progress_dlg.set_maximum(len(selected_acquisitions))  # One phase: loading + extraction combined
         progress_dlg.show()
         
         try:
@@ -7897,8 +8274,14 @@ class MainWindow(QtWidgets.QMainWindow):
                     continue
             
             if not mp_args:
+                close_progress_dialog(progress_dlg)
                 QtWidgets.QMessageBox.warning(self, "No valid acquisitions", "No valid acquisitions found for feature extraction.")
                 return
+
+            total_acquisitions = len(mp_args)
+            apply_arcsinh_at_end = normalization_config is not None and normalization_config.get('method') == 'arcsinh'
+            finalization_steps = 2 + int(apply_arcsinh_at_end) + int(bool(output_path))
+            progress_dlg.set_maximum(total_acquisitions + finalization_steps)
             
             # Group acquisitions by file path
             # IMPORTANT: Only group MCD files together. OME-TIFF files should be processed individually
@@ -7958,7 +8341,6 @@ class MainWindow(QtWidgets.QMainWindow):
                         
                         # Collect results as they complete
                         completed_for_file = 0
-                        total_acquisitions = len(mp_args)
                         for acq_idx, (acq_id, future) in enumerate(futures, 1):
                             if progress_dlg.is_cancelled():
                                 pool.terminate()
@@ -8010,7 +8392,6 @@ class MainWindow(QtWidgets.QMainWindow):
                         
                         # Collect results as they complete
                         completed_ometiff = 0
-                        total_acquisitions = len(mp_args)
                         mcd_acquisitions_processed = sum(len(args_list) for args_list in file_groups.values())
                         
                         for acq_idx, (acq_id, future) in enumerate(futures, 1):
@@ -8074,14 +8455,33 @@ class MainWindow(QtWidgets.QMainWindow):
                     )
             
             if not all_features:
+                close_progress_dialog(progress_dlg)
                 QtWidgets.QMessageBox.warning(self, "No features extracted", "No features could be extracted from the selected acquisitions.")
                 return
-            
+
+            progress_value = total_acquisitions
+            progress_dlg.set_cancel_enabled(False)
+            progress_value += 1
+            progress_dlg.update_progress(
+                progress_value,
+                "Finalizing feature table",
+                (
+                    f"All acquisitions processed. Combining results from {len(all_features)} acquisitions. "
+                    "This may take a while for large datasets."
+                ),
+            )
+
             # Combine all features
             combined_features = pd.concat(all_features, ignore_index=True)
             
             # Apply arcsinh transformation at the end if enabled (more efficient - single pass on all data)
-            if normalization_config and normalization_config.get('method') == 'arcsinh':
+            if apply_arcsinh_at_end:
+                progress_value += 1
+                progress_dlg.update_progress(
+                    progress_value,
+                    "Applying arcsinh normalization",
+                    f"Normalizing intensity features for {len(combined_features)} cells...",
+                )
                 cofactor = normalization_config.get('cofactor', 1.0)
                 
                 # Find all intensity feature columns (exclude frac_pos as it's a proportion)
@@ -8102,16 +8502,45 @@ class MainWindow(QtWidgets.QMainWindow):
             # Log feature extraction operation
             logger = get_logger()
             features_extracted = [k for k, v in selected_features.items() if v]
-            params = {
-                "normalization_method": normalization_config.get('method') if normalization_config else None,
-                "arcsinh_cofactor": normalization_config.get('cofactor') if normalization_config and normalization_config.get('method') == 'arcsinh' else None,
-                "denoise_source": denoise_source
+            morphology_feature_names = {
+                'area_um2', 'perimeter_um', 'equivalent_diameter_um', 'eccentricity',
+                'solidity', 'extent', 'circularity', 'major_axis_len_um',
+                'minor_axis_len_um', 'aspect_ratio', 'bbox_area_um2',
+                'touches_border', 'touches_edge', 'holes_count',
+                'centroid_x', 'centroid_y'
             }
-            if denoise_source == "custom" and custom_denoise_settings:
-                params["denoise_settings"] = custom_denoise_settings
+            selected_morphology_features = [name for name in features_extracted if name in morphology_feature_names]
+            selected_intensity_features = [name for name in features_extracted if name not in morphology_feature_names]
+            feature_categories = []
+            if selected_morphology_features:
+                feature_categories.append("morphology")
+            if selected_intensity_features:
+                feature_categories.append("intensity")
+            denoise_settings = self._get_relevant_denoise_settings(
+                denoise_source,
+                custom_denoise_settings=custom_denoise_settings
+            )
+            params = {
+                "normalization_method": normalization_config.get('method') if normalization_config else "none",
+                "arcsinh_cofactor": normalization_config.get('cofactor') if normalization_config and normalization_config.get('method') == 'arcsinh' else None,
+                "denoise_source": denoise_source,
+                "denoise_used": denoise_settings is not None,
+                "feature_categories": feature_categories,
+                "selected_morphology_features": selected_morphology_features,
+                "selected_intensity_features": selected_intensity_features,
+                "excluded_channels": sorted(excluded_channels or []),
+                "n_excluded_channels": len(excluded_channels or []),
+                "spillover_correction": spillover_config is not None,
+                "spillover_method": spillover_config.get('method') if spillover_config else None,
+                "spillover_matrix_path": spillover_matrix_path if spillover_config else None,
+                "spillover_matrix_size": list(spillover_config['matrix'].shape) if spillover_config and 'matrix' in spillover_config and hasattr(spillover_config['matrix'], 'shape') else None,
+                "n_selected_acquisitions": len(selected_acquisitions),
+                "source_files": self._get_source_files_for_logging(selected_acquisitions),
+            }
+            if denoise_settings:
+                params["denoise_settings"] = denoise_settings
             
-            # Get source file name
-            source_file = os.path.basename(self.current_path) if self.current_path else None
+            source_file = self._get_source_file_summary_for_logging(selected_acquisitions)
             
             logger.log_feature_extraction(
                 parameters=params,
@@ -8122,20 +8551,30 @@ class MainWindow(QtWidgets.QMainWindow):
                 source_file=source_file
             )
             
-            # Save to CSV
             if output_path:
-                combined_features.to_csv(output_path, index=False)
+                progress_value += 1
                 progress_dlg.update_progress(
-                    len(selected_acquisitions), 
-                    "Feature extraction complete", 
+                    progress_value,
+                    "Saving feature table",
+                    f"Writing {os.path.basename(output_path)}...",
+                )
+                combined_features.to_csv(output_path, index=False)
+
+            progress_value += 1
+            if output_path:
+                progress_dlg.update_progress(
+                    progress_value,
+                    "Feature extraction complete",
                     f"Features saved to: {output_path}\nTotal cells: {len(combined_features)}"
                 )
             else:
                 progress_dlg.update_progress(
-                    len(selected_acquisitions), 
-                    "Feature extraction complete", 
+                    progress_value,
+                    "Feature extraction complete",
                     f"Features stored in memory\nTotal cells: {len(combined_features)}"
                 )
+
+            close_progress_dialog(progress_dlg)
             
             # Show completion message
             QtWidgets.QMessageBox.information(
@@ -8528,10 +8967,34 @@ class MainWindow(QtWidgets.QMainWindow):
     
     def closeEvent(self, event):
         """Clean up when closing the application."""
-        if self.loader:
-            self.loader.close()
-        # Delete LLM cache when closing the app
-        pass
+        reply = QtWidgets.QMessageBox.question(
+            self,
+            "Save Analysis Steps",
+            "Do you want to save an analysis steps text file before closing OpenIMC?",
+            QtWidgets.QMessageBox.Yes | QtWidgets.QMessageBox.No,
+            QtWidgets.QMessageBox.Yes
+        )
+        if reply == QtWidgets.QMessageBox.Yes:
+            export_result = self._prompt_analysis_steps_export(
+                dialog_title="Save Analysis Steps Before Closing",
+                show_success_message=False,
+                show_failure_message=True
+            )
+            if export_result is not True:
+                event.ignore()
+                return
+
+        loaders_to_close = []
+        if self.loader is not None:
+            loaders_to_close.append(self.loader)
+        for loader in self.mcd_loaders.values():
+            if loader not in loaders_to_close:
+                loaders_to_close.append(loader)
+        for loader in loaders_to_close:
+            try:
+                loader.close()
+            except Exception:
+                pass
         event.accept()
 
     def _open_clustering_dialog(self):
@@ -11808,38 +12271,92 @@ class MainWindow(QtWidgets.QMainWindow):
             import traceback
             traceback.print_exc()
     
-    def _export_analysis_steps(self):
-        """Export analysis steps to a text file."""
-        from PyQt5.QtWidgets import QFileDialog
-        
-        # Get save path
-        output_path, _ = QFileDialog.getSaveFileName(
-            self,
-            "Export Analysis Steps",
-            "analysis_steps.txt",
-            "Text Files (*.txt);;All Files (*)"
-        )
-        
-        if not output_path:
-            return
-        
-        # Export using the exporter
+    def _get_default_analysis_steps_filename(self) -> str:
+        """Build a descriptive default filename for analysis-step exports."""
+        base_name = "analysis_steps"
+        if self.current_path:
+            current_path = Path(self.current_path)
+            if current_path.is_dir():
+                dataset_name = current_path.name
+            else:
+                dataset_name = current_path.stem
+            dataset_name = self._sanitize_filename(dataset_name)
+            if dataset_name:
+                base_name = f"{dataset_name}_analysis_steps"
+        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+        return f"{base_name}_{timestamp}.txt"
+
+    def _save_analysis_steps_to_path(
+        self,
+        output_path: str,
+        *,
+        show_success_message: bool = True,
+        show_failure_message: bool = True
+    ) -> bool:
+        """Write the current session's analysis-step summary to disk."""
         exporter = AnalysisStepsExporter()
         success = exporter.export_from_main_window(self, output_path)
-        
+
         if success:
-            QtWidgets.QMessageBox.information(
-                self,
-                "Export Complete",
-                f"Analysis steps exported successfully to:\n{output_path}"
+            acquisitions = [acq.id for acq in self.acquisitions] if self.acquisitions else []
+            self._log_export_operation(
+                "analysis_steps_txt",
+                {
+                    "export_scope": "current_session",
+                    "session_start_time": self.session_start_time.isoformat(),
+                    "source_files": self._get_source_files_for_logging(acquisitions),
+                    "output_format": "TXT",
+                },
+                output_path,
+                acquisitions=acquisitions,
+                notes="Exported analysis steps summary"
             )
-        else:
+            if show_success_message:
+                QtWidgets.QMessageBox.information(
+                    self,
+                    "Export Complete",
+                    f"Analysis steps exported successfully to:\n{output_path}"
+                )
+            return True
+
+        if show_failure_message:
             QtWidgets.QMessageBox.warning(
                 self,
                 "Export Failed",
-                f"Failed to export analysis steps.\n\n"
-                f"Make sure you have performed some analysis operations that are logged."
+                "Failed to export analysis steps.\n\n"
+                "Make sure you have performed some analysis operations that are logged."
             )
+        return False
+
+    def _prompt_analysis_steps_export(
+        self,
+        *,
+        dialog_title: str = "Export Analysis Steps",
+        show_success_message: bool = True,
+        show_failure_message: bool = True
+    ) -> Optional[bool]:
+        """Prompt for an output path, then export analysis steps."""
+        output_path, _ = QtWidgets.QFileDialog.getSaveFileName(
+            self,
+            dialog_title,
+            self._get_default_analysis_steps_filename(),
+            "Text Files (*.txt);;All Files (*)"
+        )
+        if not output_path:
+            return None
+        return self._save_analysis_steps_to_path(
+            output_path,
+            show_success_message=show_success_message,
+            show_failure_message=show_failure_message
+        )
+
+    def _export_analysis_steps(self):
+        """Export analysis steps to a text file."""
+        self._prompt_analysis_steps_export(
+            dialog_title="Export Analysis Steps",
+            show_success_message=True,
+            show_failure_message=True
+        )
     
     def _get_openimc_version(self) -> str:
         """Get OpenIMC version information."""
@@ -11858,8 +12375,3 @@ class MainWindow(QtWidgets.QMainWindow):
             pass
         
         return "Unknown"
-
-
-
-
-

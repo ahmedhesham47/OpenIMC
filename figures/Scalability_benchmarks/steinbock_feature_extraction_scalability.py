@@ -30,16 +30,42 @@ The masks directory should contain:
 """
 
 import argparse
-import os
 import re
 import shutil
 import subprocess
 import sys
-import tempfile
 from pathlib import Path
 from typing import Dict, List, Optional, Tuple
 
 import pandas as pd
+
+
+HELPER_SCRIPT = Path(__file__).parent / "run_steinbock_measurements.py"
+
+
+def normalize_stem_for_matching(stem: str) -> str:
+    """Normalize image/mask stems so dataset-specific variants still match."""
+    normalized = stem
+
+    # OME-TIFF names often retain an extra ".ome" in Path.stem.
+    if normalized.endswith('.ome'):
+        normalized = normalized[:-4]
+
+    # Masks may include duplicated image stems followed by the segmentation suffix.
+    normalized = re.sub(r'_segmentation_masks$', '', normalized)
+    for index, char in enumerate(normalized):
+        if char == '_' and normalized[:index] == normalized[index + 1:]:
+            normalized = normalized[:index]
+            break
+
+    # Some masks use a "_full" suffix where the paired image uses ".ome".
+    normalized = re.sub(r'_full$', '', normalized)
+    return normalized
+
+
+def steinbock_compatible_name(file_name: str) -> str:
+    """Match Steinbock's internal .ome.tiff -> .tiff filename normalization."""
+    return re.sub(r"\.ome(\.[^.]+)$", r"\1", file_name, flags=re.IGNORECASE)
 
 
 def parse_time_output(time_output: str) -> Dict[str, Optional[float]]:
@@ -134,22 +160,26 @@ def create_subset_directories(
     masks_copied = 0
     
     for img_path in selected_images:
-        # Copy image file
-        dest_img = images_subset_dir / img_path.name
-        shutil.copy2(img_path, dest_img)
+        subset_img_name = steinbock_compatible_name(img_path.name)
+        dest_img = images_subset_dir / subset_img_name
+        if dest_img.exists() or dest_img.is_symlink():
+            dest_img.unlink()
+        dest_img.symlink_to(img_path)
         
         # Try to find matching mask file
         # Common patterns: same name, or with _mask suffix, etc.
         # Note: steinbock expects exact filename matches, so we rename masks to match image names
         mask_found = False
         img_stem = img_path.stem
-        img_name = img_path.name
-        
+        img_name = subset_img_name
+        img_key = normalize_stem_for_matching(img_stem)
+
         # Try to find matching mask by iterating through all masks
         # Only use _segmentation_masks files (skip _segmentation.tiff files)
         for mask_path in mask_files:
             mask_stem = mask_path.stem
             mask_name = mask_path.name
+            mask_key = normalize_stem_for_matching(mask_stem)
             
             # Skip _segmentation.tiff files (only use _segmentation_masks)
             if '_segmentation' in mask_stem and '_segmentation_masks' not in mask_stem:
@@ -157,14 +187,20 @@ def create_subset_directories(
             
             # 1. Try exact name match
             if mask_name == img_name:
-                shutil.copy2(mask_path, masks_subset_dir / img_name)
+                dest_mask = masks_subset_dir / img_name
+                if dest_mask.exists() or dest_mask.is_symlink():
+                    dest_mask.unlink()
+                dest_mask.symlink_to(mask_path)
                 mask_found = True
                 masks_copied += 1
                 break
             
             # 2. Try exact stem match
             if mask_stem == img_stem:
-                shutil.copy2(mask_path, masks_subset_dir / img_name)
+                dest_mask = masks_subset_dir / img_name
+                if dest_mask.exists() or dest_mask.is_symlink():
+                    dest_mask.unlink()
+                dest_mask.symlink_to(mask_path)
                 mask_found = True
                 masks_copied += 1
                 break
@@ -172,7 +208,10 @@ def create_subset_directories(
             # 3. Try _segmentation_masks pattern (most common for this dataset)
             # Check if mask stem starts with image stem and contains _segmentation_masks
             if mask_stem.startswith(img_stem + '_') and '_segmentation_masks' in mask_stem:
-                shutil.copy2(mask_path, masks_subset_dir / img_name)
+                dest_mask = masks_subset_dir / img_name
+                if dest_mask.exists() or dest_mask.is_symlink():
+                    dest_mask.unlink()
+                dest_mask.symlink_to(mask_path)
                 mask_found = True
                 masks_copied += 1
                 break
@@ -180,7 +219,10 @@ def create_subset_directories(
             # 4. Try other common suffix patterns
             for suffix in ['_mask', '_cell', '_segmentation_masks']:
                 if mask_stem == f"{img_stem}{suffix}":
-                    shutil.copy2(mask_path, masks_subset_dir / img_name)
+                    dest_mask = masks_subset_dir / img_name
+                    if dest_mask.exists() or dest_mask.is_symlink():
+                        dest_mask.unlink()
+                    dest_mask.symlink_to(mask_path)
                     mask_found = True
                     masks_copied += 1
                     break
@@ -189,7 +231,20 @@ def create_subset_directories(
             
             # 5. Try if mask name (not just stem) starts with image stem and contains _segmentation_masks
             if mask_name.startswith(img_stem + '_') and '_segmentation_masks' in mask_name:
-                shutil.copy2(mask_path, masks_subset_dir / img_name)
+                dest_mask = masks_subset_dir / img_name
+                if dest_mask.exists() or dest_mask.is_symlink():
+                    dest_mask.unlink()
+                dest_mask.symlink_to(mask_path)
+                mask_found = True
+                masks_copied += 1
+                break
+
+            # 6. Fallback to normalized keys for .ome/_full duplicated-name variants
+            if mask_key == img_key:
+                dest_mask = masks_subset_dir / img_name
+                if dest_mask.exists() or dest_mask.is_symlink():
+                    dest_mask.unlink()
+                dest_mask.symlink_to(mask_path)
                 mask_found = True
                 masks_copied += 1
                 break
@@ -274,7 +329,8 @@ def run_steinbock_benchmark(
     num_images: int,
     num_workers: int,
     output_dir: Path,
-    base_temp_dir: Path
+    base_temp_dir: Path,
+    steinbock_python: Optional[str] = None,
 ) -> Dict:
     """
     Run feature extraction benchmark using steinbock.
@@ -320,29 +376,62 @@ def run_steinbock_benchmark(
             print(f"Warning: Panel file not found at {panel_file}. Continuing without --panel option.")
             panel_file = None
     
-    intensities_cmd = [
-        '/usr/bin/time', '-v',
-        'steinbock', 'measure', 'intensities',
-        '--img', str(images_subset_dir),
-        '--masks', str(masks_subset_dir),
-        '--no-mmap',  # Disable memory mapping for compatibility
-    ]
-    if panel_file:
-        intensities_cmd.extend(['--panel', str(panel_file)])
-    intensities_cmd.extend(['-o', str(intensities_output_dir)])
+    if steinbock_python:
+        intensities_cmd = [
+            '/usr/bin/time', '-v',
+            steinbock_python,
+            str(HELPER_SCRIPT),
+            'intensities',
+            '--img', str(images_subset_dir),
+            '--masks', str(masks_subset_dir),
+            '--output', str(intensities_output_dir),
+            '--aggregation', 'mean',
+        ]
+        if panel_file:
+            intensities_cmd.extend(['--panel', str(panel_file)])
+    else:
+        intensities_cmd = [
+            '/usr/bin/time', '-v',
+            'steinbock', 'measure', 'intensities',
+            '--img', str(images_subset_dir),
+            '--masks', str(masks_subset_dir),
+            '--no-mmap',
+        ]
+        if panel_file:
+            intensities_cmd.extend(['--panel', str(panel_file)])
+        intensities_cmd.extend(['-o', str(intensities_output_dir)])
     
     # Build steinbock measure regionprops command
     # Common regionprops: area, eccentricity, extent, major_axis_length, 
     # minor_axis_length, orientation, perimeter, solidity
-    regionprops_cmd = [
-        '/usr/bin/time', '-v',
-        'steinbock', 'measure', 'regionprops',
-        '--img', str(images_subset_dir),
-        '--masks', str(masks_subset_dir),
-        '-o', str(regionprops_output_dir),
-        'area', 'eccentricity', 'extent', 'major_axis_length',
-        'minor_axis_length', 'orientation', 'perimeter', 'solidity'
-    ]
+    if steinbock_python:
+        regionprops_cmd = [
+            '/usr/bin/time', '-v',
+            steinbock_python,
+            str(HELPER_SCRIPT),
+            'regionprops',
+            '--img', str(images_subset_dir),
+            '--masks', str(masks_subset_dir),
+            '--output', str(regionprops_output_dir),
+            '--property', 'area',
+            '--property', 'eccentricity',
+            '--property', 'extent',
+            '--property', 'major_axis_length',
+            '--property', 'minor_axis_length',
+            '--property', 'orientation',
+            '--property', 'perimeter',
+            '--property', 'solidity',
+        ]
+    else:
+        regionprops_cmd = [
+            '/usr/bin/time', '-v',
+            'steinbock', 'measure', 'regionprops',
+            '--img', str(images_subset_dir),
+            '--masks', str(masks_subset_dir),
+            '-o', str(regionprops_output_dir),
+            'area', 'eccentricity', 'extent', 'major_axis_length',
+            'minor_axis_length', 'orientation', 'perimeter', 'solidity'
+        ]
     
     # Run intensities measurement
     intensities_metrics, intensities_success, intensities_error = run_steinbock_command(
@@ -466,6 +555,12 @@ def main():
                        help='Number of times to repeat each configuration (default: 1)')
     parser.add_argument('--keep-temp', action='store_true',
                        help='Keep temporary directories after benchmark (default: False)')
+    parser.add_argument(
+        '--steinbock-python',
+        type=str,
+        default=None,
+        help='Python executable from an environment where the steinbock package is installed.',
+    )
     
     args = parser.parse_args()
     
@@ -480,13 +575,24 @@ def main():
         print(f"Error: Masks directory does not exist: {masks_dir}")
         sys.exit(1)
     
-    # Check if steinbock is available
+    if args.steinbock_python:
+        if not Path(args.steinbock_python).exists():
+            print(f"Error: Steinbock Python executable not found: {args.steinbock_python}")
+            sys.exit(1)
+        verify_cmd = [
+            args.steinbock_python,
+            '-c',
+            'import steinbock; print("steinbock import ok")',
+        ]
+    else:
+        verify_cmd = ['steinbock', '--version']
+
     try:
         result = subprocess.run(
-            ['steinbock', '--version'],
+            verify_cmd,
             capture_output=True,
             text=True,
-            timeout=5
+            timeout=10
         )
         if result.returncode != 0:
             print("Warning: steinbock command may not be available")
@@ -540,7 +646,7 @@ def main():
                 for repeat in range(args.repeats):
                     result = run_steinbock_benchmark(
                         image_files, mask_files, num_images, num_workers,
-                        output_dir, base_temp_dir
+                        output_dir, base_temp_dir, args.steinbock_python
                     )
                     result['repeat'] = repeat
                     results.append(result)
@@ -578,4 +684,3 @@ def main():
 
 if __name__ == '__main__':
     main()
-

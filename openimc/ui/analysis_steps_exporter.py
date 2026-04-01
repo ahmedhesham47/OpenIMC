@@ -35,9 +35,33 @@ class AnalysisStepsExporter:
     """
     Exports analysis steps to a formatted text file.
     """
+
+    IMPORTANT_LIST_KEYS = {
+        "nuclear_channels",
+        "cyto_channels",
+        "selected_channels",
+        "selected_morphology_features",
+        "selected_intensity_features",
+        "feature_categories",
+        "features_extracted",
+        "features_used",
+        "excluded_channels",
+        "source_files",
+        "successful_acquisitions",
+        "failed_acquisitions",
+        "channels_exported",
+        "exported_acquisitions",
+    }
     
     def __init__(self):
         self.logger = get_logger()
+
+    def has_entries(self, session_start_time: Optional[datetime] = None) -> bool:
+        """Return True when the log contains at least one exportable entry."""
+        log_file = self.logger.get_log_file_path()
+        if not Path(log_file).exists():
+            return False
+        return bool(self._read_log_entries(log_file, session_start_time=session_start_time))
     
     def export_analysis_steps(
         self,
@@ -227,18 +251,7 @@ class AnalysisStepsExporter:
             if params and include_parameters:
                 lines.append("   Parameters:")
                 for key, value in params.items():
-                    if key == "features_extracted" and isinstance(value, list):
-                        lines.append(f"      - {key}: {len(value)} features")
-                    elif key == "features_used" and isinstance(value, list):
-                        lines.append(f"      - {key}: {len(value)} features")
-                    elif isinstance(value, dict):
-                        lines.append(f"      - {key}:")
-                        for sub_key, sub_value in value.items():
-                            lines.append(f"        * {sub_key}: {sub_value}")
-                    elif isinstance(value, list) and len(value) > 5:
-                        lines.append(f"      - {key}: {len(value)} items")
-                    else:
-                        lines.append(f"      - {key}: {value}")
+                    self._append_parameter_lines(lines, key, value, indent=6)
             
             # Acquisitions
             acquisitions = entry.get("acquisitions", [])
@@ -266,6 +279,57 @@ class AnalysisStepsExporter:
             lines.append("")
         
         return lines
+
+    def _append_parameter_lines(
+        self,
+        lines: List[str],
+        key: str,
+        value: Any,
+        indent: int
+    ) -> None:
+        """Append parameter lines while preserving important list/detail values."""
+        indent_str = " " * indent
+        child_indent_str = " " * (indent + 2)
+
+        if isinstance(value, dict):
+            if not value:
+                lines.append(f"{indent_str}- {key}: {{}}")
+                return
+            lines.append(f"{indent_str}- {key}:")
+            for sub_key, sub_value in value.items():
+                self._append_parameter_lines(lines, sub_key, sub_value, indent + 2)
+            return
+
+        if isinstance(value, list):
+            if not value:
+                lines.append(f"{indent_str}- {key}: []")
+                return
+
+            if self._should_expand_list(key, value):
+                lines.append(f"{indent_str}- {key}:")
+                for item in value:
+                    if isinstance(item, dict):
+                        lines.append(f"{child_indent_str}*")
+                        for sub_key, sub_value in item.items():
+                            self._append_parameter_lines(lines, sub_key, sub_value, indent + 4)
+                    elif isinstance(item, list):
+                        lines.append(f"{child_indent_str}*")
+                        self._append_parameter_lines(lines, "items", item, indent + 4)
+                    else:
+                        lines.append(f"{child_indent_str}* {item}")
+                return
+
+            preview = ", ".join(str(item) for item in value[:5])
+            if len(value) > 5:
+                preview += f", ... ({len(value)} total)"
+            lines.append(f"{indent_str}- {key}: {preview}")
+            return
+
+        lines.append(f"{indent_str}- {key}: {value}")
+
+    def _should_expand_list(self, key: str, value: List[Any]) -> bool:
+        """Return True when a list should be rendered item-by-item."""
+        return key in self.IMPORTANT_LIST_KEYS or len(value) <= 8
     
     def export_from_main_window(self, main_window, output_path: str) -> bool:
         """
@@ -375,4 +439,3 @@ class AnalysisStepsExporter:
         # Insert into content
         new_lines = lines[:header_end] + dataset_info + lines[header_end:]
         return "\n".join(new_lines)
-

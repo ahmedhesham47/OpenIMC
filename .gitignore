@@ -46,3 +46,6 @@ figures/Figure3_Jackson/*.csv
 .vscode/
 build/
 figures/Reproducibility/
+data_deposit/
+figures/
+.codex

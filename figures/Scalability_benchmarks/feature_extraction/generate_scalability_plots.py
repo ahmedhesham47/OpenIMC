@@ -20,6 +20,15 @@ import seaborn as sns
 sns.set_style("whitegrid")
 plt.rcParams['figure.dpi'] = 100
 plt.rcParams['savefig.dpi'] = 300
+plt.rcParams['font.size'] = 8
+plt.rcParams['axes.titlesize'] = 8
+plt.rcParams['axes.labelsize'] = 8
+plt.rcParams['legend.fontsize'] = 8
+plt.rcParams['legend.title_fontsize'] = 8
+plt.rcParams['xtick.labelsize'] = 8
+plt.rcParams['ytick.labelsize'] = 8
+
+ANALYSIS_LABEL = 'Feature Extraction'
 
 
 def load_results(csv_path: Path) -> Tuple[pd.DataFrame, pd.DataFrame]:
@@ -65,11 +74,9 @@ def load_results(csv_path: Path) -> Tuple[pd.DataFrame, pd.DataFrame]:
 
 
 def plot_wall_time(raw_df: pd.DataFrame, summary_df: pd.DataFrame, output_path: Path):
-    """Plot wall time vs number of images for different worker counts with boxplots."""
-    fig, axes = plt.subplots(1, 2, figsize=(14, 5))
-    
+    """Plot wall time as separate square figures."""
     # Plot 1: Wall time vs number of images (different lines for different workers)
-    ax1 = axes[0]
+    fig, ax1 = plt.subplots(figsize=(3, 3))
     for num_workers in sorted(summary_df['num_workers'].unique()):
         subset = summary_df[summary_df['num_workers'] == num_workers].sort_values('num_images')
         
@@ -105,17 +112,21 @@ def plot_wall_time(raw_df: pd.DataFrame, summary_df: pd.DataFrame, output_path: 
                                     whiskerprops=dict(visible=False),
                                     capprops=dict(visible=False))
     
-    ax1.set_xlabel('Number of Images', fontsize=12)
-    ax1.set_ylabel('Wall Time (seconds)', fontsize=12)
-    ax1.set_title('Wall Time vs Number of Images', fontsize=14, fontweight='bold')
-    ax1.legend(title='Workers', fontsize=10)
+    ax1.set_xlabel('Number of Images', fontsize=8)
+    ax1.set_ylabel('Wall Time (seconds)', fontsize=8)
+    ax1.set_title(f'{ANALYSIS_LABEL}: Wall Time vs Number of Images', fontsize=8, fontweight='bold')
+    ax1.legend(title='Workers', fontsize=8)
     ax1.grid(True, alpha=0.3)
     # Set x-axis ticks to actual image counts
     ax1.set_xticks(sorted(summary_df['num_images'].unique()))
     ax1.set_xticklabels([str(x) for x in sorted(summary_df['num_images'].unique())])
-    
+    plt.tight_layout()
+    plt.savefig(output_path / 'wall_time_vs_num_images.png', bbox_inches='tight')
+    print(f"Saved: {output_path / 'wall_time_vs_num_images.png'}")
+    plt.close()
+
     # Plot 2: Wall time vs number of workers (different lines for different image counts)
-    ax2 = axes[1]
+    fig, ax2 = plt.subplots(figsize=(3, 3))
     for num_images in sorted(summary_df['num_images'].unique()):
         subset = summary_df[summary_df['num_images'] == num_images].sort_values('num_workers')
         
@@ -151,24 +162,21 @@ def plot_wall_time(raw_df: pd.DataFrame, summary_df: pd.DataFrame, output_path: 
                                     whiskerprops=dict(visible=False),
                                     capprops=dict(visible=False))
     
-    ax2.set_xlabel('Number of Workers', fontsize=12)
-    ax2.set_ylabel('Wall Time (seconds)', fontsize=12)
-    ax2.set_title('Wall Time vs Number of Workers', fontsize=14, fontweight='bold')
-    ax2.legend(title='Images', fontsize=10)
+    ax2.set_xlabel('Number of Workers', fontsize=8)
+    ax2.set_ylabel('Wall Time (seconds)', fontsize=8)
+    ax2.set_title(f'{ANALYSIS_LABEL}: Wall Time vs Number of Workers', fontsize=8, fontweight='bold')
+    ax2.legend(title='Images', fontsize=8)
     ax2.grid(True, alpha=0.3)
-    
     plt.tight_layout()
-    plt.savefig(output_path / 'wall_time_scalability.png', bbox_inches='tight')
-    print(f"Saved: {output_path / 'wall_time_scalability.png'}")
+    plt.savefig(output_path / 'wall_time_vs_num_workers.png', bbox_inches='tight')
+    print(f"Saved: {output_path / 'wall_time_vs_num_workers.png'}")
     plt.close()
 
 
 def plot_ram_usage(raw_df: pd.DataFrame, summary_df: pd.DataFrame, output_path: Path):
-    """Plot RAM usage vs number of images for different worker counts with boxplots."""
-    fig, axes = plt.subplots(1, 2, figsize=(14, 5))
-    
+    """Plot RAM usage as separate square figures."""
     # Plot 1: Peak RAM vs number of images
-    ax1 = axes[0]
+    fig, ax1 = plt.subplots(figsize=(3, 3))
     for num_workers in sorted(summary_df['num_workers'].unique()):
         subset = summary_df[summary_df['num_workers'] == num_workers].sort_values('num_images')
         
@@ -203,17 +211,21 @@ def plot_ram_usage(raw_df: pd.DataFrame, summary_df: pd.DataFrame, output_path: 
                                     whiskerprops=dict(visible=False),
                                     capprops=dict(visible=False))
     
-    ax1.set_xlabel('Number of Images', fontsize=12)
-    ax1.set_ylabel('Peak RAM Usage (MB)', fontsize=12)
-    ax1.set_title('Peak RAM Usage vs Number of Images', fontsize=14, fontweight='bold')
-    ax1.legend(title='Workers', fontsize=10)
+    ax1.set_xlabel('Number of Images', fontsize=8)
+    ax1.set_ylabel('Peak RAM Usage (MB)', fontsize=8)
+    ax1.set_title(f'{ANALYSIS_LABEL}: Peak RAM Usage vs Number of Images', fontsize=8, fontweight='bold')
+    ax1.legend(title='Workers', fontsize=8)
     ax1.grid(True, alpha=0.3)
     # Set x-axis ticks to actual image counts
     ax1.set_xticks(sorted(summary_df['num_images'].unique()))
     ax1.set_xticklabels([str(x) for x in sorted(summary_df['num_images'].unique())])
-    
+    plt.tight_layout()
+    plt.savefig(output_path / 'ram_usage_vs_num_images.png', bbox_inches='tight')
+    print(f"Saved: {output_path / 'ram_usage_vs_num_images.png'}")
+    plt.close()
+
     # Plot 2: Peak RAM vs number of workers
-    ax2 = axes[1]
+    fig, ax2 = plt.subplots(figsize=(3, 3))
     for num_images in sorted(summary_df['num_images'].unique()):
         subset = summary_df[summary_df['num_images'] == num_images].sort_values('num_workers')
         
@@ -248,15 +260,14 @@ def plot_ram_usage(raw_df: pd.DataFrame, summary_df: pd.DataFrame, output_path: 
                                     whiskerprops=dict(visible=False),
                                     capprops=dict(visible=False))
     
-    ax2.set_xlabel('Number of Workers', fontsize=12)
-    ax2.set_ylabel('Peak RAM Usage (MB)', fontsize=12)
-    ax2.set_title('Peak RAM Usage vs Number of Workers', fontsize=14, fontweight='bold')
-    ax2.legend(title='Images', fontsize=10)
+    ax2.set_xlabel('Number of Workers', fontsize=8)
+    ax2.set_ylabel('Peak RAM Usage (MB)', fontsize=8)
+    ax2.set_title(f'{ANALYSIS_LABEL}: Peak RAM Usage vs Number of Workers', fontsize=8, fontweight='bold')
+    ax2.legend(title='Images', fontsize=8)
     ax2.grid(True, alpha=0.3)
-    
     plt.tight_layout()
-    plt.savefig(output_path / 'ram_usage_scalability.png', bbox_inches='tight')
-    print(f"Saved: {output_path / 'ram_usage_scalability.png'}")
+    plt.savefig(output_path / 'ram_usage_vs_num_workers.png', bbox_inches='tight')
+    print(f"Saved: {output_path / 'ram_usage_vs_num_workers.png'}")
     plt.close()
 
 
@@ -300,10 +311,10 @@ def plot_rss(raw_df: pd.DataFrame, summary_df: pd.DataFrame, output_path: Path):
                                     whiskerprops=dict(visible=False),
                                     capprops=dict(visible=False))
     
-    ax1.set_xlabel('Number of Images', fontsize=12)
-    ax1.set_ylabel('Maximum RSS (MB)', fontsize=12)
-    ax1.set_title('Maximum RSS vs Number of Images', fontsize=14, fontweight='bold')
-    ax1.legend(title='Workers', fontsize=10)
+    ax1.set_xlabel('Number of Images', fontsize=8)
+    ax1.set_ylabel('Maximum RSS (MB)', fontsize=8)
+    ax1.set_title('Maximum RSS vs Number of Images', fontsize=8, fontweight='bold')
+    ax1.legend(title='Workers', fontsize=8)
     ax1.grid(True, alpha=0.3)
     # Set x-axis ticks to actual image counts
     ax1.set_xticks(sorted(summary_df['num_images'].unique()))
@@ -345,10 +356,10 @@ def plot_rss(raw_df: pd.DataFrame, summary_df: pd.DataFrame, output_path: Path):
                                     whiskerprops=dict(visible=False),
                                     capprops=dict(visible=False))
     
-    ax2.set_xlabel('Number of Workers', fontsize=12)
-    ax2.set_ylabel('Maximum RSS (MB)', fontsize=12)
-    ax2.set_title('Maximum RSS vs Number of Workers', fontsize=14, fontweight='bold')
-    ax2.legend(title='Images', fontsize=10)
+    ax2.set_xlabel('Number of Workers', fontsize=8)
+    ax2.set_ylabel('Maximum RSS (MB)', fontsize=8)
+    ax2.set_title('Maximum RSS vs Number of Workers', fontsize=8, fontweight='bold')
+    ax2.legend(title='Images', fontsize=8)
     ax2.grid(True, alpha=0.3)
     
     plt.tight_layout()
@@ -392,9 +403,9 @@ def plot_heatmaps(summary_df: pd.DataFrame, output_path: Path):
         ax=axes[0],
         cbar_kws={'label': 'Wall Time (s)'}
     )
-    axes[0].set_title('Wall Time Heatmap', fontsize=14, fontweight='bold')
-    axes[0].set_xlabel('Number of Workers', fontsize=12)
-    axes[0].set_ylabel('Number of Images', fontsize=12)
+    axes[0].set_title('Wall Time Heatmap', fontsize=8, fontweight='bold')
+    axes[0].set_xlabel('Number of Workers', fontsize=8)
+    axes[0].set_ylabel('Number of Images', fontsize=8)
     
     sns.heatmap(
         ram_pivot,
@@ -404,9 +415,9 @@ def plot_heatmaps(summary_df: pd.DataFrame, output_path: Path):
         ax=axes[1],
         cbar_kws={'label': 'Peak RAM (MB)'}
     )
-    axes[1].set_title('Peak RAM Usage Heatmap', fontsize=14, fontweight='bold')
-    axes[1].set_xlabel('Number of Workers', fontsize=12)
-    axes[1].set_ylabel('Number of Images', fontsize=12)
+    axes[1].set_title('Peak RAM Usage Heatmap', fontsize=8, fontweight='bold')
+    axes[1].set_xlabel('Number of Workers', fontsize=8)
+    axes[1].set_ylabel('Number of Images', fontsize=8)
     
     sns.heatmap(
         rss_pivot,
@@ -416,9 +427,9 @@ def plot_heatmaps(summary_df: pd.DataFrame, output_path: Path):
         ax=axes[2],
         cbar_kws={'label': 'Max RSS (MB)'}
     )
-    axes[2].set_title('Maximum RSS Heatmap', fontsize=14, fontweight='bold')
-    axes[2].set_xlabel('Number of Workers', fontsize=12)
-    axes[2].set_ylabel('Number of Images', fontsize=12)
+    axes[2].set_title('Maximum RSS Heatmap', fontsize=8, fontweight='bold')
+    axes[2].set_xlabel('Number of Workers', fontsize=8)
+    axes[2].set_ylabel('Number of Images', fontsize=8)
     
     plt.tight_layout()
     plt.savefig(output_path / 'scalability_heatmaps.png', bbox_inches='tight')
@@ -483,4 +494,3 @@ def main():
 
 if __name__ == '__main__':
     main()
-

@@ -30,16 +30,31 @@ The masks directory should contain:
 """
 
 import argparse
-import os
 import re
 import shutil
 import subprocess
 import sys
-import tempfile
 from pathlib import Path
 from typing import Dict, List, Optional, Tuple
 
 import pandas as pd
+
+
+def normalize_stem_for_matching(stem: str) -> str:
+    """Normalize image/mask stems so dataset-specific variants still match."""
+    normalized = stem
+
+    if normalized.endswith('.ome'):
+        normalized = normalized[:-4]
+
+    normalized = re.sub(r'_segmentation_masks$', '', normalized)
+    for index, char in enumerate(normalized):
+        if char == '_' and normalized[:index] == normalized[index + 1:]:
+            normalized = normalized[:index]
+            break
+
+    normalized = re.sub(r'_full$', '', normalized)
+    return normalized
 
 
 def parse_time_output(time_output: str) -> Dict[str, Optional[float]]:
@@ -144,12 +159,14 @@ def create_subset_directories(
         mask_found = False
         img_stem = img_path.stem
         img_name = img_path.name
-        
+        img_key = normalize_stem_for_matching(img_stem)
+
         # Try to find matching mask by iterating through all masks
         # Only use _segmentation_masks files (skip _segmentation.tiff files)
         for mask_path in mask_files:
             mask_stem = mask_path.stem
             mask_name = mask_path.name
+            mask_key = normalize_stem_for_matching(mask_stem)
             
             # Skip _segmentation.tiff files (only use _segmentation_masks)
             if '_segmentation' in mask_stem and '_segmentation_masks' not in mask_stem:
@@ -189,6 +206,12 @@ def create_subset_directories(
             
             # 5. Try if mask name (not just stem) starts with image stem and contains _segmentation_masks
             if mask_name.startswith(img_stem + '_') and '_segmentation_masks' in mask_name:
+                shutil.copy2(mask_path, masks_subset_dir / img_name)
+                mask_found = True
+                masks_copied += 1
+                break
+
+            if mask_key == img_key:
                 shutil.copy2(mask_path, masks_subset_dir / img_name)
                 mask_found = True
                 masks_copied += 1
@@ -523,5 +546,3 @@ def main():
 
 if __name__ == '__main__':
     main()
-
-
