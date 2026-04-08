@@ -17,10 +17,15 @@
 # You should have received a copy of the GNU General Public License
 # along with this program.  If not, see <https://www.gnu.org/licenses/>.
 
-from typing import Optional
+from concurrent.futures import ProcessPoolExecutor, ThreadPoolExecutor
+import multiprocessing as mp
+import time
+from typing import Callable, Optional, TypeVar
 
 from PyQt5 import QtWidgets
-from PyQt5.QtCore import Qt
+from PyQt5.QtCore import Qt, QEventLoop, QThread
+
+T = TypeVar("T")
 
 class ProgressDialog(QtWidgets.QDialog):
     def __init__(self, title: str = "Export Progress", parent=None):
@@ -88,3 +93,90 @@ def close_progress_dialog(progress_dialog: Optional[QtWidgets.QDialog]) -> None:
     app = QtWidgets.QApplication.instance()
     if app is not None:
         app.processEvents()
+
+
+def run_blocking_task_with_progress(
+    *,
+    parent: Optional[QtWidgets.QWidget],
+    window_title: str,
+    initial_message: str,
+    task: Callable[[], T],
+    detail_text: str = "",
+    poll_interval_ms: int = 100,
+) -> T:
+    """Run a blocking task in a worker thread while showing a modal busy dialog."""
+    progress = QtWidgets.QProgressDialog(initial_message, None, 0, 0, parent)
+    progress.setWindowTitle(window_title)
+    progress.setWindowModality(Qt.WindowModal)
+    progress.setCancelButton(None)
+    progress.setMinimumDuration(0)
+    progress.setAutoClose(False)
+    progress.setAutoReset(False)
+    progress.show()
+
+    app = QtWidgets.QApplication.instance()
+    if app is not None:
+        app.processEvents(QEventLoop.AllEvents, 20)
+
+    started_at = time.monotonic()
+    poll_interval_ms = max(20, min(250, int(poll_interval_ms)))
+
+    try:
+        with ThreadPoolExecutor(max_workers=1) as executor:
+            future = executor.submit(task)
+            while not future.done():
+                elapsed_s = int(max(0.0, time.monotonic() - started_at))
+                dots = "." * ((elapsed_s % 3) + 1)
+
+                lines = [f"{initial_message}{dots}"]
+                if detail_text:
+                    lines.append(detail_text)
+                lines.append(f"Elapsed: {elapsed_s}s")
+                progress.setLabelText("\n".join(lines))
+
+                if app is not None:
+                    app.processEvents(QEventLoop.AllEvents, poll_interval_ms)
+                QThread.msleep(poll_interval_ms)
+
+            return future.result()
+    finally:
+        close_progress_dialog(progress)
+
+
+def run_task_with_event_pump(
+    task: Callable[[], T],
+    *,
+    poll_interval_ms: int = 100,
+    use_process: bool = False,
+) -> T:
+    """Run a blocking task in a worker thread while keeping the GUI event loop responsive.
+
+    This helper is useful when the caller already has its own progress dialog and only
+    needs to prevent "application not responding" during long CPU/GPU/network work.
+    """
+    app = QtWidgets.QApplication.instance()
+    poll_interval_ms = max(20, min(250, int(poll_interval_ms)))
+
+    def _wait_future(executor):
+        with executor:
+            future = executor.submit(task)
+            while not future.done():
+                if app is not None:
+                    app.processEvents(QEventLoop.AllEvents, poll_interval_ms)
+                QThread.msleep(poll_interval_ms)
+            return future.result()
+
+    if use_process:
+        try:
+            return _wait_future(
+                ProcessPoolExecutor(
+                    max_workers=1,
+                    mp_context=mp.get_context("spawn"),
+                )
+            )
+        except Exception:
+            # Fallback to thread execution if process-based execution fails
+            # (e.g. environment restrictions or non-picklable task payloads).
+            return _wait_future(ThreadPoolExecutor(max_workers=1))
+
+    return _wait_future(ThreadPoolExecutor(max_workers=1))

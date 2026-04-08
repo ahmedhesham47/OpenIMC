@@ -28,14 +28,15 @@ from typing import Optional, Dict, List
 import os
 from datetime import datetime
 import pandas as pd
-import numpy as np
 from PyQt5 import QtWidgets
 from PyQt5.QtCore import Qt
 
 from openimc.processing.batch_correction import (
+    get_feature_columns_from_dataframe,
     validate_batch_correction_inputs
 )
 from openimc.core import batch_correction
+from openimc.ui.dialogs.progress_dialog import run_blocking_task_with_progress
 from openimc.ui.dialogs.custom_grouping_dialog import CustomGroupingDialog
 from openimc.utils.logger import get_logger
 
@@ -432,20 +433,10 @@ class BatchCorrectionDialog(QtWidgets.QDialog):
                 'well', 'cluster', 'source_file', 'source_well', 'source_file_acquisition_id',
                 'centroid_x', 'centroid_y', 'batch_group'
             }
-            
-            # Exclude feature columns (intensity and morphology)
-            feature_cols = set()
-            for col in combined_df.columns:
-                if col in exclude_cols:
-                    continue
-                # Check if it's a feature column (has intensity suffix or is morphology)
-                if any(col.endswith(suffix) for suffix in ['_mean', '_median', '_std', '_mad', '_p10', '_p90', '_integrated', '_frac_pos']):
-                    feature_cols.add(col)
-                elif col in ['area_um2', 'perimeter_um', 'equivalent_diameter_um', 'eccentricity',
-                            'solidity', 'extent', 'circularity', 'major_axis_len_um', 'minor_axis_len_um',
-                            'aspect_ratio', 'bbox_area_um2', 'touches_border', 'holes_count']:
-                    feature_cols.add(col)
-            
+
+            # Infer feature columns directly from the feature table.
+            feature_cols = set(get_feature_columns_from_dataframe(combined_df, include_custom_numeric=False))
+
             # Metadata columns are everything else
             metadata_cols = [col for col in combined_df.columns 
                            if col not in exclude_cols and col not in feature_cols]
@@ -717,25 +708,20 @@ class BatchCorrectionDialog(QtWidgets.QDialog):
         show_median = self.filter_median_chk.isChecked() if hasattr(self, 'filter_median_chk') else True
         show_other = self.filter_other_chk.isChecked() if hasattr(self, 'filter_other_chk') else False
         
-        # Identify feature columns (exclude metadata columns)
-        exclude_cols = {
-            'label', 'cell_id', 'acquisition_id', 'acquisition_name', 
-            'well', 'cluster', 'source_file', 'source_file_acquisition_id'
-        }
-        
-        feature_cols = [col for col in combined_df.columns if col not in exclude_cols]
+        # Infer features directly from the table schema (not image channels).
+        feature_cols = get_feature_columns_from_dataframe(combined_df)
         
         # Separate intensity and morphology features
         # Morphology features (based on feature_selector_dialog.py)
         morpho_names = {
             'area_um2', 'perimeter_um', 'equivalent_diameter_um', 'eccentricity',
             'solidity', 'extent', 'circularity', 'major_axis_len_um', 'minor_axis_len_um',
-            'aspect_ratio', 'bbox_area_um2', 'touches_border', 'holes_count',
+            'aspect_ratio', 'bbox_area_um2', 'touches_border', 'touches_edge', 'holes_count',
             'centroid_x', 'centroid_y'
         }
         
         # Intensity features identified by suffixes
-        intensity_suffixes = ['_mean', '_median', '_std', '_mad', '_p10', '_p90', '_integrated', '_frac_pos']
+        intensity_suffixes = ('_mean', '_median', '_std', '_mad', '_p10', '_p90', '_integrated', '_frac_pos')
         
         mean_features = []
         median_features = []
@@ -1046,12 +1032,16 @@ class BatchCorrectionDialog(QtWidgets.QDialog):
             item = self.feature_list.item(i)
             if item.isSelected():
                 selected_features.append(item.text())
+
+        # Guard against stale UI selections by re-validating against the table columns.
+        available_features = set(get_feature_columns_from_dataframe(combined_df))
+        selected_features = [f for f in selected_features if f in available_features]
         
         if not selected_features:
             QtWidgets.QMessageBox.warning(
                 self,
                 "No Features Selected",
-                "Please select at least one feature to correct."
+                "Please select at least one valid feature column to correct."
             )
             return
         
@@ -1139,13 +1129,6 @@ class BatchCorrectionDialog(QtWidgets.QDialog):
         # Get method
         method = self.method_combo.currentText()
         
-        # Show progress
-        progress = QtWidgets.QProgressDialog("Applying batch correction...", None, 0, 0, self)
-        progress.setWindowModality(Qt.WindowModal)
-        progress.setCancelButton(None)
-        progress.show()
-        QtWidgets.QApplication.processEvents()
-        
         try:
             # Map method name to core function format
             method_lower = method.lower()  # "Combat" -> "combat", "Harmony" -> "harmony"
@@ -1154,28 +1137,37 @@ class BatchCorrectionDialog(QtWidgets.QDialog):
             pca_variance = 0.9  # Default
             if method == "Harmony" and hasattr(self, 'pca_variance_spin'):
                 pca_variance = self.pca_variance_spin.value()
-            
-            # Use core batch_correction function
-            # Note: output_path is None here since we handle saving separately below
-            self.corrected_dataframe = batch_correction(
-                features_df=combined_df,
-                method=method_lower,
-                batch_var=batch_var,
-                features=selected_features,
-                output_path=None,  # We'll save manually below if requested
-                covariates=None,  # ComBat covariates not currently supported in GUI
-                # Harmony parameters (only used if method == "harmony")
-                n_clusters=30,  # Default, could add UI control later
-                sigma=0.1,  # Default, could add UI control later
-                theta=2.0,  # Default, could add UI control later
-                lambda_reg=1.0,  # Default, could add UI control later
-                max_iter=20,  # Default, could add UI control later
-                pca_variance=pca_variance
+
+            def _batch_correction_task():
+                # Use core batch_correction function.
+                # Note: output_path is None here since we handle saving separately below.
+                return batch_correction(
+                    features_df=combined_df,
+                    method=method_lower,
+                    batch_var=batch_var,
+                    features=selected_features,
+                    output_path=None,
+                    covariates=None,
+                    # Harmony parameters (only used if method == "harmony")
+                    n_clusters=30,
+                    sigma=0.1,
+                    theta=2.0,
+                    lambda_reg=1.0,
+                    max_iter=20,
+                    pca_variance=pca_variance,
+                )
+
+            self.corrected_dataframe = run_blocking_task_with_progress(
+                parent=self,
+                window_title="Batch Correction In Progress",
+                initial_message=f"Applying {method} batch correction",
+                detail_text=(
+                    "Computing correction and rebuilding corrected features.\n"
+                    "Large datasets may take several minutes."
+                ),
+                task=_batch_correction_task,
             )
-            
-            progress.close()
         except ImportError as e:
-            progress.close()
             QtWidgets.QMessageBox.critical(
                 self,
                 "Import Error",
@@ -1258,7 +1250,6 @@ class BatchCorrectionDialog(QtWidgets.QDialog):
             self.accept()
             
         except Exception as e:
-            progress.close()
             QtWidgets.QMessageBox.critical(
                 self,
                 "Batch Correction Error",
@@ -1266,4 +1257,3 @@ class BatchCorrectionDialog(QtWidgets.QDialog):
             )
             import traceback
             traceback.print_exc()
-

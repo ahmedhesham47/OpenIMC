@@ -45,6 +45,7 @@ import random
 from collections import defaultdict
 from openimc.utils.logger import get_logger
 from openimc.ui.dialogs.figure_save_dialog import save_figure_with_options
+from openimc.ui.dialogs.progress_dialog import run_blocking_task_with_progress
 from openimc.core import spatial_enrichment, spatial_distance_distribution, build_spatial_graph
 from openimc.ui.dialogs.spatial_analysis import (
     SourceFileFilterDialog,
@@ -1044,26 +1045,7 @@ class SimpleSpatialAnalysisDialog(QtWidgets.QDialog):
         random.seed(self.rng_seed)
         np.random.seed(self.rng_seed)
 
-        # Show progress dialog
-        progress_dlg = QtWidgets.QProgressDialog(
-            "Building spatial graph...",
-            None,
-            0,
-            0,
-            self
-        )
-        progress_dlg.setWindowTitle("Building Spatial Graph")
-        progress_dlg.setWindowModality(QtCore.Qt.WindowModal)
-        progress_dlg.setMinimumDuration(0)
-        progress_dlg.setValue(0)
-        QtWidgets.QApplication.processEvents()
-
         try:
-            # Initialize global cell ID mapping
-            self.cell_id_to_gid = {}
-            self.gid_to_cell_id = {}
-            self.adj_matrices = {}
-            
             parent = self.parent() if hasattr(self, 'parent') else None
 
             # Get filtered dataframe (respects source file filter)
@@ -1083,70 +1065,82 @@ class SimpleSpatialAnalysisDialog(QtWidgets.QDialog):
                     except Exception:
                         # Default to 1.0 um if pixel size cannot be retrieved (e.g., MCD file not loaded)
                         pixel_size_um = 1.0
-            
-            # Use core.build_spatial_graph to build edges
-            edges_df, _ = build_spatial_graph(
-                features_df=filtered_df,
-                method=mode,
-                k_neighbors=k,
-                radius=radius_um if mode == "Radius" else None,
-                pixel_size_um=pixel_size_um,
-                roi_column=roi_col,
-                detect_communities=False,  # We don't need communities here
-                community_seed=self.rng_seed,
-                output_path=None
+
+            def _graph_task():
+                edges_df, _ = build_spatial_graph(
+                    features_df=filtered_df,
+                    method=mode,
+                    k_neighbors=k,
+                    radius=radius_um if mode == "Radius" else None,
+                    pixel_size_um=pixel_size_um,
+                    roi_column=roi_col,
+                    detect_communities=False,
+                    community_seed=self.rng_seed,
+                    output_path=None,
+                )
+
+                cell_id_to_gid = {}
+                gid_to_cell_id = {}
+                adj_matrices = {}
+
+                if _HAVE_SPARSE and not edges_df.empty:
+                    roi_groups_local = list(filtered_df.groupby(roi_col)) if roi_col and roi_col in filtered_df.columns else [(None, filtered_df)]
+                    global_id_counter = 0
+
+                    for roi_id, roi_df in roi_groups_local:
+                        roi_id_str = str(roi_id) if roi_id is not None else "global"
+                        roi_edges = edges_df[edges_df['roi_id'] == roi_id_str] if 'roi_id' in edges_df.columns else edges_df
+
+                        if roi_edges.empty:
+                            continue
+
+                        cell_ids = roi_df["cell_id"].astype(int).to_numpy() if 'cell_id' in roi_df.columns else roi_df.index.values
+                        n_cells = len(cell_ids)
+
+                        roi_cell_to_gid = {}
+                        for i, cell_id in enumerate(cell_ids):
+                            gid = global_id_counter + i
+                            cell_id_to_gid[(roi_id_str, int(cell_id))] = gid
+                            gid_to_cell_id[gid] = (roi_id_str, int(cell_id))
+                            roi_cell_to_gid[int(cell_id)] = gid
+
+                        global_id_counter += n_cells
+
+                        rows, cols, data = [], [], []
+                        for _, edge in roi_edges.iterrows():
+                            src_cell_id = int(edge['cell_id_A'])
+                            dst_cell_id = int(edge['cell_id_B'])
+
+                            if src_cell_id in roi_cell_to_gid and dst_cell_id in roi_cell_to_gid:
+                                src_gid = roi_cell_to_gid[src_cell_id]
+                                dst_gid = roi_cell_to_gid[dst_cell_id]
+                                src_local = src_gid - (global_id_counter - n_cells)
+                                dst_local = dst_gid - (global_id_counter - n_cells)
+                                rows.extend([src_local, dst_local])
+                                cols.extend([dst_local, src_local])
+                                data.extend([1.0, 1.0])
+
+                        if rows:
+                            adj_matrix = sp.coo_matrix((data, (rows, cols)), shape=(n_cells, n_cells))
+                            adj_matrices[roi_id_str] = adj_matrix.tocsr()
+
+                return edges_df, cell_id_to_gid, gid_to_cell_id, adj_matrices
+
+            edges_df, cell_id_to_gid, gid_to_cell_id, adj_matrices = run_blocking_task_with_progress(
+                parent=self,
+                window_title="Building Spatial Graph",
+                initial_message="Building spatial graph",
+                detail_text=(
+                    "Computing graph edges and adjacency matrices.\n"
+                    "Large datasets may take several minutes."
+                ),
+                task=_graph_task,
             )
-            
+
             self.edge_df = edges_df
-            
-            # Build adjacency matrices from edges (GUI-specific for visualization)
-            if _HAVE_SPARSE and not self.edge_df.empty:
-                roi_groups = list(filtered_df.groupby(roi_col)) if roi_col and roi_col in filtered_df.columns else [(None, filtered_df)]
-                global_id_counter = 0
-                
-                for roi_id, roi_df in roi_groups:
-                    roi_id_str = str(roi_id) if roi_id is not None else "global"
-                    roi_edges = self.edge_df[self.edge_df['roi_id'] == roi_id_str] if 'roi_id' in self.edge_df.columns else self.edge_df
-                    
-                    if roi_edges.empty:
-                        continue
-                    
-                    # Get cell IDs for this ROI
-                    cell_ids = roi_df["cell_id"].astype(int).to_numpy() if 'cell_id' in roi_df.columns else roi_df.index.values
-                    n_cells = len(cell_ids)
-                    
-                    # Build global ID mapping for this ROI
-                    roi_cell_to_gid = {}
-                    for i, cell_id in enumerate(cell_ids):
-                        gid = global_id_counter + i
-                        self.cell_id_to_gid[(roi_id_str, int(cell_id))] = gid
-                        self.gid_to_cell_id[gid] = (roi_id_str, int(cell_id))
-                        roi_cell_to_gid[int(cell_id)] = gid
-                    
-                    global_id_counter += n_cells
-                    
-                    # Build adjacency matrix from edges
-                    rows, cols, data = [], [], []
-                    for _, edge in roi_edges.iterrows():
-                        src_cell_id = int(edge['cell_id_A'])
-                        dst_cell_id = int(edge['cell_id_B'])
-                        
-                        if src_cell_id in roi_cell_to_gid and dst_cell_id in roi_cell_to_gid:
-                            src_gid = roi_cell_to_gid[src_cell_id]
-                            dst_gid = roi_cell_to_gid[dst_cell_id]
-                            
-                            # Convert global IDs to local indices for this ROI
-                            src_local = src_gid - (global_id_counter - n_cells)
-                            dst_local = dst_gid - (global_id_counter - n_cells)
-                            
-                            # Add both directions (undirected graph)
-                            rows.extend([src_local, dst_local])
-                            cols.extend([dst_local, src_local])
-                            data.extend([1.0, 1.0])
-                    
-                    if rows:
-                        adj_matrix = sp.coo_matrix((data, (rows, cols)), shape=(n_cells, n_cells))
-                        self.adj_matrices[roi_id_str] = adj_matrix.tocsr()
+            self.cell_id_to_gid = cell_id_to_gid
+            self.gid_to_cell_id = gid_to_cell_id
+            self.adj_matrices = adj_matrices
 
             # Update metadata
             roi_groups = list(filtered_df.groupby(roi_col)) if roi_col and roi_col in filtered_df.columns else [(None, filtered_df)]
@@ -1184,14 +1178,11 @@ class SimpleSpatialAnalysisDialog(QtWidgets.QDialog):
             
             # Enable export graph button now that graph is built
             self._update_tab_states()
-            
-            progress_dlg.close()
             return True
             
         except Exception as e:
             import traceback
             traceback.print_exc()
-            progress_dlg.close()
             QtWidgets.QMessageBox.critical(self, "Spatial Graph Error", f"Error: {str(e)}\n\nCheck console for detailed debug information.")
             return False
     
@@ -1219,20 +1210,6 @@ class SimpleSpatialAnalysisDialog(QtWidgets.QDialog):
             QtWidgets.QMessageBox.warning(self, "No Graph", "Please build the spatial graph first using the 'Build Graph' button.")
             return
         
-        # Show progress dialog
-        progress_dlg = QtWidgets.QProgressDialog(
-            "Running enrichment analysis...",
-            None,
-            0,
-            0,
-            self
-        )
-        progress_dlg.setWindowTitle("Enrichment Analysis")
-        progress_dlg.setWindowModality(QtCore.Qt.WindowModal)
-        progress_dlg.setMinimumDuration(0)
-        progress_dlg.setValue(0)
-        QtWidgets.QApplication.processEvents()
-            
         try:
             n_perm = int(self.n_perm_spin.value())
             self._compute_pairwise_enrichment(n_perm=n_perm)
@@ -1264,12 +1241,9 @@ class SimpleSpatialAnalysisDialog(QtWidgets.QDialog):
             # Update visualization
             self._update_enrichment_plot()
             
-            progress_dlg.close()
-            
         except Exception as e:
             import traceback
             traceback.print_exc()
-            progress_dlg.close()
             QtWidgets.QMessageBox.critical(self, "Enrichment Analysis Error", f"Error: {str(e)}")
     
     def _run_distance_analysis(self):
@@ -1340,34 +1314,28 @@ class SimpleSpatialAnalysisDialog(QtWidgets.QDialog):
         roi_col = self._get_roi_column()
         seed = self.seed_spinbox.value()
         
-        # Show progress dialog
-        progress_dlg = QtWidgets.QProgressDialog(
-            "Computing enrichment analysis...",
-            "Cancel",
-            0,
-            0,
-            self
-        )
-        progress_dlg.setWindowTitle("Enrichment Analysis")
-        progress_dlg.setWindowModality(QtCore.Qt.WindowModal)
-        progress_dlg.setMinimumDuration(0)
-        progress_dlg.setValue(0)
-        QtWidgets.QApplication.processEvents()
-        
         try:
             # Get number of workers from UI
             n_workers = int(self.workers_spin.value())
-            
-            # Use core spatial_enrichment function with multiprocessing
-            self.enrichment_df = spatial_enrichment(
-                features_df=filtered_df,
-                edges_df=self.edge_df,
-                cluster_column=cluster_col,
-                n_permutations=n_perm,
-                seed=seed,
-                roi_column=roi_col,
-                output_path=None,  # Don't save, we'll use the dataframe directly
-                n_workers=n_workers
+
+            def _enrichment_task():
+                return spatial_enrichment(
+                    features_df=filtered_df,
+                    edges_df=self.edge_df,
+                    cluster_column=cluster_col,
+                    n_permutations=n_perm,
+                    seed=seed,
+                    roi_column=roi_col,
+                    output_path=None,
+                    n_workers=n_workers,
+                )
+
+            self.enrichment_df = run_blocking_task_with_progress(
+                parent=self,
+                window_title="Enrichment Analysis",
+                initial_message="Computing enrichment analysis",
+                detail_text="Running permutation-based enrichment across ROIs.",
+                task=_enrichment_task,
             )
         except Exception as e:
             QtWidgets.QMessageBox.critical(
@@ -1378,8 +1346,6 @@ class SimpleSpatialAnalysisDialog(QtWidgets.QDialog):
             import traceback
             traceback.print_exc()
             self.enrichment_df = pd.DataFrame()
-        finally:
-            progress_dlg.close()
     
     def _compute_distance_distributions(self):
         """Compute distance distribution analysis using core function."""
@@ -1430,30 +1396,24 @@ class SimpleSpatialAnalysisDialog(QtWidgets.QDialog):
         # Get number of workers from UI
         n_workers = int(self.distance_workers_spin.value()) if hasattr(self, 'distance_workers_spin') else None
         
-        # Show progress dialog
-        progress_dlg = QtWidgets.QProgressDialog(
-            "Computing distance distributions...",
-            "Cancel",
-            0,
-            0,
-            self
-        )
-        progress_dlg.setWindowTitle("Distance Distribution Analysis")
-        progress_dlg.setWindowModality(QtCore.Qt.WindowModal)
-        progress_dlg.setMinimumDuration(0)
-        progress_dlg.setValue(0)
-        QtWidgets.QApplication.processEvents()
-        
         try:
-            # Use core spatial_distance_distribution function with multiprocessing
-            self.distance_df = spatial_distance_distribution(
-                features_df=filtered_df,
-                edges_df=self.edge_df,
-                cluster_column=cluster_col,
-                roi_column=roi_col,
-                output_path=None,  # Don't save, we'll use the dataframe directly
-                pixel_size_um=pixel_size_um,
-                n_workers=n_workers
+            def _distance_task():
+                return spatial_distance_distribution(
+                    features_df=filtered_df,
+                    edges_df=self.edge_df,
+                    cluster_column=cluster_col,
+                    roi_column=roi_col,
+                    output_path=None,
+                    pixel_size_um=pixel_size_um,
+                    n_workers=n_workers,
+                )
+
+            self.distance_df = run_blocking_task_with_progress(
+                parent=self,
+                window_title="Distance Distribution Analysis",
+                initial_message="Computing distance distributions",
+                detail_text="Calculating nearest-neighbor distances across ROIs.",
+                task=_distance_task,
             )
         except Exception as e:
             QtWidgets.QMessageBox.critical(
@@ -1464,8 +1424,6 @@ class SimpleSpatialAnalysisDialog(QtWidgets.QDialog):
             import traceback
             traceback.print_exc()
             self.distance_df = pd.DataFrame()
-        finally:
-            progress_dlg.close()
     
     def _populate_roi_combo(self):
         """Populate ROI combo box."""
@@ -1526,30 +1484,45 @@ class SimpleSpatialAnalysisDialog(QtWidgets.QDialog):
         if not selected_roi:
             QtWidgets.QMessageBox.warning(self, "No ROI Selected", "Please select an ROI to visualize.")
             return
-        
-        # Show progress dialog
-        progress_dlg = QtWidgets.QProgressDialog(
-            "Generating spatial visualization...",
-            None,
-            0,
-            0,
-            self
-        )
-        progress_dlg.setWindowTitle("Spatial Visualization")
-        progress_dlg.setWindowModality(QtCore.Qt.WindowModal)
-        progress_dlg.setMinimumDuration(0)
-        progress_dlg.setValue(0)
-        QtWidgets.QApplication.processEvents()
-        
+
         try:
-            self._create_spatial_visualization(selected_roi, force_regenerate=True)
+            color_option = self.spatial_color_combo.currentText() if hasattr(self, 'spatial_color_combo') else 'cluster'
+            show_edges = (
+                hasattr(self, 'spatial_show_edges_check')
+                and self.spatial_show_edges_check.isChecked()
+            )
+            filtered_df = self._get_filtered_dataframe()
+            roi_col = self._get_roi_column()
+            pixel_size_um = 1.0
+            parent = self.parent() if hasattr(self, 'parent') else None
+            try:
+                if parent is not None and hasattr(parent, '_get_pixel_size_um'):
+                    pixel_size = parent._get_pixel_size_um(selected_roi)
+                    if pixel_size is not None:
+                        pixel_size_um = float(pixel_size)
+            except Exception:
+                pixel_size_um = 1.0
+            cache_data = run_blocking_task_with_progress(
+                parent=self,
+                window_title="Spatial Visualization",
+                initial_message="Preparing spatial visualization",
+                detail_text="Collecting ROI coordinates and overlay data.",
+                task=lambda: self._build_spatial_visualization_cache_data(
+                    selected_roi,
+                    filtered_df=filtered_df,
+                    roi_col=roi_col,
+                    pixel_size_um=pixel_size_um,
+                    color_option=color_option,
+                    show_edges=show_edges,
+                ),
+            )
+            self.spatial_viz_cache[selected_roi] = cache_data
+            self._render_spatial_visualization(selected_roi, cache_data)
             self.spatial_viz_run = True
             self._update_tab_states()
-            progress_dlg.close()
         except Exception as e:
             import traceback
             traceback.print_exc()
-            progress_dlg.close()
             QtWidgets.QMessageBox.critical(self, "Visualization Error", f"Error: {str(e)}")
     
     def _on_spatial_viz_option_changed(self):
@@ -1565,31 +1538,46 @@ class SimpleSpatialAnalysisDialog(QtWidgets.QDialog):
             cached_data = self.spatial_viz_cache[roi_id]
             self._render_spatial_visualization(roi_id, cached_data)
             return
-            
+
+        cache_data = self._build_spatial_visualization_cache_data(roi_id)
+        self.spatial_viz_cache[roi_id] = cache_data
+        self._render_spatial_visualization(roi_id, cache_data)
+
+    def _build_spatial_visualization_cache_data(
+        self,
+        roi_id,
+        filtered_df=None,
+        roi_col=None,
+        pixel_size_um=None,
+        color_option=None,
+        show_edges=None,
+    ):
+        """Build cache data for a spatial visualization (safe to run in a worker thread)."""
         # Get filtered dataframe
-        filtered_df = self._get_filtered_dataframe()
-        roi_col = self._get_roi_column()
+        if filtered_df is None:
+            filtered_df = self._get_filtered_dataframe()
+        if roi_col is None:
+            roi_col = self._get_roi_column()
         roi_df = filtered_df[filtered_df[roi_col] == roi_id].copy()
         
         if roi_df.empty:
-            QtWidgets.QMessageBox.warning(self, "No Data", f"No data available for ROI {roi_id}.")
-            return
+            raise ValueError(f"No data available for ROI {roi_id}.")
             
         # Get color option
-        color_option = self.spatial_color_combo.currentText() if hasattr(self, 'spatial_color_combo') else 'cluster'
+        if color_option is None:
+            color_option = self.spatial_color_combo.currentText() if hasattr(self, 'spatial_color_combo') else 'cluster'
         
         # Get pixel size (default to 1.0 um if not available, e.g., MCD file not loaded)
-        parent = self.parent() if hasattr(self, 'parent') else None
-        pixel_size_um = 1.0
-        try:
-            if parent is not None and hasattr(parent, '_get_pixel_size_um'):
-                pixel_size = parent._get_pixel_size_um(roi_id)
-                if pixel_size is not None:
-                    pixel_size_um = float(pixel_size)
-                # If None, keep default 1.0
-        except Exception:
-            # Default to 1.0 um if pixel size cannot be retrieved (e.g., MCD file not loaded)
+        if pixel_size_um is None:
+            parent = self.parent() if hasattr(self, 'parent') else None
             pixel_size_um = 1.0
+            try:
+                if parent is not None and hasattr(parent, '_get_pixel_size_um'):
+                    pixel_size = parent._get_pixel_size_um(roi_id)
+                    if pixel_size is not None:
+                        pixel_size_um = float(pixel_size)
+            except Exception:
+                pixel_size_um = 1.0
         
         # Get coordinates
         coords_um = roi_df[["centroid_x", "centroid_y"]].to_numpy() * pixel_size_um
@@ -1602,8 +1590,9 @@ class SimpleSpatialAnalysisDialog(QtWidgets.QDialog):
         
         # Get edges if graph is built AND checkbox is enabled (skip computation if not needed)
         edges_um = None
-        show_edges = (hasattr(self, 'spatial_show_edges_check') and 
-                     self.spatial_show_edges_check.isChecked())
+        if show_edges is None:
+            show_edges = (hasattr(self, 'spatial_show_edges_check') and 
+                         self.spatial_show_edges_check.isChecked())
         if show_edges and self.edge_df is not None and not self.edge_df.empty:
             roi_edges = self.edge_df[self.edge_df['roi_id'] == str(roi_id)]
             if not roi_edges.empty:
@@ -1624,10 +1613,7 @@ class SimpleSpatialAnalysisDialog(QtWidgets.QDialog):
             'edges_um': edges_um,
             'roi_df': roi_df
         }
-        self.spatial_viz_cache[roi_id] = cache_data
-        
-        # Render
-        self._render_spatial_visualization(roi_id, cache_data)
+        return cache_data
     
     def _render_spatial_visualization(self, roi_id, cache_data):
         """Render the spatial visualization on the canvas."""
@@ -1712,20 +1698,6 @@ class SimpleSpatialAnalysisDialog(QtWidgets.QDialog):
                 "Community analysis requires igraph. Please install it: pip install python-igraph")
             return
         
-        # Show progress dialog
-        progress_dlg = QtWidgets.QProgressDialog(
-            "Running community detection analysis...",
-            None,
-            0,
-            0,
-            self
-        )
-        progress_dlg.setWindowTitle("Community Analysis")
-        progress_dlg.setWindowModality(QtCore.Qt.WindowModal)
-        progress_dlg.setMinimumDuration(0)
-        progress_dlg.setValue(0)
-        QtWidgets.QApplication.processEvents()
-            
         try:
             # Get filtered dataframe
             filtered_df = self._get_filtered_dataframe()
@@ -1740,25 +1712,32 @@ class SimpleSpatialAnalysisDialog(QtWidgets.QDialog):
             if roi_edges.empty:
                 QtWidgets.QMessageBox.warning(self, "No Edges", f"No edges found for ROI {selected_roi}.")
                 return
-            
-            # Build igraph graph
-            cell_ids = roi_df['cell_id'].astype(int).tolist()
-            cell_id_to_idx = {cell_id: i for i, cell_id in enumerate(cell_ids)}
-            
-            g = ig.Graph()
-            g.add_vertices(len(cell_ids))
-            
-            for _, edge in roi_edges.iterrows():
-                cell_a = int(edge['cell_id_A'])
-                cell_b = int(edge['cell_id_B'])
-                if cell_a in cell_id_to_idx and cell_b in cell_id_to_idx:
-                    idx_a = cell_id_to_idx[cell_a]
-                    idx_b = cell_id_to_idx[cell_b]
-                    g.add_edge(idx_a, idx_b)
-            
-            # Run community detection (Louvain algorithm)
-            communities = g.community_multilevel()
-            community_labels = communities.membership
+
+            def _community_task():
+                cell_ids = roi_df['cell_id'].astype(int).tolist()
+                cell_id_to_idx = {cell_id: i for i, cell_id in enumerate(cell_ids)}
+
+                g = ig.Graph()
+                g.add_vertices(len(cell_ids))
+
+                for _, edge in roi_edges.iterrows():
+                    cell_a = int(edge['cell_id_A'])
+                    cell_b = int(edge['cell_id_B'])
+                    if cell_a in cell_id_to_idx and cell_b in cell_id_to_idx:
+                        idx_a = cell_id_to_idx[cell_a]
+                        idx_b = cell_id_to_idx[cell_b]
+                        g.add_edge(idx_a, idx_b)
+
+                communities = g.community_multilevel()
+                return communities.membership, cell_id_to_idx
+
+            community_labels, cell_id_to_idx = run_blocking_task_with_progress(
+                parent=self,
+                window_title="Community Analysis",
+                initial_message="Running community detection",
+                detail_text="Building graph partitions for the selected ROI.",
+                task=_community_task,
+            )
             
             # Store results
             roi_df['community'] = [community_labels[cell_id_to_idx[int(cid)]] for cid in roi_df['cell_id']]
@@ -1767,14 +1746,12 @@ class SimpleSpatialAnalysisDialog(QtWidgets.QDialog):
             self._update_community_plot(selected_roi, roi_df, community_labels)
             
             self.community_analysis_run = True
-            progress_dlg.close()
             QtWidgets.QMessageBox.information(self, "Community Analysis", 
                 f"Detected {len(set(community_labels))} communities in ROI {selected_roi}.")
             
         except Exception as e:
             import traceback
             traceback.print_exc()
-            progress_dlg.close()
             QtWidgets.QMessageBox.critical(self, "Community Analysis Error", f"Error: {str(e)}")
     
     def _update_community_plot(self, roi_id, roi_df, community_labels):
@@ -2275,4 +2252,3 @@ class SimpleSpatialAnalysisDialog(QtWidgets.QDialog):
         if hasattr(self, 'annotation_timer'):
             self.annotation_timer.stop()
         event.accept()
-

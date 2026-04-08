@@ -30,6 +30,7 @@ import operator
 import os
 import sys
 import time
+import warnings
 from typing import Optional
 
 
@@ -742,6 +743,9 @@ def cellsam_pipeline_custom(
     
     if not _HAVE_DASK:
         raise ImportError("dask not installed. Install with: pip install dask")
+
+    # Avoid noisy progress bars and repetitive warnings from the upstream package.
+    os.environ.setdefault("TQDM_DISABLE", "1")
     
     # Get cached model (this ensures only one instance exists)
     model = _get_cached_model(model_path, bbox_threshold)
@@ -763,22 +767,28 @@ def cellsam_pipeline_custom(
     inp = da.from_array(img, chunks=chunks)
     
     # gauge_cell_size can be used with or without use_wsi
-    if gauge_cell_size:
-        # Gauge cell size first, then decide on best segmentation approach
-        labels = use_cellsize_gaging_custom(
-            inp, model, device, block_size=block_size, overlap=overlap,
-            iou_depth=iou_depth, iou_threshold=iou_threshold,
-            bbox_threshold=bbox_threshold
+    with warnings.catch_warnings():
+        warnings.filterwarnings(
+            "ignore",
+            message="Low IOU threshold, ignoring mask\\.",
+            category=UserWarning,
         )
-    elif use_wsi:
-        labels = segment_wsi_custom(
-            inp, model, block_size, overlap, iou_depth, iou_threshold,
-            bbox_threshold, normalize=True
-        )
-    else:
-        if not _HAVE_CELLSAM or segment_cellular_image is None:
-            raise ImportError("CellSAM not installed. segment_cellular_image not available.")
-        labels = segment_cellular_image(inp, model=model, normalize=True, device=device)[0]
+        if gauge_cell_size:
+            # Gauge cell size first, then decide on best segmentation approach
+            labels = use_cellsize_gaging_custom(
+                inp, model, device, block_size=block_size, overlap=overlap,
+                iou_depth=iou_depth, iou_threshold=iou_threshold,
+                bbox_threshold=bbox_threshold
+            )
+        elif use_wsi:
+            labels = segment_wsi_custom(
+                inp, model, block_size, overlap, iou_depth, iou_threshold,
+                bbox_threshold, normalize=True
+            )
+        else:
+            if not _HAVE_CELLSAM or segment_cellular_image is None:
+                raise ImportError("CellSAM not installed. segment_cellular_image not available.")
+            labels = segment_cellular_image(inp, model=model, normalize=True, device=device)[0]
     
     # Handle case where CellSAM fails to detect any cells (returns None)
     if labels is None:
@@ -791,6 +801,39 @@ def cellsam_pipeline_custom(
         )
     
     return labels
+
+
+def run_cellsam_pipeline_subprocess(
+    img: np.ndarray,
+    bbox_threshold: float = 0.4,
+    use_wsi: bool = True,
+    low_contrast_enhancement: bool = False,
+    gauge_cell_size: bool = False,
+    chunks: int = 256,
+    block_size: int = 400,
+    overlap: int = 56,
+    iou_depth: int = 56,
+    iou_threshold: float = 0.5,
+) -> np.ndarray:
+    """Process-safe entry point for CellSAM inference.
+
+    This function is designed to be executed in a subprocess to avoid
+    Qt UI stalling from long-running Python/GIL-heavy sections.
+    """
+    return cellsam_pipeline_custom(
+        img=img,
+        chunks=chunks,
+        model_path=None,
+        bbox_threshold=bbox_threshold,
+        low_contrast_enhancement=low_contrast_enhancement,
+        swap_channels=False,
+        use_wsi=use_wsi,
+        gauge_cell_size=gauge_cell_size,
+        block_size=block_size,
+        overlap=overlap,
+        iou_depth=iou_depth,
+        iou_threshold=iou_threshold,
+    )
 
 
 def clear_model_cache():
@@ -821,4 +864,3 @@ def clear_model_cache():
         import gc
         gc.collect()
         gc.collect()
-

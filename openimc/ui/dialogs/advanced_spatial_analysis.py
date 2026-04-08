@@ -56,6 +56,7 @@ from scipy.spatial import Delaunay
 from scipy import stats
 import seaborn as sns
 from openimc.ui.dialogs.figure_save_dialog import save_figure_with_options
+from openimc.ui.dialogs.progress_dialog import run_blocking_task_with_progress
 from openimc.ui.dialogs.spatial_analysis import (
     SourceFileFilterDialog,
     _HAVE_SQUIDPY,
@@ -1286,20 +1287,6 @@ class AdvancedSpatialAnalysisDialog(QtWidgets.QDialog):
         if not self._validate_data():
             return
         
-        # Show progress dialog
-        progress_dlg = QtWidgets.QProgressDialog(
-            "Creating spatial graph...",
-            None,
-            0,
-            0,
-            self
-        )
-        progress_dlg.setWindowTitle("Building Spatial Graph")
-        progress_dlg.setWindowModality(QtCore.Qt.WindowModal)
-        progress_dlg.setMinimumDuration(0)
-        progress_dlg.setValue(0)
-        QtWidgets.QApplication.processEvents()
-        
         try:
             method = self.graph_method_combo.currentText()
             k = int(self.graph_k_spin.value()) if method == "kNN" else None
@@ -1308,26 +1295,42 @@ class AdvancedSpatialAnalysisDialog(QtWidgets.QDialog):
             
             roi_col = self._get_roi_column()
             filtered_df = self._get_filtered_dataframe()
+            roi_cell_counts = {}
+            if roi_col in filtered_df.columns:
+                roi_cell_counts = (
+                    filtered_df
+                    .dropna(subset=["centroid_x", "centroid_y"])
+                    .groupby(roi_col)
+                    .size()
+                    .to_dict()
+                )
             
             # Get pixel size (use first ROI as default)
             all_rois = self._get_all_rois()
             if not all_rois:
-                progress_dlg.close()
                 QtWidgets.QMessageBox.warning(self, "No ROIs", "No ROIs found in the data.")
                 return
             
             pixel_size_um = self._get_pixel_size_um(all_rois[0])
-            
-            # Use core function to build graph
-            anndata_dict = build_spatial_graph_anndata(
-                features_df=filtered_df,
-                method=method,
-                k_neighbors=k if k else 20,
-                radius=radius,
-                pixel_size_um=pixel_size_um,
-                roi_column=roi_col,
-                roi_id=None,  # Process all ROIs
-                seed=seed
+
+            def _spatial_graph_task():
+                return build_spatial_graph_anndata(
+                    features_df=filtered_df,
+                    method=method,
+                    k_neighbors=k if k else 20,
+                    radius=radius,
+                    pixel_size_um=pixel_size_um,
+                    roi_column=roi_col,
+                    roi_id=None,
+                    seed=seed,
+                )
+
+            anndata_dict = run_blocking_task_with_progress(
+                parent=self,
+                window_title="Building Spatial Graph",
+                initial_message="Creating spatial graph",
+                detail_text="Building spatial neighbor graph for selected ROI set.",
+                task=_spatial_graph_task,
             )
             
             if anndata_dict:
@@ -1335,9 +1338,27 @@ class AdvancedSpatialAnalysisDialog(QtWidgets.QDialog):
                 self.anndata_cache.update(anndata_dict)
                 self.spatial_graph_built = True
                 success_count = len(anndata_dict)
+                skipped_rois = []
+                if roi_cell_counts:
+                    successful_roi_ids = set(anndata_dict.keys())
+                    for raw_roi_id, n_cells in roi_cell_counts.items():
+                        roi_id_str = str(raw_roi_id)
+                        if roi_id_str not in successful_roi_ids:
+                            skipped_rois.append((roi_id_str, int(n_cells)))
+                adjusted_k_rois = []
+                if method == "kNN" and k is not None and roi_cell_counts:
+                    for raw_roi_id, n_cells in roi_cell_counts.items():
+                        if n_cells >= 2 and k >= n_cells:
+                            adjusted_k_rois.append((str(raw_roi_id), int(k), int(n_cells - 1)))
                 
-                self.graph_status_label.setText(f"Graph created for {success_count} ROI(s)")
-                self.graph_status_label.setStyleSheet("color: green;")
+                if skipped_rois:
+                    self.graph_status_label.setText(
+                        f"Graph created for {success_count} ROI(s), skipped {len(skipped_rois)} ROI(s)"
+                    )
+                    self.graph_status_label.setStyleSheet("color: #b36b00;")
+                else:
+                    self.graph_status_label.setText(f"Graph created for {success_count} ROI(s)")
+                    self.graph_status_label.setStyleSheet("color: green;")
                 
                 # Update processed ROIs tracking
                 for roi_id in anndata_dict.keys():
@@ -1353,20 +1374,46 @@ class AdvancedSpatialAnalysisDialog(QtWidgets.QDialog):
                         self._update_cooccur_ref_cluster_combo(first_adata)
                 
                 self._update_button_states()
-                progress_dlg.close()
-                QtWidgets.QMessageBox.information(self, "Graph Created", 
-                    f"Spatial graph created successfully for {success_count} ROI(s).")
+
+                details = [f"Spatial graph created successfully for {success_count} ROI(s)."]
+                if adjusted_k_rois:
+                    preview = ", ".join(
+                        f"{roi} ({old_k}->{new_k})" for roi, old_k, new_k in adjusted_k_rois[:6]
+                    )
+                    if len(adjusted_k_rois) > 6:
+                        preview += f", ... ({len(adjusted_k_rois)} total)"
+                    details.append(
+                        f"k was auto-adjusted for {len(adjusted_k_rois)} ROI(s) with fewer cells than requested neighbors: {preview}"
+                    )
+                if skipped_rois:
+                    preview = ", ".join(
+                        f"{roi} (n={n_cells})" for roi, n_cells in skipped_rois[:6]
+                    )
+                    if len(skipped_rois) > 6:
+                        preview += f", ... ({len(skipped_rois)} total)"
+                    if method == "kNN":
+                        details.append(
+                            f"Skipped {len(skipped_rois)} ROI(s) that could not build a valid graph (typically n < 2): {preview}"
+                        )
+                    elif method == "Delaunay":
+                        details.append(
+                            f"Skipped {len(skipped_rois)} ROI(s) that could not build Delaunay graph (requires at least 3 non-degenerate points): {preview}"
+                        )
+                    else:
+                        details.append(
+                            f"Skipped {len(skipped_rois)} ROI(s) due to graph construction constraints: {preview}"
+                        )
+
+                QtWidgets.QMessageBox.information(self, "Graph Created", "\n\n".join(details))
             else:
                 self.graph_status_label.setText("Graph creation failed")
                 self.graph_status_label.setStyleSheet("color: red;")
-                progress_dlg.close()
                 QtWidgets.QMessageBox.warning(self, "Graph Creation Failed", 
                     "Failed to create spatial graph for any ROI.")
                 
         except Exception as e:
             import traceback
             traceback.print_exc()
-            progress_dlg.close()
             QtWidgets.QMessageBox.critical(self, "Error", f"Error creating spatial graph: {str(e)}")
     
     def _run_sq_nhood_enrichment(self):
@@ -1377,20 +1424,6 @@ class AdvancedSpatialAnalysisDialog(QtWidgets.QDialog):
             QtWidgets.QMessageBox.warning(self, "Graph Required", 
                 "Please create the spatial graph first (Step 1 at the top).")
             return
-        
-        # Show progress dialog
-        progress_dlg = QtWidgets.QProgressDialog(
-            "Running neighborhood enrichment analysis...",
-            None,
-            0,
-            0,
-            self
-        )
-        progress_dlg.setWindowTitle("Neighborhood Enrichment")
-        progress_dlg.setWindowModality(QtCore.Qt.WindowModal)
-        progress_dlg.setMinimumDuration(0)
-        progress_dlg.setValue(0)
-        QtWidgets.QApplication.processEvents()
         
         try:
             cluster_key = self.sq_nhood_cluster_combo.currentText()
@@ -1425,27 +1458,20 @@ class AdvancedSpatialAnalysisDialog(QtWidgets.QDialog):
                 QtWidgets.QMessageBox.warning(self, "No Data", "No AnnData objects with spatial graphs found.")
                 return
             
-            # Use core function
-            import sys
-            sys.stdout.flush()
-            try:
-                results = spatial_neighborhood_enrichment(
+            def _nhood_task():
+                return spatial_neighborhood_enrichment(
                     anndata_dict=anndata_dict,
                     cluster_key=cluster_key,
-                    aggregation=agg_method
+                    aggregation=agg_method,
                 )
-                sys.stdout.flush()
-                if 'results' in results:
-                    pass
-                if 'aggregated' in results:
-                    if results['aggregated'] is not None:
-                        pass
-                sys.stdout.flush()
-            except Exception as e:
-                import traceback
-                traceback.print_exc()
-                sys.stdout.flush()
-                raise
+
+            results = run_blocking_task_with_progress(
+                parent=self,
+                window_title="Neighborhood Enrichment",
+                initial_message="Running neighborhood enrichment",
+                detail_text="Computing enrichment statistics across the selected ROI set.",
+                task=_nhood_task,
+            )
             
             # Update cache with results
             self.anndata_cache.update(results['results'])
@@ -1709,20 +1735,6 @@ class AdvancedSpatialAnalysisDialog(QtWidgets.QDialog):
                 "Please create the spatial graph first (Step 1 at the top).")
             return
         
-        # Show progress dialog
-        progress_dlg = QtWidgets.QProgressDialog(
-            "Running co-occurrence analysis...",
-            None,
-            0,
-            0,
-            self
-        )
-        progress_dlg.setWindowTitle("Co-occurrence Analysis")
-        progress_dlg.setWindowModality(QtCore.Qt.WindowModal)
-        progress_dlg.setMinimumDuration(0)
-        progress_dlg.setValue(0)
-        QtWidgets.QApplication.processEvents()
-        
         try:
             cluster_key = self.sq_cooccur_cluster_combo.currentText()
             roi_id = self._get_selected_roi(self.sq_cooccur_roi_combo)
@@ -1786,12 +1798,20 @@ class AdvancedSpatialAnalysisDialog(QtWidgets.QDialog):
                 QtWidgets.QMessageBox.warning(self, "No Data", "No AnnData objects with spatial graphs found.")
                 return
             
-            # Use core function
-            results = spatial_cooccurrence(
-                anndata_dict=anndata_dict,
-                cluster_key=cluster_key,
-                interval=nhood_sizes,
-                reference_cluster=self.sq_cooccur_ref_cluster_combo.currentData()
+            def _cooccur_task():
+                return spatial_cooccurrence(
+                    anndata_dict=anndata_dict,
+                    cluster_key=cluster_key,
+                    interval=nhood_sizes,
+                    reference_cluster=self.sq_cooccur_ref_cluster_combo.currentData(),
+                )
+
+            results = run_blocking_task_with_progress(
+                parent=self,
+                window_title="Co-occurrence Analysis",
+                initial_message="Running co-occurrence analysis",
+                detail_text="Estimating neighborhood co-occurrence across distances.",
+                task=_cooccur_task,
             )
             
             # Update cache with results
@@ -1819,13 +1839,10 @@ class AdvancedSpatialAnalysisDialog(QtWidgets.QDialog):
             else:
                 QtWidgets.QMessageBox.warning(self, "No Results", 
                     "Co-occurrence analysis completed but no results to plot.")
-            
-            progress_dlg.close()
                 
         except Exception as e:
             import traceback
             traceback.print_exc()
-            progress_dlg.close()
             QtWidgets.QMessageBox.critical(self, "Error", f"Error running co-occurrence: {str(e)}")
     
     def _plot_sq_cooccurrence(self, adata: 'ad.AnnData'):
@@ -2202,20 +2219,6 @@ class AdvancedSpatialAnalysisDialog(QtWidgets.QDialog):
                 "Please create the spatial graph first (Step 1 at the top).")
             return
         
-        # Show progress dialog
-        progress_dlg = QtWidgets.QProgressDialog(
-            "Running spatial autocorrelation analysis...",
-            None,
-            0,
-            0,
-            self
-        )
-        progress_dlg.setWindowTitle("Spatial Autocorrelation")
-        progress_dlg.setWindowModality(QtCore.Qt.WindowModal)
-        progress_dlg.setMinimumDuration(0)
-        progress_dlg.setValue(0)
-        QtWidgets.QApplication.processEvents()
-        
         try:
             markers_str = self.sq_autocorr_markers_edit.text().strip()
             roi_id = self._get_selected_roi(self.sq_autocorr_roi_combo)
@@ -2246,11 +2249,19 @@ class AdvancedSpatialAnalysisDialog(QtWidgets.QDialog):
                 QtWidgets.QMessageBox.warning(self, "No Data", "No AnnData objects with spatial graphs found.")
                 return
             
-            # Use core function
-            results = spatial_autocorrelation(
-                anndata_dict=anndata_dict,
-                markers=markers,
-                aggregation=agg_method
+            def _autocorr_task():
+                return spatial_autocorrelation(
+                    anndata_dict=anndata_dict,
+                    markers=markers,
+                    aggregation=agg_method,
+                )
+
+            results = run_blocking_task_with_progress(
+                parent=self,
+                window_title="Spatial Autocorrelation",
+                initial_message="Running spatial autocorrelation analysis",
+                detail_text="Computing Moran statistics for selected markers.",
+                task=_autocorr_task,
             )
             
             # Update cache with results
@@ -2282,13 +2293,10 @@ class AdvancedSpatialAnalysisDialog(QtWidgets.QDialog):
             # Plot results
             self._plot_sq_autocorrelation(plot_adata)
             self.sq_autocorr_save_btn.setEnabled(True)
-            
-            progress_dlg.close()
                 
         except Exception as e:
             import traceback
             traceback.print_exc()
-            progress_dlg.close()
             QtWidgets.QMessageBox.critical(self, "Error", f"Error running autocorrelation: {str(e)}")
     
     def _plot_sq_autocorrelation(self, adata: 'ad.AnnData'):
@@ -2657,20 +2665,6 @@ class AdvancedSpatialAnalysisDialog(QtWidgets.QDialog):
                 "Please create the spatial graph first (Step 1 at the top).")
             return
         
-        # Show progress dialog
-        progress_dlg = QtWidgets.QProgressDialog(
-            "Running Ripley analysis...",
-            None,
-            0,
-            0,
-            self
-        )
-        progress_dlg.setWindowTitle("Ripley Analysis")
-        progress_dlg.setWindowModality(QtCore.Qt.WindowModal)
-        progress_dlg.setMinimumDuration(0)
-        progress_dlg.setValue(0)
-        QtWidgets.QApplication.processEvents()
-        
         try:
             mode = self.sq_ripley_mode_combo.currentText()  # F, G, or L
             max_dist = float(self.sq_ripley_r_max_spin.value())
@@ -2704,12 +2698,20 @@ class AdvancedSpatialAnalysisDialog(QtWidgets.QDialog):
                 QtWidgets.QMessageBox.warning(self, "No Data", "No AnnData objects with spatial graphs found.")
                 return
             
-            # Use core function
-            results = spatial_ripley(
-                anndata_dict=anndata_dict,
-                cluster_key=cluster_key,
-                mode=mode,
-                max_dist=max_dist
+            def _ripley_task():
+                return spatial_ripley(
+                    anndata_dict=anndata_dict,
+                    cluster_key=cluster_key,
+                    mode=mode,
+                    max_dist=max_dist,
+                )
+
+            results = run_blocking_task_with_progress(
+                parent=self,
+                window_title="Ripley Analysis",
+                initial_message="Running Ripley analysis",
+                detail_text="Estimating spatial dispersion/clustering statistics.",
+                task=_ripley_task,
             )
             
             # Update cache with results
@@ -2743,13 +2745,10 @@ class AdvancedSpatialAnalysisDialog(QtWidgets.QDialog):
                 QtWidgets.QMessageBox.warning(self, "No Results", 
                     "Ripley analysis completed but no results to plot. "
                     "This can happen when clusters are too small.")
-            
-            progress_dlg.close()
                 
         except Exception as e:
             import traceback
             traceback.print_exc()
-            progress_dlg.close()
             QtWidgets.QMessageBox.critical(self, "Error", f"Error running Ripley: {str(e)}")
     
     def _aggregate_ripley_results(self, results: Dict[str, 'ad.AnnData'], cluster_key: str, mode: str, agg_method: str) -> 'ad.AnnData':
@@ -3129,4 +3128,3 @@ class AdvancedSpatialAnalysisDialog(QtWidgets.QDialog):
     def closeEvent(self, event):
         """Handle dialog closing."""
         event.accept()
-

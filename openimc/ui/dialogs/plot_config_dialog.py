@@ -306,6 +306,22 @@ class PlotConfigDialog(QtWidgets.QDialog):
         zscore_method_layout.addWidget(self.zscore_method_combo)
         zscore_method_layout.addStretch()
         heatmap_layout.addLayout(zscore_method_layout)
+
+        # Cluster Map cell size (for Cluster Map only)
+        cluster_cell_size_layout = QtWidgets.QHBoxLayout()
+        self.cluster_cell_size_label = QtWidgets.QLabel("Cluster cell size (px):")
+        cluster_cell_size_layout.addWidget(self.cluster_cell_size_label)
+        self.cluster_cell_size_spinbox = QtWidgets.QSpinBox()
+        self.cluster_cell_size_spinbox.setRange(4, 64)
+        self.cluster_cell_size_spinbox.setValue(14)
+        self.cluster_cell_size_spinbox.setToolTip(
+            "Approximate pixel size per Cluster Map cell. "
+            "Larger values make each cell bigger and can increase figure size."
+        )
+        self.cluster_cell_size_spinbox.valueChanged.connect(self._on_cluster_cell_size_changed)
+        cluster_cell_size_layout.addWidget(self.cluster_cell_size_spinbox)
+        cluster_cell_size_layout.addStretch()
+        heatmap_layout.addLayout(cluster_cell_size_layout)
         
         self.heatmap_group.setLayout(heatmap_layout)
         content_layout.addWidget(self.heatmap_group)
@@ -532,6 +548,12 @@ class PlotConfigDialog(QtWidgets.QDialog):
         if hasattr(self, 'zscore_method_combo'):
             self.zscore_method_combo.setVisible(view == 'Cluster Map')
         
+        # Cluster cell size: Only for Cluster Map
+        if hasattr(self, 'cluster_cell_size_label'):
+            self.cluster_cell_size_label.setVisible(view == 'Cluster Map')
+        if hasattr(self, 'cluster_cell_size_spinbox'):
+            self.cluster_cell_size_spinbox.setVisible(view == 'Cluster Map')
+        
         # Heatmap source: Only for Heatmap (not Cluster Map)
         if hasattr(self, 'heatmap_source_label'):
             self.heatmap_source_label.setVisible(view == 'Heatmap')
@@ -713,6 +735,13 @@ class PlotConfigDialog(QtWidgets.QDialog):
                 self.zscore_method_combo.setCurrentText(zscore_method)
         elif hasattr(self, 'zscore_method_combo'):
             self.zscore_method_combo.setCurrentText("Mean")  # Default
+
+        # Cluster Map cell size
+        if hasattr(self.parent_dialog, 'cluster_map_cell_size'):
+            if hasattr(self, 'cluster_cell_size_spinbox'):
+                self.cluster_cell_size_spinbox.setValue(int(self.parent_dialog.cluster_map_cell_size))
+        elif hasattr(self, 'cluster_cell_size_spinbox'):
+            self.cluster_cell_size_spinbox.setValue(14)  # Default
         
         # Patient annotation - populate column options
         # Block signals to prevent triggering dialogs during population
@@ -826,6 +855,15 @@ class PlotConfigDialog(QtWidgets.QDialog):
                 self.parent_dialog.cluster_map_orientation = 'landscape'
             if hasattr(self.parent_dialog, '_show_cluster_map'):
                 self.parent_dialog._show_cluster_map()
+
+    def _on_cluster_cell_size_changed(self, value: int):
+        """Handle Cluster Map cell size change."""
+        if hasattr(self.parent_dialog, 'cluster_map_cell_size'):
+            self.parent_dialog.cluster_map_cell_size = int(value)
+        # Update parent dialog immediately if Cluster Map is active
+        if hasattr(self.parent_dialog, 'view_combo') and self.parent_dialog.view_combo.currentText() == 'Cluster Map':
+            if hasattr(self.parent_dialog, '_show_cluster_map'):
+                self.parent_dialog._show_cluster_map()
     
     def _on_patient_annotation_changed(self, state: int):
         """Handle patient annotation checkbox change."""
@@ -929,6 +967,10 @@ class PlotConfigDialog(QtWidgets.QDialog):
         # Cluster Map z-score computation method
         if hasattr(self, 'zscore_method_combo'):
             self.parent_dialog.cluster_map_zscore_method = self.zscore_method_combo.currentText()
+
+        # Cluster Map cell size
+        if hasattr(self, 'cluster_cell_size_spinbox') and hasattr(self.parent_dialog, 'cluster_map_cell_size'):
+            self.parent_dialog.cluster_map_cell_size = int(self.cluster_cell_size_spinbox.value())
         
         # Refresh Cluster Map if it's the current view
         if hasattr(self.parent_dialog, 'view_combo') and self.parent_dialog.view_combo.currentText() == 'Cluster Map':
@@ -1033,4 +1075,3 @@ class PlotConfigDialog(QtWidgets.QDialog):
                 self.parent_dialog._on_view_changed(current_view)
         
         self.accept()
-

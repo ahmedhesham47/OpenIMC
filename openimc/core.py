@@ -50,12 +50,17 @@ from scipy.spatial import cKDTree, Delaunay
 from openimc.data.mcd_loader import MCDLoader, AcquisitionInfo
 from openimc.data.ometiff_loader import OMETIFFLoader
 from openimc.processing.export_worker import process_channel_for_export
-from openimc.processing.feature_worker import _apply_denoise_to_channel, extract_features_for_acquisition
+from openimc.processing.feature_worker import (
+    _apply_denoise_to_channel,
+    extract_features_for_acquisition,
+    drop_excluded_channel_feature_columns
+)
 from openimc.processing.watershed_worker import watershed_segmentation
 from openimc.processing.batch_correction import (
     apply_combat_correction,
     apply_harmony_correction,
     detect_batch_variable,
+    get_feature_columns_from_dataframe,
     validate_batch_correction_inputs
 )
 from openimc.processing.spillover_correction import (
@@ -811,6 +816,10 @@ def extract_features(
     else:
         # No features extracted
         combined_features = pd.DataFrame()
+
+    # Enforce channel exclusion at final table level (after concat) so excluded
+    # channels cannot appear as columns with NaN values.
+    combined_features = drop_excluded_channel_feature_columns(combined_features, excluded_channels)
     
     # Apply arcsinh transformation to intensity features after combining all acquisitions
     # This is more efficient than applying per-acquisition and ensures consistency
@@ -888,8 +897,12 @@ def cluster(
         ValueError: If method is invalid or required parameters are missing
     """
     import time
+    import random
     t_start = time.time()
     print(f"[CORE.CLUSTER] Starting clustering: method={method}, input shape={features_df.shape}")
+    # Set explicit seeds once at function entry for reproducible behavior.
+    random.seed(seed)
+    np.random.seed(seed)
     
     # Select columns for clustering
     t0 = time.time()
@@ -1029,14 +1042,18 @@ def cluster(
         
         t0 = time.time()
         # Build k-NN graph using sklearn (matching old GUI implementation)
-        nbrs = NearestNeighbors(n_neighbors=n_neighbors, metric=metric).fit(data_values)
+        try:
+            nbrs = NearestNeighbors(n_neighbors=n_neighbors, metric=metric, n_jobs=1).fit(data_values)
+        except TypeError:
+            # Backward compatibility with older sklearn versions without n_jobs arg.
+            nbrs = NearestNeighbors(n_neighbors=n_neighbors, metric=metric).fit(data_values)
         distances_knn, indices_knn = nbrs.kneighbors(data_values)
         print(f"[CORE.CLUSTER] Leiden: k-NN calculation took {time.time() - t0:.3f}s")
         
         t0 = time.time()
         # Create graph from k-NN (matching old GUI implementation)
-        edges = []
-        weights = []
+        edge_weights = {}
+        directed_edge_count = 0
         
         if use_jaccard:
             # Compute neighbor sets for Jaccard similarity (PhenoGraph-like)
@@ -1047,35 +1064,43 @@ def cluster(
             for i in range(n):
                 for j_idx, neighbor_idx in enumerate(indices_knn[i]):
                     if neighbor_idx != i:  # Don't add self-loops
-                        edges.append((i, neighbor_idx))
+                        directed_edge_count += 1
                         # Compute Jaccard similarity: |N(i) ∩ N(j)| / |N(i) ∪ N(j)|
                         intersection = len(neighbor_sets[i] & neighbor_sets[neighbor_idx])
                         union = len(neighbor_sets[i] | neighbor_sets[neighbor_idx])
                         jaccard = intersection / union if union > 0 else 0.0
-                        weights.append(jaccard)
+                        u = int(i)
+                        v = int(neighbor_idx)
+                        if u > v:
+                            u, v = v, u
+                        key = (u, v)
+                        prev = edge_weights.get(key)
+                        if prev is None or jaccard > prev:
+                            edge_weights[key] = float(jaccard)
         else:
             # Use inverse distance weighting (default)
             for i in range(n):
                 for j_idx, neighbor_idx in enumerate(indices_knn[i]):
                     if neighbor_idx != i:  # Don't add self-loops
-                        edges.append((i, neighbor_idx))
+                        directed_edge_count += 1
                         # Convert distance to similarity (inverse, normalized) - matching old GUI
                         weight = 1.0 / (1.0 + distances_knn[i][j_idx])
-                        weights.append(weight)
+                        u = int(i)
+                        v = int(neighbor_idx)
+                        if u > v:
+                            u, v = v, u
+                        key = (u, v)
+                        prev = edge_weights.get(key)
+                        if prev is None or weight > prev:
+                            edge_weights[key] = float(weight)
         
         print(f"[CORE.CLUSTER] Leiden: Edge list creation took {time.time() - t0:.3f}s")
-        print(f"[CORE.CLUSTER] Leiden: Created {len(edges)} edges from k-NN")
+        print(f"[CORE.CLUSTER] Leiden: Created {directed_edge_count} directed edges from k-NN")
         
         t0 = time.time()
-        # Create symmetric graph (undirected - convert to symmetric)
-        edge_set = set()
-        symmetric_edges = []
-        symmetric_weights = []
-        for (i, j), w in zip(edges, weights):
-            if (i, j) not in edge_set and (j, i) not in edge_set:
-                edge_set.add((i, j))
-                symmetric_edges.append((i, j))
-                symmetric_weights.append(w)
+        # Convert to a deterministic undirected edge representation.
+        symmetric_edges = list(edge_weights.keys())
+        symmetric_weights = list(edge_weights.values())
         
         print(f"[CORE.CLUSTER] Leiden: Symmetric graph conversion took {time.time() - t0:.3f}s")
         print(f"[CORE.CLUSTER] Leiden: Final graph has {len(symmetric_edges)} unique edges")
@@ -1116,14 +1141,18 @@ def cluster(
         
         t0 = time.time()
         # Build k-NN graph using sklearn (same as Leiden)
-        nbrs = NearestNeighbors(n_neighbors=n_neighbors, metric=metric).fit(data_values)
+        try:
+            nbrs = NearestNeighbors(n_neighbors=n_neighbors, metric=metric, n_jobs=1).fit(data_values)
+        except TypeError:
+            # Backward compatibility with older sklearn versions without n_jobs arg.
+            nbrs = NearestNeighbors(n_neighbors=n_neighbors, metric=metric).fit(data_values)
         distances_knn, indices_knn = nbrs.kneighbors(data_values)
         print(f"[CORE.CLUSTER] Louvain: k-NN calculation took {time.time() - t0:.3f}s")
         
         t0 = time.time()
         # Create graph from k-NN
-        edges = []
-        weights = []
+        edge_weights = {}
+        directed_edge_count = 0
         
         if use_jaccard:
             # Compute neighbor sets for Jaccard similarity (PhenoGraph-like)
@@ -1134,35 +1163,43 @@ def cluster(
             for i in range(n):
                 for j_idx, neighbor_idx in enumerate(indices_knn[i]):
                     if neighbor_idx != i:  # Don't add self-loops
-                        edges.append((i, neighbor_idx))
+                        directed_edge_count += 1
                         # Compute Jaccard similarity: |N(i) ∩ N(j)| / |N(i) ∪ N(j)|
                         intersection = len(neighbor_sets[i] & neighbor_sets[neighbor_idx])
                         union = len(neighbor_sets[i] | neighbor_sets[neighbor_idx])
                         jaccard = intersection / union if union > 0 else 0.0
-                        weights.append(jaccard)
+                        u = int(i)
+                        v = int(neighbor_idx)
+                        if u > v:
+                            u, v = v, u
+                        key = (u, v)
+                        prev = edge_weights.get(key)
+                        if prev is None or jaccard > prev:
+                            edge_weights[key] = float(jaccard)
         else:
             # Use inverse distance weighting (default)
             for i in range(n):
                 for j_idx, neighbor_idx in enumerate(indices_knn[i]):
                     if neighbor_idx != i:  # Don't add self-loops
-                        edges.append((i, neighbor_idx))
+                        directed_edge_count += 1
                         # Convert distance to similarity (inverse, normalized)
                         weight = 1.0 / (1.0 + distances_knn[i][j_idx])
-                        weights.append(weight)
+                        u = int(i)
+                        v = int(neighbor_idx)
+                        if u > v:
+                            u, v = v, u
+                        key = (u, v)
+                        prev = edge_weights.get(key)
+                        if prev is None or weight > prev:
+                            edge_weights[key] = float(weight)
         
         print(f"[CORE.CLUSTER] Louvain: Edge list creation took {time.time() - t0:.3f}s")
-        print(f"[CORE.CLUSTER] Louvain: Created {len(edges)} edges from k-NN")
+        print(f"[CORE.CLUSTER] Louvain: Created {directed_edge_count} directed edges from k-NN")
         
         t0 = time.time()
-        # Create symmetric graph (undirected - convert to symmetric)
-        edge_set = set()
-        symmetric_edges = []
-        symmetric_weights = []
-        for (i, j), w in zip(edges, weights):
-            if (i, j) not in edge_set and (j, i) not in edge_set:
-                edge_set.add((i, j))
-                symmetric_edges.append((i, j))
-                symmetric_weights.append(w)
+        # Convert to a deterministic undirected edge representation.
+        symmetric_edges = list(edge_weights.keys())
+        symmetric_weights = list(edge_weights.values())
         
         print(f"[CORE.CLUSTER] Louvain: Symmetric graph conversion took {time.time() - t0:.3f}s")
         print(f"[CORE.CLUSTER] Louvain: Final graph has {len(symmetric_edges)} unique edges")
@@ -1727,13 +1764,7 @@ def batch_correction(
     
     # Auto-detect features if not provided
     if features is None:
-        # Exclude non-feature columns
-        exclude_cols = {
-            'label', 'acquisition_id', 'acquisition_name', 'well', 'cluster',
-            'cell_id', 'centroid_x', 'centroid_y', 'source_file', 'source_well',
-            batch_var
-        }
-        features = [col for col in features_df.columns if col not in exclude_cols]
+        features = get_feature_columns_from_dataframe(features_df, batch_var=batch_var)
         if not features:
             raise ValueError("No features found to correct. Please specify features.")
     
@@ -2859,6 +2890,8 @@ def build_spatial_graph_anndata(
         roi_ids = sorted(features_df[roi_column].unique())
     
     anndata_dict = {}
+    skipped_rois: List[Tuple[str, str]] = []
+    adjusted_k_rois: List[Tuple[str, int, int]] = []
     
     for current_roi_id in roi_ids:
         # Convert dataframe to AnnData
@@ -2870,6 +2903,11 @@ def build_spatial_graph_anndata(
         )
         
         if adata is None:
+            skipped_rois.append((str(current_roi_id), "no valid cells after filtering"))
+            continue
+        n_cells = int(adata.n_obs)
+        if n_cells == 0:
+            skipped_rois.append((str(current_roi_id), "no valid cells after filtering"))
             continue
         
         # Ensure cluster columns are categorical (required by squidpy)
@@ -2881,43 +2919,86 @@ def build_spatial_graph_anndata(
         # Build spatial graph
         coords = adata.obsm['spatial']
         
-        if method == "kNN":
-            # Use squidpy for kNN
-            sq.gr.spatial_neighbors(adata, coord_type="generic", n_neighs=k_neighbors, n_rings=1)
-        elif method == "Radius":
-            # Radius is in micrometers, coordinates are in micrometers
-            sq.gr.spatial_neighbors(adata, coord_type="generic", radius=radius, n_rings=1)
-        elif method == "Delaunay":
-            # Delaunay triangulation - manual implementation
-            tri = Delaunay(coords)
-            n_cells = len(coords)
-            rows, cols = [], []
-            for simplex in tri.simplices:
-                # Each simplex has 3 vertices, create edges between all pairs
-                for i in range(3):
-                    for j in range(i + 1, 3):
-                        rows.extend([simplex[i], simplex[j]])
-                        cols.extend([simplex[j], simplex[i]])
-            
-            # Create sparse matrix
-            data = np.ones(len(rows))
-            conn = sp.csr_matrix((data, (rows, cols)), shape=(n_cells, n_cells))
-            
-            # Store in AnnData format
-            adata.obsp['spatial_connectivities'] = conn
-            
-            # Calculate distances
-            distances = []
-            for i, j in zip(rows, cols):
-                dist = np.linalg.norm(coords[i] - coords[j])
-                distances.append(dist)
-            dist_matrix = sp.csr_matrix((distances, (rows, cols)), shape=(n_cells, n_cells))
-            adata.obsp['spatial_distances'] = dist_matrix
+        try:
+            if method == "kNN":
+                # squidpy/scikit-learn require n_neighbors < n_samples for self-neighbor queries.
+                if n_cells < 2:
+                    skipped_rois.append((str(current_roi_id), "fewer than 2 cells for kNN"))
+                    continue
+
+                requested_k = int(k_neighbors)
+                effective_k = min(max(1, requested_k), n_cells - 1)
+                if effective_k != requested_k:
+                    adjusted_k_rois.append((str(current_roi_id), requested_k, effective_k))
+                sq.gr.spatial_neighbors(adata, coord_type="generic", n_neighs=effective_k, n_rings=1)
+            elif method == "Radius":
+                # Radius is in micrometers, coordinates are in micrometers.
+                # ROIs with one cell are allowed but will produce no edges.
+                sq.gr.spatial_neighbors(adata, coord_type="generic", radius=radius, n_rings=1)
+            elif method == "Delaunay":
+                # Delaunay triangulation requires at least 3 points.
+                if n_cells < 3:
+                    skipped_rois.append((str(current_roi_id), "fewer than 3 cells for Delaunay"))
+                    continue
+
+                tri = Delaunay(coords)
+                rows, cols = [], []
+                for simplex in tri.simplices:
+                    # Each simplex has 3 vertices, create edges between all pairs.
+                    for i in range(3):
+                        for j in range(i + 1, 3):
+                            rows.extend([simplex[i], simplex[j]])
+                            cols.extend([simplex[j], simplex[i]])
+                
+                # Create sparse matrix.
+                data = np.ones(len(rows))
+                conn = sp.csr_matrix((data, (rows, cols)), shape=(n_cells, n_cells))
+                
+                # Store in AnnData format.
+                adata.obsp['spatial_connectivities'] = conn
+                
+                # Calculate distances.
+                distances = []
+                for i, j in zip(rows, cols):
+                    dist = np.linalg.norm(coords[i] - coords[j])
+                    distances.append(dist)
+                dist_matrix = sp.csr_matrix((distances, (rows, cols)), shape=(n_cells, n_cells))
+                adata.obsp['spatial_distances'] = dist_matrix
+        except ValueError as e:
+            err = str(e)
+            if "n_neighbors" in err or "n_samples_fit" in err:
+                skipped_rois.append((str(current_roi_id), f"insufficient cells for requested neighborhood graph ({err})"))
+                continue
+            raise
+        except Exception as e:
+            # Keep processing other ROIs, especially for Delaunay edge cases (e.g., degenerate geometry).
+            skipped_rois.append((str(current_roi_id), f"graph construction failed ({e})"))
+            continue
         
         # Verify graph was created
         if 'spatial_connectivities' in adata.obsp:
             anndata_dict[str(current_roi_id)] = adata
     
+    if adjusted_k_rois:
+        adjusted_preview = ", ".join(
+            f"{roi}: {old_k}->{new_k}" for roi, old_k, new_k in adjusted_k_rois[:8]
+        )
+        if len(adjusted_k_rois) > 8:
+            adjusted_preview += f", ... ({len(adjusted_k_rois)} total)"
+        print(
+            f"[CORE.SPATIAL] Adjusted k-neighbors for small ROIs to avoid failures: {adjusted_preview}"
+        )
+
+    if skipped_rois:
+        skipped_preview = ", ".join(
+            f"{roi} ({reason})" for roi, reason in skipped_rois[:8]
+        )
+        if len(skipped_rois) > 8:
+            skipped_preview += f", ... ({len(skipped_rois)} total)"
+        print(
+            f"[CORE.SPATIAL] Skipped ROI(s) during spatial graph construction: {skipped_preview}"
+        )
+
     return anndata_dict
 
 
@@ -3517,4 +3598,3 @@ def get_panel(
     df.to_csv(output_path, index=False)
     
     return output_path
-

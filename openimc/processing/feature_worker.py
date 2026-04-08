@@ -27,6 +27,37 @@ import pandas as pd
 
 from skimage.measure import regionprops, regionprops_table
 
+INTENSITY_FEATURE_TYPES = ("mean", "median", "std", "mad", "p10", "p90", "integrated", "frac_pos")
+
+
+def drop_excluded_channel_feature_columns(
+    features_df: pd.DataFrame,
+    excluded_channels: Optional[set]
+) -> pd.DataFrame:
+    """Remove intensity feature columns for excluded channels from a feature table.
+
+    This enforces a strict schema rule: excluded channels should not exist as
+    columns in the final feature dataframe (rather than appearing as all-NaN).
+    """
+    if features_df is None or features_df.empty or not excluded_channels:
+        return features_df
+
+    excluded = {str(ch) for ch in excluded_channels if ch is not None}
+    if not excluded:
+        return features_df
+
+    cols_to_drop: List[str] = []
+    for ch_name in excluded:
+        for feature_type in INTENSITY_FEATURE_TYPES:
+            col = f"{ch_name}_{feature_type}"
+            if col in features_df.columns:
+                cols_to_drop.append(col)
+
+    if cols_to_drop:
+        features_df = features_df.drop(columns=sorted(set(cols_to_drop)))
+
+    return features_df
+
 
 def _compute_mean_intensity_manual(label_image: np.ndarray, intensity_image: np.ndarray) -> pd.DataFrame:
     """Manually compute mean intensity per label as fallback when regionprops_table hangs.
@@ -571,6 +602,7 @@ def extract_features_for_acquisition(
             "source_well": [source_well] * len(morph_df)
         })
         morph_df = pd.concat([metadata_df, morph_df], axis=1)
+        morph_df = drop_excluded_channel_feature_columns(morph_df, excluded_channels)
 
         return morph_df
 
@@ -730,4 +762,3 @@ def _load_and_extract_features_unlocked(
         import traceback
         traceback.print_exc()
         return pd.DataFrame()
-

@@ -24,7 +24,10 @@ import numpy as np
 import pandas as pd
 import pytest
 
-from openimc.processing.feature_worker import extract_features_for_acquisition
+from openimc.processing.feature_worker import (
+    extract_features_for_acquisition,
+    drop_excluded_channel_feature_columns
+)
 
 
 @pytest.mark.unit
@@ -248,3 +251,23 @@ class TestFeatureExtraction:
         # Should return empty dataframe or handle gracefully
         assert isinstance(result, pd.DataFrame)
 
+    def test_drop_excluded_channel_columns_removes_schema_columns(self):
+        """Excluded channels should not remain as columns (including all-NaN columns)."""
+        df = pd.DataFrame(
+            {
+                'acquisition_id': ['a1', 'a1'],
+                'cell_id': [1, 2],
+                'CD3_mean': [1.0, 2.0],
+                'CD3_median': [1.1, 2.1],
+                'CD4_mean': [np.nan, np.nan],  # Simulates concat-generated NA column
+                'CD4_p90': [np.nan, np.nan],
+                'area_um2': [50.0, 60.0],
+            }
+        )
+
+        out = drop_excluded_channel_feature_columns(df, excluded_channels={'CD4'})
+
+        assert 'CD4_mean' not in out.columns
+        assert 'CD4_p90' not in out.columns
+        assert 'CD3_mean' in out.columns
+        assert 'area_um2' in out.columns

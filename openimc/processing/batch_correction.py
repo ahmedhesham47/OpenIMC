@@ -47,6 +47,62 @@ except ImportError:
     _HAVE_BBKNN = False
 
 
+INTENSITY_FEATURE_SUFFIXES = (
+    '_mean', '_median', '_std', '_mad', '_p10', '_p90', '_integrated', '_frac_pos'
+)
+
+MORPHOLOGY_FEATURE_COLUMNS = {
+    'area_um2', 'perimeter_um', 'equivalent_diameter_um', 'eccentricity',
+    'solidity', 'extent', 'circularity', 'major_axis_len_um', 'minor_axis_len_um',
+    'aspect_ratio', 'bbox_area_um2', 'touches_border', 'touches_edge', 'holes_count',
+    'centroid_x', 'centroid_y'
+}
+
+NON_FEATURE_METADATA_COLUMNS = {
+    'label', 'cell_id', 'acquisition_id', 'acquisition_name', 'acquisition_label',
+    'well', 'cluster', 'source_file', 'source_well', 'source_file_acquisition_id',
+    'batch_group'
+}
+
+
+def get_feature_columns_from_dataframe(
+    data: pd.DataFrame,
+    batch_var: Optional[str] = None,
+    include_custom_numeric: bool = True
+) -> List[str]:
+    """Infer feature columns directly from the feature table.
+
+    This intentionally derives columns from the dataframe schema only (not image
+    channels), so deselected channels that never made it into feature extraction
+    are naturally excluded.
+    """
+    if data is None or data.empty:
+        return []
+
+    excluded = set(NON_FEATURE_METADATA_COLUMNS)
+    if batch_var:
+        excluded.add(batch_var)
+
+    feature_cols: List[str] = []
+    for col in data.columns:
+        if col in excluded:
+            continue
+
+        if col in MORPHOLOGY_FEATURE_COLUMNS:
+            feature_cols.append(col)
+            continue
+
+        if col.endswith(INTENSITY_FEATURE_SUFFIXES):
+            feature_cols.append(col)
+            continue
+
+        # Preserve backwards compatibility for custom numeric feature columns.
+        if include_custom_numeric and (pd.api.types.is_numeric_dtype(data[col]) or pd.api.types.is_bool_dtype(data[col])):
+            feature_cols.append(col)
+
+    return feature_cols
+
+
 def apply_combat_correction(
     data: pd.DataFrame,
     batch_var: str,
@@ -374,13 +430,37 @@ def apply_harmony_correction(
             lamb=lambda_reg,
             max_iter_harmony=max_iter
         )
-        
-        # run_harmony returns a Harmony object with Z_corr attribute
-        # Z_corr is the corrected data in PCA space (samples x n_components)
-        corrected_pca = harmony_result.Z_corr.T
-        
+
+        # run_harmony returns a Harmony object with Z_corr attribute.
+        # Depending on harmonypy backend/version, Z_corr can be either:
+        #   - (n_samples, n_components), or
+        #   - (n_components, n_samples)
+        corrected_pca = harmony_result.Z_corr
+        if hasattr(corrected_pca, "detach"):
+            corrected_pca = corrected_pca.detach()
+        if hasattr(corrected_pca, "cpu"):
+            corrected_pca = corrected_pca.cpu()
+        if hasattr(corrected_pca, "numpy"):
+            corrected_pca = corrected_pca.numpy()
+        corrected_pca = np.asarray(corrected_pca)
+
+        if corrected_pca.shape == pca_data.shape:
+            pass
+        elif corrected_pca.T.shape == pca_data.shape:
+            corrected_pca = corrected_pca.T
+        else:
+            raise RuntimeError(
+                "Harmony returned corrected PCA coordinates with unexpected shape: "
+                f"got {corrected_pca.shape}, expected {pca_data.shape} or {pca_data.T.shape}"
+            )
+
         # Transform back to feature space
         corrected_matrix = pca.inverse_transform(corrected_pca)
+        if corrected_matrix.shape != feature_matrix.shape:
+            raise RuntimeError(
+                "Harmony inverse PCA produced unexpected feature matrix shape: "
+                f"got {corrected_matrix.shape}, expected {feature_matrix.shape}"
+            )
         
     except Exception as e:
         raise RuntimeError(f"Harmony correction failed: {str(e)}")
@@ -620,4 +700,3 @@ def validate_batch_correction_inputs(
                 f"Feature '{feature}' contains missing values. "
                 f"Please handle missing values before batch correction."
             )
-

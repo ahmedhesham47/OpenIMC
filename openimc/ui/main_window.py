@@ -43,6 +43,7 @@ except (ImportError, AttributeError) as e:
     pass
 
 from typing import Dict, List, Optional, Tuple, Union, Any
+from functools import partial
 import threading
 import copy
 from concurrent.futures import ThreadPoolExecutor, Future
@@ -58,7 +59,10 @@ from PyQt5.QtCore import Qt, QTimer
 
 from openimc.data.mcd_loader import MCDLoader, AcquisitionInfo
 from openimc.data.ometiff_loader import OMETIFFLoader
-from openimc.processing.feature_worker import extract_features_for_acquisition
+from openimc.processing.feature_worker import (
+    extract_features_for_acquisition,
+    drop_excluded_channel_feature_columns
+)
 from openimc.core import extract_features, load_mcd
 from openimc.processing.watershed_worker import watershed_segmentation
 from openimc.core import segment
@@ -128,7 +132,11 @@ from openimc.ui.utils import (
     combine_channels,
     additive_blend_channels,
 )
-from openimc.ui.dialogs.progress_dialog import ProgressDialog, close_progress_dialog
+from openimc.ui.dialogs.progress_dialog import (
+    ProgressDialog,
+    close_progress_dialog,
+    run_task_with_event_pump,
+)
 from openimc.ui.dialogs.gpu_selection_dialog import GPUSelectionDialog
 from openimc.ui.dialogs.preprocessing_dialog import PreprocessingDialog
 from openimc.ui.dialogs.segmentation_dialog import SegmentationDialog
@@ -193,9 +201,14 @@ else:
 # Optional CellSAM - use our custom implementation
 _HAVE_CELLSAM = False
 cellsam_pipeline = None
+cellsam_pipeline_subprocess = None
 try:
-    from openimc.processing.custom_cellsam import cellsam_pipeline_custom
+    from openimc.processing.custom_cellsam import (
+        cellsam_pipeline_custom,
+        run_cellsam_pipeline_subprocess,
+    )
     cellsam_pipeline = cellsam_pipeline_custom
+    cellsam_pipeline_subprocess = run_cellsam_pipeline_subprocess
     _HAVE_CELLSAM = True
 except (ImportError, OSError):
     _HAVE_CELLSAM = False
@@ -5663,27 +5676,29 @@ class MainWindow(QtWidgets.QMainWindow):
                 img_stack = loader.get_all_channels(original_acq_id)
                 channel_names = loader.get_channels(original_acq_id)
                 
-                # Run watershed segmentation using worker function
+                # Run watershed segmentation in a worker thread to keep UI responsive.
                 progress_dlg.update_progress(20, "Running watershed segmentation", "Processing...")
-                masks = watershed_segmentation(
-                    img_stack, channel_names, nuclear_channels, cyto_channels,
-                    denoise_settings=denoise_settings,
-                    nuclear_fusion_method=nuclear_fusion_method,
-                    nuclear_weights=nuclear_weights,
-                    seed_threshold_method=seed_threshold_method,
-                    min_seed_area=min_seed_area,
-                    min_distance_peaks=min_distance_peaks,
-                    membrane_fusion_method=membrane_fusion_method,
-                    membrane_weights=cyto_weights,
-                    boundary_method=boundary_method,
-                    boundary_sigma=boundary_sigma,
-                    compactness=compactness,
-                    min_cell_area=min_cell_area,
-                    max_cell_area=max_cell_area,
-                    tile_size=tile_size,
-                    tile_overlap=tile_overlap,
-                    rng_seed=rng_seed
-                )
+                def _watershed_task():
+                    return watershed_segmentation(
+                        img_stack, channel_names, nuclear_channels, cyto_channels,
+                        denoise_settings=denoise_settings,
+                        nuclear_fusion_method=nuclear_fusion_method,
+                        nuclear_weights=nuclear_weights,
+                        seed_threshold_method=seed_threshold_method,
+                        min_seed_area=min_seed_area,
+                        min_distance_peaks=min_distance_peaks,
+                        membrane_fusion_method=membrane_fusion_method,
+                        membrane_weights=cyto_weights,
+                        boundary_method=boundary_method,
+                        boundary_sigma=boundary_sigma,
+                        compactness=compactness,
+                        min_cell_area=min_cell_area,
+                        max_cell_area=max_cell_area,
+                        tile_size=tile_size,
+                        tile_overlap=tile_overlap,
+                        rng_seed=rng_seed
+                    )
+                masks = run_task_with_event_pump(_watershed_task, poll_interval_ms=80)
                 masks = [masks]  # Convert to list format for consistency
                 flows = [None]
                 styles = [None]
@@ -5801,51 +5816,76 @@ class MainWindow(QtWidgets.QMainWindow):
                 arcsinh_cofactor = preprocessing_config.get('arcsinh_cofactor', 1.0) if preprocessing_config else 1.0
                 percentile_params = preprocessing_config.get('percentile_params', (1.0, 99.0)) if preprocessing_config else (1.0, 99.0)
                 
-                # Call core.segment()
+                # Call segmentation with UI-safe execution.
                 if core_method == "cellsam":
-                    mask = segment(
-                        loader=loader,
-                        acquisition=acq_info,
-                        method="cellsam",
-                        nuclear_channels=nuclear_channels,
-                        cyto_channels=cyto_channels,
-                        output_dir=masks_directory if save_masks else None,
-                        denoise_settings=denoise_settings,
-                        normalization_method=norm_method,
-                        arcsinh_cofactor=arcsinh_cofactor,
-                        percentile_params=percentile_params,
-                        nuclear_combo_method=nuclear_combo_method,
-                        cyto_combo_method=cyto_combo_method,
-                        nuclear_weights=nuclear_weights,
-                        cyto_weights=cyto_weights,
-                        deepcell_api_key=deepcell_api_key,
+                    if cellsam_pipeline_subprocess is None:
+                        raise ImportError("CellSAM subprocess entry point is unavailable.")
+
+                    progress_dlg.update_progress(25, "Preprocessing images", "Preparing CellSAM input...")
+                    def _preprocess_cellsam_task():
+                        return self._preprocess_channels_for_segmentation(
+                            preprocessing_config,
+                            None,
+                            use_viewer_denoising=use_viewer_denoising,
+                            denoise_source=denoise_source,
+                            custom_denoise_settings=custom_denoise_settings
+                        )
+
+                    nuclear_img, cyto_img = run_task_with_event_pump(
+                        _preprocess_cellsam_task,
+                        poll_interval_ms=80,
+                    )
+
+                    if nuclear_channels and cyto_channels:
+                        h, w = nuclear_img.shape
+                        cellsam_input = np.zeros((h, w, 3), dtype=np.float32)
+                        cellsam_input[:, :, 1] = nuclear_img
+                        cellsam_input[:, :, 2] = cyto_img if cyto_img is not None else nuclear_img
+                    elif nuclear_channels:
+                        cellsam_input = nuclear_img
+                    elif cyto_channels:
+                        cellsam_input = cyto_img if cyto_img is not None else nuclear_img
+                    else:
+                        raise ValueError("At least one channel (nuclear or cyto) must be selected for CellSAM")
+
+                    progress_dlg.update_progress(45, "Running CellSAM", "Segmenting cells...")
+                    cellsam_task = partial(
+                        cellsam_pipeline_subprocess,
+                        cellsam_input,
                         bbox_threshold=bbox_threshold,
                         use_wsi=use_wsi,
                         low_contrast_enhancement=low_contrast_enhancement,
-                        gauge_cell_size=gauge_cell_size
+                        gauge_cell_size=gauge_cell_size,
+                    )
+                    mask = run_task_with_event_pump(
+                        cellsam_task,
+                        poll_interval_ms=80,
+                        use_process=True,
                     )
                 else:  # cellpose
-                    mask = segment(
-                        loader=loader,
-                        acquisition=acq_info,
-                        method="cellpose",
-                        nuclear_channels=nuclear_channels,
-                        cyto_channels=cyto_channels,
-                        output_dir=masks_directory if save_masks else None,
-                        denoise_settings=denoise_settings,
-                        normalization_method=norm_method,
-                        arcsinh_cofactor=arcsinh_cofactor,
-                        percentile_params=percentile_params,
-                        nuclear_combo_method=nuclear_combo_method,
-                        cyto_combo_method=cyto_combo_method,
-                        nuclear_weights=nuclear_weights,
-                        cyto_weights=cyto_weights,
-                        cellpose_model=cellpose_model,
-                        diameter=diameter,
-                        flow_threshold=flow_threshold,
-                        cellprob_threshold=cellprob_threshold,
-                        gpu_id=gpu_id
-                    )
+                    def _cellpose_segment_task():
+                        return segment(
+                            loader=loader,
+                            acquisition=acq_info,
+                            method="cellpose",
+                            nuclear_channels=nuclear_channels,
+                            cyto_channels=cyto_channels,
+                            output_dir=masks_directory if save_masks else None,
+                            denoise_settings=denoise_settings,
+                            normalization_method=norm_method,
+                            arcsinh_cofactor=arcsinh_cofactor,
+                            percentile_params=percentile_params,
+                            nuclear_combo_method=nuclear_combo_method,
+                            cyto_combo_method=cyto_combo_method,
+                            nuclear_weights=nuclear_weights,
+                            cyto_weights=cyto_weights,
+                            cellpose_model=cellpose_model,
+                            diameter=diameter,
+                            flow_threshold=flow_threshold,
+                            cellprob_threshold=cellprob_threshold,
+                            gpu_id=gpu_id
+                        )
+                    mask = run_task_with_event_pump(_cellpose_segment_task, poll_interval_ms=80)
                 
                 masks = [mask]
                 flows = [None]
@@ -6096,14 +6136,20 @@ class MainWindow(QtWidgets.QMainWindow):
                         f"Running Cellpose... ({successful_segmentations}/{total_acquisitions} completed)"
                     )
                     
-                    # Run Cellpose eval
-                    # Note: Cellpose eval() does not support nproc parameter
-                    masks, flows, styles, diams = model_obj.eval(
-                        cellpose_input,
-                        diameter=diameter,
-                        flow_threshold=flow_threshold,
-                        cellprob_threshold=cellprob_threshold,
-                        channels=channels
+                    # Run Cellpose eval in worker thread to keep GUI responsive.
+                    # Note: Cellpose eval() does not support nproc parameter.
+                    def _cellpose_eval_task():
+                        return model_obj.eval(
+                            cellpose_input,
+                            diameter=diameter,
+                            flow_threshold=flow_threshold,
+                            cellprob_threshold=cellprob_threshold,
+                            channels=channels
+                        )
+
+                    masks, flows, styles, diams = run_task_with_event_pump(
+                        _cellpose_eval_task,
+                        poll_interval_ms=80,
                     )
                     
                     mask = masks[0] if len(masks) > 0 else np.zeros((1, 1), dtype=np.int32)
@@ -6268,9 +6314,12 @@ class MainWindow(QtWidgets.QMainWindow):
             QtWidgets.QApplication.processEvents()
             try:
                 from openimc.processing.custom_cellsam import _get_cached_model
-                # Pre-initialize the model - this will download weights if needed
-                # The download happens synchronously, but we show progress and process events
-                model = _get_cached_model(model_path=None, bbox_threshold=bbox_threshold)
+                # Pre-initialize the model in a worker thread - this can download/extract
+                # large weights and would otherwise freeze the UI.
+                def _cellsam_init_task():
+                    return _get_cached_model(model_path=None, bbox_threshold=bbox_threshold)
+
+                model = run_task_with_event_pump(_cellsam_init_task, poll_interval_ms=100)
                 progress_dlg.update_progress(10, "Initializing DeepCell CellSAM", "Model loaded successfully")
                 QtWidgets.QApplication.processEvents()
             except Exception as e:
@@ -6358,13 +6407,16 @@ class MainWindow(QtWidgets.QMainWindow):
                         f"Running CellSAM... ({successful_segmentations}/{total_acquisitions} completed)"
                     )
                     
-                    mask = cellsam_pipeline(
-                        cellsam_input,
-                        bbox_threshold=bbox_threshold,
-                        use_wsi=use_wsi,
-                        low_contrast_enhancement=low_contrast_enhancement,
-                        gauge_cell_size=gauge_cell_size
-                    )
+                    def _cellsam_segment_task():
+                        return cellsam_pipeline(
+                            cellsam_input,
+                            bbox_threshold=bbox_threshold,
+                            use_wsi=use_wsi,
+                            low_contrast_enhancement=low_contrast_enhancement,
+                            gauge_cell_size=gauge_cell_size
+                        )
+
+                    mask = run_task_with_event_pump(_cellsam_segment_task, poll_interval_ms=80)
                     
                     # Explicitly release input images memory immediately after segmentation
                     del cellsam_input
@@ -6581,25 +6633,28 @@ class MainWindow(QtWidgets.QMainWindow):
                         f"Running watershed segmentation... ({successful_segmentations}/{total_acquisitions} completed)"
                     )
                     
-                    mask = watershed_segmentation(
-                        img_stack, channel_names, nuclear_channels, cyto_channels,
-                        denoise_settings=denoise_settings,
-                        nuclear_fusion_method=nuclear_fusion_method,
-                        nuclear_weights=nuclear_weights,
-                        seed_threshold_method=seed_threshold_method,
-                        min_seed_area=min_seed_area,
-                        min_distance_peaks=min_distance_peaks,
-                        membrane_fusion_method=membrane_fusion_method,
-                        membrane_weights=cyto_weights,
-                        boundary_method=boundary_method,
-                        boundary_sigma=boundary_sigma,
-                        compactness=compactness,
-                        min_cell_area=min_cell_area,
-                        max_cell_area=max_cell_area,
-                        tile_size=tile_size,
-                        tile_overlap=tile_overlap,
-                        rng_seed=rng_seed
-                    )
+                    def _watershed_batch_task():
+                        return watershed_segmentation(
+                            img_stack, channel_names, nuclear_channels, cyto_channels,
+                            denoise_settings=denoise_settings,
+                            nuclear_fusion_method=nuclear_fusion_method,
+                            nuclear_weights=nuclear_weights,
+                            seed_threshold_method=seed_threshold_method,
+                            min_seed_area=min_seed_area,
+                            min_distance_peaks=min_distance_peaks,
+                            membrane_fusion_method=membrane_fusion_method,
+                            membrane_weights=cyto_weights,
+                            boundary_method=boundary_method,
+                            boundary_sigma=boundary_sigma,
+                            compactness=compactness,
+                            min_cell_area=min_cell_area,
+                            max_cell_area=max_cell_area,
+                            tile_size=tile_size,
+                            tile_overlap=tile_overlap,
+                            rng_seed=rng_seed
+                        )
+
+                    mask = run_task_with_event_pump(_watershed_batch_task, poll_interval_ms=80)
                     
                     # Explicitly release image stack memory immediately after segmentation
                     del img_stack
@@ -8473,6 +8528,9 @@ class MainWindow(QtWidgets.QMainWindow):
 
             # Combine all features
             combined_features = pd.concat(all_features, ignore_index=True)
+            # Enforce excluded-channel schema after concat so excluded channels
+            # never appear as all-NaN columns in the final feature table.
+            combined_features = drop_excluded_channel_feature_columns(combined_features, excluded_channels)
             
             # Apply arcsinh transformation at the end if enabled (more efficient - single pass on all data)
             if apply_arcsinh_at_end:
@@ -8558,7 +8616,30 @@ class MainWindow(QtWidgets.QMainWindow):
                     "Saving feature table",
                     f"Writing {os.path.basename(output_path)}...",
                 )
-                combined_features.to_csv(output_path, index=False)
+                total_rows = len(combined_features)
+                chunk_size = 50000
+
+                if total_rows == 0:
+                    combined_features.to_csv(output_path, index=False)
+                else:
+                    for start_idx in range(0, total_rows, chunk_size):
+                        end_idx = min(start_idx + chunk_size, total_rows)
+                        chunk = combined_features.iloc[start_idx:end_idx]
+                        chunk.to_csv(
+                            output_path,
+                            mode='w' if start_idx == 0 else 'a',
+                            header=(start_idx == 0),
+                            index=False
+                        )
+                        progress_dlg.update_progress(
+                            progress_value,
+                            "Saving feature table",
+                            (
+                                f"Writing {os.path.basename(output_path)}...\n"
+                                f"{end_idx:,}/{total_rows:,} rows written"
+                            ),
+                        )
+                        QtWidgets.QApplication.processEvents()
 
             progress_value += 1
             if output_path:
@@ -10208,7 +10289,15 @@ class MainWindow(QtWidgets.QMainWindow):
                 output_path = dlg.get_output_path()
                 if output_path:
                     try:
-                        corrected_df.to_csv(output_path, index=False)
+                        self._save_dataframe_with_progress(
+                            corrected_df,
+                            output_path,
+                            title="Saving Batch-Corrected Features",
+                            status_prefix=(
+                                "Batch correction is complete. Writing corrected features to disk.\n"
+                                "Large files may take a few minutes."
+                            )
+                        )
                         QtWidgets.QMessageBox.information(
                             self,
                             "Success",
@@ -10227,6 +10316,47 @@ class MainWindow(QtWidgets.QMainWindow):
                         "Success",
                         "Batch correction completed. Both original and batch-corrected features are now available in memory."
                     )
+
+    def _save_dataframe_with_progress(
+        self,
+        dataframe: pd.DataFrame,
+        output_path: str,
+        title: str = "Saving Data",
+        status_prefix: str = "Saving data to disk...",
+        chunk_size: int = 50000
+    ) -> None:
+        """Save a dataframe to CSV in chunks while keeping the UI responsive."""
+        total_rows = len(dataframe)
+        if total_rows == 0:
+            dataframe.to_csv(output_path, index=False)
+            return
+
+        progress = QtWidgets.QProgressDialog(status_prefix, None, 0, total_rows, self)
+        progress.setWindowTitle(title)
+        progress.setWindowModality(Qt.WindowModal)
+        progress.setCancelButton(None)
+        progress.setMinimumDuration(0)
+        progress.show()
+        QtWidgets.QApplication.processEvents()
+
+        try:
+            rows_written = 0
+            for start_idx in range(0, total_rows, chunk_size):
+                end_idx = min(start_idx + chunk_size, total_rows)
+                chunk = dataframe.iloc[start_idx:end_idx]
+                chunk.to_csv(
+                    output_path,
+                    mode='w' if start_idx == 0 else 'a',
+                    header=(start_idx == 0),
+                    index=False
+                )
+
+                rows_written = end_idx
+                progress.setLabelText(f"{status_prefix}\n{rows_written:,}/{total_rows:,} rows written")
+                progress.setValue(rows_written)
+                QtWidgets.QApplication.processEvents()
+        finally:
+            progress.close()
     
     def _save_state(self):
         """Save complete application state to a folder."""
@@ -10565,6 +10695,9 @@ class MainWindow(QtWidgets.QMainWindow):
         
         if hasattr(dlg, 'cluster_map_zscore_method'):
             state["cluster_map_zscore_method"] = dlg.cluster_map_zscore_method
+        
+        if hasattr(dlg, 'cluster_map_cell_size'):
+            state["cluster_map_cell_size"] = dlg.cluster_map_cell_size
         
         # Collect heatmap scaling method
         if hasattr(dlg, 'heatmap_scaling_combo'):
@@ -11581,6 +11714,10 @@ class MainWindow(QtWidgets.QMainWindow):
             if "cluster_map_zscore_method" in state:
                 if hasattr(dialog, 'cluster_map_zscore_method'):
                     dialog.cluster_map_zscore_method = state["cluster_map_zscore_method"]
+            
+            if "cluster_map_cell_size" in state:
+                if hasattr(dialog, 'cluster_map_cell_size'):
+                    dialog.cluster_map_cell_size = state["cluster_map_cell_size"]
             
             # Restore heatmap scaling
             if "heatmap_scaling" in state:
