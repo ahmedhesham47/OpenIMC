@@ -43,7 +43,7 @@ except Exception as e:
     traceback.print_exc()
     pass
 
-from typing import Optional, Dict, Any
+from typing import Optional, Dict, Any, List, Tuple
 import numpy as np
 import pandas as pd
 from PyQt5 import QtWidgets, QtCore
@@ -55,7 +55,24 @@ from matplotlib.patches import Circle
 from scipy.spatial import Delaunay
 from scipy import stats
 import seaborn as sns
+from openimc.ui.cluster_utils import (
+    canonicalize_cluster_id,
+    format_default_cluster_label,
+    get_cluster_display_name,
+    normalize_cluster_annotation_map,
+    sort_cluster_values,
+)
+from openimc.ui.figure_layout import dense_heatmap_style, fit_canvas_and_draw
+from openimc.ui.utils import (
+    benjamini_hochberg_adjust,
+    benjamini_hochberg_adjust_matrix,
+    combine_pvalues_fisher,
+)
 from openimc.ui.dialogs.figure_save_dialog import save_figure_with_options
+from openimc.ui.dialogs.label_customization_dialogs import (
+    edit_cluster_annotation_map,
+    edit_feature_label_map,
+)
 from openimc.ui.dialogs.progress_dialog import run_blocking_task_with_progress
 from openimc.ui.dialogs.spatial_analysis import (
     SourceFileFilterDialog,
@@ -155,6 +172,7 @@ class AdvancedSpatialAnalysisDialog(QtWidgets.QDialog):
         
         # Cluster annotation mapping
         self.cluster_annotation_map = {}
+        self.feature_label_map = {}
         
         # Source file filtering
         self.selected_source_files = set()
@@ -167,9 +185,75 @@ class AdvancedSpatialAnalysisDialog(QtWidgets.QDialog):
         self.aggregated_results: Dict[str, Any] = {}  # {analysis_type: aggregated_data}
         
         self._create_ui()
+        self._plot_resize_in_progress = False
+        self._plot_resize_timer = QtCore.QTimer(self)
+        self._plot_resize_timer.setSingleShot(True)
+        self._plot_resize_timer.timeout.connect(self._refresh_current_plot_after_resize)
+        if hasattr(self, 'tabs'):
+            self.tabs.currentChanged.connect(self._queue_plot_resize_refresh)
         
         if hasattr(self, 'source_file_status_label'):
             self._update_source_file_status_label()
+
+    def _fit_canvas(self, canvas, *, rect=None, pad: float = 0.95):
+        """Fit the supplied canvas to the current tab size and redraw it."""
+        if canvas is None or canvas.width() < 10 or canvas.height() < 10:
+            return
+        fit_canvas_and_draw(canvas, rect=rect, pad=pad, allow_text_compaction=True)
+
+    def _current_plot_canvas_layout(self):
+        """Return the visible analysis canvas plus any reserved layout rect."""
+        if not hasattr(self, 'tabs'):
+            return None
+        current_tab = self.tabs.currentWidget()
+        if current_tab is getattr(self, 'sq_nhood_tab', None) and self.sq_nhood_canvas.figure.axes:
+            return self.sq_nhood_canvas, None, 0.95
+        if current_tab is getattr(self, 'sq_cooccur_tab', None) and self.sq_cooccur_canvas.figure.axes:
+            rect = None
+            if hasattr(self, 'sq_cooccur_plot_type_combo') and self.sq_cooccur_plot_type_combo.currentText() != "Heatmap":
+                rect = [0.0, 0.0, 0.84, 1.0]
+            return self.sq_cooccur_canvas, rect, 0.95
+        if current_tab is getattr(self, 'sq_autocorr_tab', None) and self.sq_autocorr_canvas.figure.axes:
+            return self.sq_autocorr_canvas, None, 0.95
+        if current_tab is getattr(self, 'sq_ripley_tab', None) and self.sq_ripley_canvas.figure.axes:
+            return self.sq_ripley_canvas, [0.0, 0.0, 0.84, 1.0], 0.95
+        return None
+
+    def _queue_plot_resize_refresh(self, *_args):
+        """Debounce layout reflow for the currently visible advanced plot."""
+        if self._plot_resize_in_progress or not self.isVisible():
+            return
+        if self._current_plot_canvas_layout() is None:
+            return
+        self._plot_resize_timer.start(140)
+
+    def _refresh_current_plot_after_resize(self):
+        """Refit the current advanced spatial plot to the resized canvas."""
+        if self._plot_resize_in_progress:
+            return
+        layout = self._current_plot_canvas_layout()
+        if layout is None:
+            return
+        canvas, rect, pad = layout
+        try:
+            self._plot_resize_in_progress = True
+            self._fit_canvas(canvas, rect=rect, pad=pad)
+        finally:
+            self._plot_resize_in_progress = False
+
+    def resizeEvent(self, event):
+        """Keep the active advanced spatial plot fitted to the dialog."""
+        super().resizeEvent(event)
+        if event is None:
+            return
+        try:
+            old_size = event.oldSize()
+            new_size = event.size()
+            if old_size.isValid() and new_size == old_size:
+                return
+        except Exception:
+            pass
+        self._queue_plot_resize_refresh()
     
     def _get_roi_column(self):
         """Get the appropriate ROI column name."""
@@ -369,6 +453,12 @@ class AdvancedSpatialAnalysisDialog(QtWidgets.QDialog):
         self.export_anndata_btn = QtWidgets.QPushButton("Export to AnnData…")
         self.export_anndata_btn.setToolTip("Export data to AnnData format")
         action_row.addWidget(self.export_anndata_btn)
+        self.cluster_labels_btn = QtWidgets.QPushButton("Customize Cluster Names…")
+        self.cluster_labels_btn.setToolTip("Set custom display names for spatial-analysis cluster labels.")
+        action_row.addWidget(self.cluster_labels_btn)
+        self.feature_labels_btn = QtWidgets.QPushButton("Customize Feature Labels…")
+        self.feature_labels_btn.setToolTip("Set custom display names for features used in spatial analysis.")
+        action_row.addWidget(self.feature_labels_btn)
         action_row.addStretch(1)
         layout.addLayout(action_row)
         
@@ -382,6 +472,8 @@ class AdvancedSpatialAnalysisDialog(QtWidgets.QDialog):
         
         # Wire signals
         self.export_anndata_btn.clicked.connect(self._export_to_anndata)
+        self.cluster_labels_btn.clicked.connect(self._open_cluster_labels_dialog)
+        self.feature_labels_btn.clicked.connect(self._open_feature_labels_dialog)
         self.create_graph_btn.clicked.connect(self._create_spatial_graph)
         
         # Initialize
@@ -434,8 +526,11 @@ class AdvancedSpatialAnalysisDialog(QtWidgets.QDialog):
         self.sq_nhood_run_btn = QtWidgets.QPushButton("Run Neighborhood Enrichment")
         self.sq_nhood_save_btn = QtWidgets.QPushButton("Save Plot")
         self.sq_nhood_save_btn.setEnabled(False)
+        self.sq_nhood_export_btn = QtWidgets.QPushButton("Export Results…")
+        self.sq_nhood_export_btn.setEnabled(False)
         sq_nhood_btn_layout.addWidget(self.sq_nhood_run_btn)
         sq_nhood_btn_layout.addWidget(self.sq_nhood_save_btn)
+        sq_nhood_btn_layout.addWidget(self.sq_nhood_export_btn)
         sq_nhood_btn_layout.addStretch()
         
         sq_nhood_layout.addLayout(sq_nhood_params)
@@ -450,6 +545,7 @@ class AdvancedSpatialAnalysisDialog(QtWidgets.QDialog):
         
         self.sq_nhood_run_btn.clicked.connect(self._run_sq_nhood_enrichment)
         self.sq_nhood_save_btn.clicked.connect(self._save_sq_nhood_plot)
+        self.sq_nhood_export_btn.clicked.connect(self._export_sq_nhood_results)
         self.sq_nhood_roi_combo.currentIndexChanged.connect(self._on_sq_nhood_roi_changed)
         self.sq_nhood_agg_combo.currentIndexChanged.connect(self._on_sq_nhood_agg_changed)
         self.sq_nhood_cluster_combo.currentIndexChanged.connect(self._on_sq_nhood_cluster_changed)
@@ -499,8 +595,11 @@ class AdvancedSpatialAnalysisDialog(QtWidgets.QDialog):
         self.sq_cooccur_run_btn = QtWidgets.QPushButton("Run Co-occurrence Analysis")
         self.sq_cooccur_save_btn = QtWidgets.QPushButton("Save Plot")
         self.sq_cooccur_save_btn.setEnabled(False)
+        self.sq_cooccur_export_btn = QtWidgets.QPushButton("Export Results…")
+        self.sq_cooccur_export_btn.setEnabled(False)
         sq_cooccur_btn_layout.addWidget(self.sq_cooccur_run_btn)
         sq_cooccur_btn_layout.addWidget(self.sq_cooccur_save_btn)
+        sq_cooccur_btn_layout.addWidget(self.sq_cooccur_export_btn)
         sq_cooccur_btn_layout.addStretch()
         
         # Plot type selection
@@ -531,6 +630,7 @@ class AdvancedSpatialAnalysisDialog(QtWidgets.QDialog):
         
         self.sq_cooccur_run_btn.clicked.connect(self._run_sq_cooccurrence)
         self.sq_cooccur_save_btn.clicked.connect(self._save_sq_cooccur_plot)
+        self.sq_cooccur_export_btn.clicked.connect(self._export_sq_cooccur_results)
         self.sq_cooccur_roi_combo.currentIndexChanged.connect(self._on_sq_cooccur_roi_changed)
         self.sq_cooccur_ref_cluster_combo.currentIndexChanged.connect(self._on_sq_cooccur_ref_cluster_changed)
         self.sq_cooccur_cluster_combo.currentIndexChanged.connect(self._on_sq_cooccur_cluster_column_changed)
@@ -580,8 +680,11 @@ class AdvancedSpatialAnalysisDialog(QtWidgets.QDialog):
         self.sq_autocorr_run_btn = QtWidgets.QPushButton("Run Spatial Autocorrelation")
         self.sq_autocorr_save_btn = QtWidgets.QPushButton("Save Plot")
         self.sq_autocorr_save_btn.setEnabled(False)
+        self.sq_autocorr_export_btn = QtWidgets.QPushButton("Export Results…")
+        self.sq_autocorr_export_btn.setEnabled(False)
         sq_autocorr_btn_layout.addWidget(self.sq_autocorr_run_btn)
         sq_autocorr_btn_layout.addWidget(self.sq_autocorr_save_btn)
+        sq_autocorr_btn_layout.addWidget(self.sq_autocorr_export_btn)
         sq_autocorr_btn_layout.addStretch()
         
         # Visualization controls
@@ -622,6 +725,7 @@ class AdvancedSpatialAnalysisDialog(QtWidgets.QDialog):
         
         self.sq_autocorr_run_btn.clicked.connect(self._run_sq_autocorrelation)
         self.sq_autocorr_save_btn.clicked.connect(self._save_sq_autocorr_plot)
+        self.sq_autocorr_export_btn.clicked.connect(self._export_sq_autocorr_results)
         self.sq_autocorr_roi_combo.currentIndexChanged.connect(self._on_sq_autocorr_roi_changed)
         self.sq_autocorr_topk_spin.valueChanged.connect(self._on_sq_autocorr_topk_changed)
         self.sq_autocorr_viz_type_combo.currentTextChanged.connect(self._on_sq_autocorr_viz_type_changed)
@@ -673,8 +777,11 @@ class AdvancedSpatialAnalysisDialog(QtWidgets.QDialog):
         self.sq_ripley_run_btn = QtWidgets.QPushButton("Run Ripley Analysis")
         self.sq_ripley_save_btn = QtWidgets.QPushButton("Save Plot")
         self.sq_ripley_save_btn.setEnabled(False)
+        self.sq_ripley_export_btn = QtWidgets.QPushButton("Export Results…")
+        self.sq_ripley_export_btn.setEnabled(False)
         sq_ripley_btn_layout.addWidget(self.sq_ripley_run_btn)
         sq_ripley_btn_layout.addWidget(self.sq_ripley_save_btn)
+        sq_ripley_btn_layout.addWidget(self.sq_ripley_export_btn)
         sq_ripley_btn_layout.addStretch()
         
         sq_ripley_layout.addLayout(sq_ripley_params)
@@ -689,6 +796,7 @@ class AdvancedSpatialAnalysisDialog(QtWidgets.QDialog):
         
         self.sq_ripley_run_btn.clicked.connect(self._run_sq_ripley)
         self.sq_ripley_save_btn.clicked.connect(self._save_sq_ripley_plot)
+        self.sq_ripley_export_btn.clicked.connect(self._export_sq_ripley_results)
         self.sq_ripley_roi_combo.currentIndexChanged.connect(self._on_sq_ripley_roi_changed)
         self.sq_ripley_cluster_combo.currentIndexChanged.connect(self._on_sq_ripley_cluster_changed)
     
@@ -735,13 +843,13 @@ class AdvancedSpatialAnalysisDialog(QtWidgets.QDialog):
                 self.source_file_status_label.setText(f"{count} of {total} files")
     
     def _load_cluster_annotations(self):
-        """Load cluster annotations from parent dialog if available."""
+        """Load cluster and feature display names from the clustering dialog if available."""
         try:
-            parent = self.parent()
-            if parent is not None and hasattr(parent, 'cluster_annotation_map'):
-                self.cluster_annotation_map = parent.cluster_annotation_map.copy()
-            elif parent is not None and hasattr(parent, '_get_cluster_display_name'):
-                pass
+            label_source = self._get_label_source_dialog()
+            if label_source is not None and hasattr(label_source, 'cluster_annotation_map'):
+                self.cluster_annotation_map = normalize_cluster_annotation_map(label_source.cluster_annotation_map or {})
+            if label_source is not None and hasattr(label_source, 'feature_label_map'):
+                self.feature_label_map = dict(label_source.feature_label_map or {})
             
             if self.feature_dataframe is not None and 'cluster_phenotype' in self.feature_dataframe.columns:
                 phenotype_map = {}
@@ -753,13 +861,141 @@ class AdvancedSpatialAnalysisDialog(QtWidgets.QDialog):
                             (self.feature_dataframe['cluster_phenotype'] != '')
                         ]
                         if not phenotype_rows.empty:
-                            phenotype_map[cluster_id] = phenotype_rows['cluster_phenotype'].iloc[0]
+                            phenotype_map[canonicalize_cluster_id(cluster_id)] = phenotype_rows['cluster_phenotype'].iloc[0]
                 
                 if phenotype_map:
-                    self.cluster_annotation_map.update(phenotype_map)
-                    
-        except Exception as e:
+                    self.cluster_annotation_map.update(normalize_cluster_annotation_map(phenotype_map))
+            
+            self._apply_cluster_annotations_to_dataframes()
+        except Exception:
             pass
+
+    def _get_label_source_dialog(self):
+        """Return the best available dialog or parent object for shared label maps."""
+        parent = self.parent()
+        if parent is None:
+            return None
+        if hasattr(parent, 'clustering_dialog') and parent.clustering_dialog is not None:
+            return parent.clustering_dialog
+        return parent
+
+    def _apply_cluster_annotations_to_dataframes(self):
+        """Mirror cluster display names into dataframe and cached AnnData phenotype columns."""
+        for dataframe_attr in ('feature_dataframe', 'original_feature_dataframe', 'batch_corrected_dataframe'):
+            df = getattr(self, dataframe_attr, None)
+            if df is None or 'cluster' not in df.columns:
+                continue
+            phenotype_series = df['cluster'].map(
+                lambda cluster_id: self._get_cluster_display_name(cluster_id)
+            )
+            df.loc[:, 'cluster_phenotype'] = phenotype_series
+
+        for adata in self.anndata_cache.values():
+            if 'cluster' not in adata.obs.columns:
+                continue
+            phenotype_series = adata.obs['cluster'].map(
+                lambda cluster_id: self._get_cluster_display_name(cluster_id)
+            )
+            adata.obs['cluster_phenotype'] = phenotype_series
+            adata.obs['cluster_phenotype'] = adata.obs['cluster_phenotype'].astype('category')
+
+        for result in self.aggregated_results.values():
+            if not hasattr(result, 'obs') or 'cluster' not in result.obs.columns:
+                continue
+            phenotype_series = result.obs['cluster'].map(
+                lambda cluster_id: self._get_cluster_display_name(cluster_id)
+            )
+            result.obs['cluster_phenotype'] = phenotype_series
+            try:
+                result.obs['cluster_phenotype'] = result.obs['cluster_phenotype'].astype('category')
+            except Exception:
+                pass
+
+    def _format_default_cluster_name(self, cluster_id) -> str:
+        """Return the default display label for an unannotated cluster id."""
+        return format_default_cluster_label(cluster_id)
+
+    def _get_feature_display_name(self, feature_name: str) -> str:
+        """Return the custom display name for a feature when available."""
+        return self.feature_label_map.get(feature_name, feature_name)
+
+    def _get_feature_name_from_display(self, label: str) -> str:
+        """Resolve a display label back to its underlying feature name when possible."""
+        if not label:
+            return label
+        for feature_name, display_name in self.feature_label_map.items():
+            if display_name == label:
+                return feature_name
+        return label
+
+    def _get_spatial_feature_columns(self) -> List[str]:
+        """Return numeric feature columns that users may want to relabel for spatial plots."""
+        if self.feature_dataframe is None or self.feature_dataframe.empty:
+            return []
+        exclude = {
+            'cell_id',
+            'centroid_x',
+            'centroid_y',
+            'cluster',
+            'cluster_id',
+            'cluster_phenotype',
+            'acquisition_id',
+        }
+        numeric_cols = self.feature_dataframe.select_dtypes(include=[np.number]).columns
+        return [column for column in numeric_cols if column not in exclude]
+
+    def _sync_label_maps_to_parent(self):
+        """Push cluster and feature display names back to the clustering dialog when possible."""
+        label_source = self._get_label_source_dialog()
+        if label_source is None:
+            return
+        if hasattr(label_source, 'cluster_annotation_map'):
+            label_source.cluster_annotation_map = normalize_cluster_annotation_map(self.cluster_annotation_map)
+            if hasattr(label_source, '_apply_cluster_annotations'):
+                try:
+                    label_source._apply_cluster_annotations()
+                except Exception:
+                    pass
+        if hasattr(label_source, 'feature_label_map'):
+            label_source.feature_label_map = dict(self.feature_label_map)
+
+    def _refresh_label_dependent_views(self):
+        """Refresh controls and plots that depend on cluster or feature display names."""
+        self._update_autocorr_var_combo()
+        self._on_sq_nhood_roi_changed()
+        self._on_sq_cooccur_roi_changed()
+        self._on_sq_autocorr_roi_changed()
+        self._on_sq_ripley_roi_changed()
+
+    def _open_cluster_labels_dialog(self):
+        """Open a dialog to customize cluster display names for spatial plots."""
+        filtered_df = self._get_filtered_dataframe()
+        if filtered_df is None or filtered_df.empty or 'cluster' not in filtered_df.columns:
+            QtWidgets.QMessageBox.warning(self, "No Clusters", "No cluster assignments are available to relabel.")
+            return
+        cluster_ids = sort_cluster_values(filtered_df['cluster'].dropna().unique(), annotation_map=self.cluster_annotation_map, canonical=True)
+        updated_map = edit_cluster_annotation_map(self, cluster_ids, self.cluster_annotation_map)
+        if updated_map is None:
+            return
+        self.cluster_annotation_map = normalize_cluster_annotation_map(updated_map)
+        self._apply_cluster_annotations_to_dataframes()
+        self._sync_label_maps_to_parent()
+        self._refresh_label_dependent_views()
+        QtWidgets.QMessageBox.information(self, "Labels Applied", "Cluster names have been updated for spatial analysis.")
+
+    def _open_feature_labels_dialog(self):
+        """Open a dialog to customize feature display names for spatial plots."""
+        feature_columns = self._get_spatial_feature_columns()
+        if not feature_columns:
+            QtWidgets.QMessageBox.warning(self, "No Features", "No numeric features are available to relabel.")
+            return
+        updated_map = edit_feature_label_map(self, feature_columns, self.feature_label_map)
+        if updated_map is None:
+            return
+        self.feature_label_map = updated_map
+        self._sync_label_maps_to_parent()
+        self._refresh_label_dependent_views()
+        QtWidgets.QMessageBox.information(self, "Labels Applied", "Feature labels have been updated for spatial analysis.")
     
     def _populate_roi_combo(self):
         """Populate all ROI combo boxes."""
@@ -796,25 +1032,14 @@ class AdvancedSpatialAnalysisDialog(QtWidgets.QDialog):
     
     def _get_cluster_display_name(self, cluster_id):
         """Return display label for a cluster id, using annotation if available."""
-        # Handle NaN values
-        if pd.isna(cluster_id):
-            return "Unknown Cluster"
-        
         try:
             parent = self.parent()
             if parent is not None and hasattr(parent, '_get_cluster_display_name'):
                 return parent._get_cluster_display_name(cluster_id)
         except Exception:
             pass
-        
-        if isinstance(self.cluster_annotation_map, dict) and cluster_id in self.cluster_annotation_map and self.cluster_annotation_map[cluster_id]:
-            name = self.cluster_annotation_map[cluster_id]
-            return name.replace('_', ' ')
-        
-        try:
-            return f"Cluster {int(cluster_id)}"
-        except (ValueError, TypeError):
-            return f"Cluster {cluster_id}"
+
+        return get_cluster_display_name(cluster_id, annotation_map=self.cluster_annotation_map)
     
     def _on_feature_set_changed(self):
         """Handle feature set change - invalidate cache and refresh."""
@@ -850,6 +1075,19 @@ class AdvancedSpatialAnalysisDialog(QtWidgets.QDialog):
                 canvas = getattr(self, canvas_name)
                 canvas.figure.clear()
                 canvas.draw()
+
+        for btn_name in [
+            'sq_nhood_save_btn',
+            'sq_nhood_export_btn',
+            'sq_cooccur_save_btn',
+            'sq_cooccur_export_btn',
+            'sq_autocorr_save_btn',
+            'sq_autocorr_export_btn',
+            'sq_ripley_save_btn',
+            'sq_ripley_export_btn',
+        ]:
+            if hasattr(self, btn_name):
+                getattr(self, btn_name).setEnabled(False)
         
         # Update status
         if hasattr(self, 'graph_status_label'):
@@ -1051,7 +1289,11 @@ class AdvancedSpatialAnalysisDialog(QtWidgets.QDialog):
             if hasattr(adata.obs[cluster_key], 'cat'):
                 categories = list(adata.obs[cluster_key].cat.categories)
             else:
-                categories = sorted(adata.obs[cluster_key].unique())
+                categories = sort_cluster_values(
+                    adata.obs[cluster_key].unique(),
+                    annotation_map=self.cluster_annotation_map,
+                    canonical=False,
+                )
             
             for cat in categories:
                 self.sq_cooccur_ref_cluster_combo.addItem(
@@ -1149,12 +1391,7 @@ class AdvancedSpatialAnalysisDialog(QtWidgets.QDialog):
             
             if isinstance(moran_data, pd.DataFrame):
                 # DataFrame format
-                if 'pval_norm' in moran_data.columns:
-                    pval_col = 'pval_norm'
-                elif 'pval' in moran_data.columns:
-                    pval_col = 'pval'
-                else:
-                    pval_col = None
+                pval_col, _ = self._get_preferred_moran_pvalue_columns(list(moran_data.columns))
                 
                 # Get variable names from index
                 if 'var_names' in moran_data.columns:
@@ -1177,7 +1414,11 @@ class AdvancedSpatialAnalysisDialog(QtWidgets.QDialog):
             elif isinstance(moran_data, dict):
                 # Dict format
                 var_names = moran_data.get('var_names', [])
-                p_values = moran_data.get('pval_norm', moran_data.get('pval', None))
+                p_values = None
+                for key in ['pval_sim', 'pval_z_sim', 'pval_norm', 'pval']:
+                    if key in moran_data:
+                        p_values = moran_data.get(key)
+                        break
                 
                 if var_names and p_values is not None:
                     if isinstance(p_values, (list, np.ndarray)):
@@ -1196,14 +1437,15 @@ class AdvancedSpatialAnalysisDialog(QtWidgets.QDialog):
             
             # Add to combo with p-value annotation
             for var, pval in var_pval_list:
+                display_var = self._get_feature_display_name(str(var))
                 if pval < 0.001:
-                    label = f"{var} (p < 0.001)"
+                    label = f"{display_var} (p < 0.001)"
                 elif pval < 0.01:
-                    label = f"{var} (p = {pval:.3f})"
+                    label = f"{display_var} (p = {pval:.3f})"
                 elif pval < 0.05:
-                    label = f"{var} (p = {pval:.2f})"
+                    label = f"{display_var} (p = {pval:.2f})"
                 else:
-                    label = f"{var} (p = {pval:.2f})"
+                    label = f"{display_var} (p = {pval:.2f})"
                 self.sq_autocorr_var_combo.addItem(label, var)  # Store actual var name as data
             
             # Enable if there are variables and visualization type requires it
@@ -1215,7 +1457,13 @@ class AdvancedSpatialAnalysisDialog(QtWidgets.QDialog):
     def _on_sq_ripley_roi_changed(self):
         """Handle ROI change in Ripley tab."""
         roi_id = self._get_selected_roi(self.sq_ripley_roi_combo)
-        if roi_id and roi_id in self.anndata_cache:
+        if roi_id is None:
+            if 'ripley' in self.aggregated_results:
+                cluster_key = self.sq_ripley_cluster_combo.currentText()
+                self._plot_sq_ripley(self.aggregated_results['ripley'], cluster_key)
+                self.sq_ripley_save_btn.setEnabled(True)
+                self.sq_ripley_export_btn.setEnabled(True)
+        elif roi_id in self.anndata_cache:
             adata = self.anndata_cache[roi_id]
             cluster_key = self.sq_ripley_cluster_combo.currentText()
             # Check for any ripley key
@@ -1227,6 +1475,7 @@ class AdvancedSpatialAnalysisDialog(QtWidgets.QDialog):
             if has_ripley:
                 self._plot_sq_ripley(adata, cluster_key)
                 self.sq_ripley_save_btn.setEnabled(True)
+                self.sq_ripley_export_btn.setEnabled(True)
     
     def _on_sq_ripley_mode_changed(self):
         """Handle mode change (F/G/L) in Ripley tab - auto-refresh if data exists."""
@@ -1486,8 +1735,20 @@ class AdvancedSpatialAnalysisDialog(QtWidgets.QDialog):
             if results['aggregated'] is not None:
                 
                 class TempAnnData:
-                    def __init__(self, matrix, cluster_key, obs, significant_counts=None):
+                    def __init__(
+                        self,
+                        matrix,
+                        cluster_key,
+                        obs,
+                        significant_counts=None,
+                        p_values=None,
+                        p_values_adjusted=None,
+                    ):
                         self.uns = {'nhood_enrichment': {'zscore': matrix}}
+                        if p_values is not None:
+                            self.uns['nhood_enrichment']['pvalue'] = p_values
+                        if p_values_adjusted is not None:
+                            self.uns['nhood_enrichment']['pvalue_fdr_bh'] = p_values_adjusted
                         self.obs = obs
                         self._cluster_key = cluster_key
                         self._significant_counts = significant_counts
@@ -1502,7 +1763,9 @@ class AdvancedSpatialAnalysisDialog(QtWidgets.QDialog):
                     results['aggregated'], 
                     cluster_key, 
                     obs_df,
-                    significant_counts=results.get('significant_counts')
+                    significant_counts=results.get('significant_counts'),
+                    p_values=results.get('aggregated_p_values'),
+                    p_values_adjusted=results.get('aggregated_p_values_adjusted'),
                 )
                 
                 self.aggregated_results['nhood_enrichment'] = temp_adata
@@ -1529,6 +1792,7 @@ class AdvancedSpatialAnalysisDialog(QtWidgets.QDialog):
                 self.sq_nhood_canvas.show()
                 self.sq_nhood_canvas.update()
                 self.sq_nhood_save_btn.setEnabled(True)
+                self.sq_nhood_export_btn.setEnabled(True)
             else:
                 # Plot first ROI result
                 if results['results']:
@@ -1550,6 +1814,7 @@ class AdvancedSpatialAnalysisDialog(QtWidgets.QDialog):
                     self.sq_nhood_canvas.show()
                     self.sq_nhood_canvas.update()
                     self.sq_nhood_save_btn.setEnabled(True)
+                    self.sq_nhood_export_btn.setEnabled(True)
                     QtWidgets.QMessageBox.information(self, "Enrichment Complete", 
                         f"Neighborhood enrichment completed for {len(results['results'])} ROI(s).")
                 
@@ -1577,13 +1842,9 @@ class AdvancedSpatialAnalysisDialog(QtWidgets.QDialog):
             self.sq_nhood_canvas.draw()
             return
         
-        # Clear figure and create new subplot with space for external legend
+        # Clear figure and maximize the main heatmap area.
         self.sq_nhood_canvas.figure.clear()
-        # Create a grid layout: main plot on top, legend area below
-        gs = self.sq_nhood_canvas.figure.add_gridspec(2, 1, height_ratios=[4, 1], hspace=0.15, wspace=0.1)
-        ax = self.sq_nhood_canvas.figure.add_subplot(gs[0, 0])
-        ax_legend = self.sq_nhood_canvas.figure.add_subplot(gs[1, 0])
-        ax_legend.axis('off')  # Hide axes for legend area
+        ax = self.sq_nhood_canvas.figure.add_subplot(111)
         
         enrichment_data = adata.uns['nhood_enrichment']
         cluster_key = self.sq_nhood_cluster_combo.currentText()
@@ -1619,7 +1880,11 @@ class AdvancedSpatialAnalysisDialog(QtWidgets.QDialog):
             if hasattr(adata.obs[cluster_key], 'cat'):
                 categories = list(adata.obs[cluster_key].cat.categories)
             else:
-                categories = sorted(adata.obs[cluster_key].unique())
+                categories = sort_cluster_values(
+                    adata.obs[cluster_key].unique(),
+                    annotation_map=self.cluster_annotation_map,
+                    canonical=False,
+                )
         
         if matrix is not None and isinstance(matrix, np.ndarray) and matrix.ndim == 2:
             try:
@@ -1641,60 +1906,72 @@ class AdvancedSpatialAnalysisDialog(QtWidgets.QDialog):
                     vmin, vmax = -3, 3
                 
                 
-                # Get significance information
-                significant_counts = None
-                significance_threshold = 2.0
-                if hasattr(adata, '_significant_counts') and adata._significant_counts is not None:
-                    significant_counts = adata._significant_counts
-                else:
-                    # Compute significance from z-scores
-                    significant_counts = (np.abs(matrix) > significance_threshold).astype(int)
-                
                 # Create DataFrame for seaborn heatmap
                 if categories is not None and len(categories) == matrix.shape[0] == matrix.shape[1]:
                     cluster_labels = [self._get_cluster_display_name(c) for c in categories]
                     df = pd.DataFrame(matrix, index=cluster_labels, columns=cluster_labels)
                 else:
                     df = pd.DataFrame(matrix)
-                
-                # Create annotation matrix: z-score values only (no asterisks)
-                annot_matrix = np.empty(matrix.shape, dtype=object)
-                for i in range(matrix.shape[0]):
-                    for j in range(matrix.shape[1]):
-                        z_val = matrix[i, j]
-                        # Format z-score (2 decimal places)
-                        annot_matrix[i, j] = f"{z_val:.2f}"
-                
-                # Create heatmap using seaborn for better aesthetics
-                # Use a diverging colormap centered at 0 (red-white-blue)
-                # Seaborn accepts matplotlib colormap names as strings
-                cmap = 'RdBu_r'
-                
-                # Create the heatmap
-                sns.heatmap(df, 
-                           annot=annot_matrix, 
-                           fmt='', 
-                           cmap=cmap,
-                           center=0,
-                           vmin=vmin, 
-                           vmax=vmax,
-                           square=True,
-                           linewidths=0.5,
-                           cbar_kws={'label': 'Z-Score', 'shrink': 0.8},
-                           ax=ax,
-                           annot_kws={'size': 9, 'weight': 'normal', 'color': 'black'},
-                           xticklabels=True,
-                           yticklabels=True)
-                
-                # Rotate labels for better readability
-                ax.set_xticklabels(ax.get_xticklabels(), rotation=45, ha='right')
-                ax.set_yticklabels(ax.get_yticklabels(), rotation=0)
-                
-                # Set labels
-                ax.set_xlabel("Neighbor Cluster", fontsize=11, fontweight='bold')
-                ax.set_ylabel("Cell Cluster", fontsize=11, fontweight='bold')
-                ax.set_title("Neighborhood Enrichment Analysis", fontsize=13, fontweight='bold', pad=15)
-                
+                style = dense_heatmap_style(
+                    n_rows=df.shape[0],
+                    n_cols=df.shape[1],
+                    row_labels=df.index.astype(str).tolist(),
+                    col_labels=df.columns.astype(str).tolist(),
+                    base_tick_fontsize=10.0,
+                    base_annotation_fontsize=9.0,
+                    allow_annotations=True,
+                )
+                annot_data = np.round(df.to_numpy(), 2) if style['show_annotations'] else False
+
+                sns.heatmap(
+                    df,
+                    annot=annot_data,
+                    fmt='.2f',
+                    cmap='RdBu_r',
+                    center=0,
+                    vmin=vmin,
+                    vmax=vmax,
+                    square=style['square_cells'],
+                    linewidths=style['linewidths'],
+                    cbar_kws={
+                        'label': 'Z-Score',
+                        'shrink': style['colorbar_shrink'],
+                        'fraction': style['colorbar_fraction'],
+                        'pad': style['colorbar_pad'],
+                    },
+                    ax=ax,
+                    annot_kws={
+                        'size': style['annotation_fontsize'],
+                        'weight': 'normal',
+                        'color': 'black',
+                    },
+                    xticklabels=True,
+                    yticklabels=True,
+                )
+
+                ax.set_xticklabels(
+                    ax.get_xticklabels(),
+                    rotation=style['x_rotation'],
+                    ha='right',
+                    fontsize=style['tick_fontsize'],
+                )
+                ax.set_yticklabels(ax.get_yticklabels(), rotation=0, fontsize=style['tick_fontsize'])
+
+                ax.set_xlabel("Neighbor Cluster", fontsize=style['axis_fontsize'], fontweight='bold')
+                ax.set_ylabel("Cell Cluster", fontsize=style['axis_fontsize'], fontweight='bold')
+                ax.set_title(
+                    "Neighborhood Enrichment Analysis",
+                    fontsize=style['title_fontsize'],
+                    fontweight='bold',
+                    pad=12,
+                )
+                ax.tick_params(axis='both', labelsize=style['tick_fontsize'])
+
+                colorbar = ax.collections[0].colorbar if ax.collections else None
+                if colorbar is not None:
+                    colorbar.ax.tick_params(labelsize=style['colorbar_fontsize'])
+                    colorbar.set_label('Z-Score', fontsize=style['axis_fontsize'])
+
                 
             except Exception as e:
                 import traceback
@@ -1713,9 +1990,7 @@ class AdvancedSpatialAnalysisDialog(QtWidgets.QDialog):
                    ha='center', va='center', transform=ax.transAxes, fontsize=8)
         
         try:
-            # Adjust layout for better spacing
-            self.sq_nhood_canvas.figure.tight_layout()
-            self.sq_nhood_canvas.draw()
+            self._fit_canvas(self.sq_nhood_canvas, pad=0.95)
             # Force update and repaint
             self.sq_nhood_canvas.update()
             self.sq_nhood_canvas.repaint()
@@ -1836,6 +2111,7 @@ class AdvancedSpatialAnalysisDialog(QtWidgets.QDialog):
                 # Plot results (will use the default reference cluster "1")
                 self._plot_sq_cooccurrence(plot_adata)
                 self.sq_cooccur_save_btn.setEnabled(True)
+                self.sq_cooccur_export_btn.setEnabled(True)
             else:
                 QtWidgets.QMessageBox.warning(self, "No Results", 
                     "Co-occurrence analysis completed but no results to plot.")
@@ -1887,7 +2163,11 @@ class AdvancedSpatialAnalysisDialog(QtWidgets.QDialog):
             if hasattr(adata.obs[cluster_key], 'cat'):
                 categories = list(adata.obs[cluster_key].cat.categories)
             else:
-                categories = sorted(adata.obs[cluster_key].unique())
+                categories = sort_cluster_values(
+                    adata.obs[cluster_key].unique(),
+                    annotation_map=self.cluster_annotation_map,
+                    canonical=False,
+                )
         else:
             categories = []
         
@@ -1973,41 +2253,64 @@ class AdvancedSpatialAnalysisDialog(QtWidgets.QDialog):
                         df = pd.DataFrame(heatmap_data, index=cluster_labels, columns=cluster_labels)
                     else:
                         df = pd.DataFrame(heatmap_data)
-                    
-                    # Create annotation matrix with values
-                    annot_matrix = np.empty(heatmap_data.shape, dtype=object)
-                    for i in range(heatmap_data.shape[0]):
-                        for j in range(heatmap_data.shape[1]):
-                            val = heatmap_data[i, j]
-                            # Format to 3 decimal places for co-occurrence scores
-                            annot_matrix[i, j] = f"{val:.3f}"
-                    
-                    # Use seaborn heatmap with better colormap
-                    # Use a sequential colormap that works well for co-occurrence (probability-like values)
-                    sns.heatmap(df,
-                               annot=annot_matrix,
-                               fmt='',
-                               cmap='YlOrRd',  # Yellow-Orange-Red colormap for co-occurrence
-                               square=True,
-                               linewidths=0.5,
-                               cbar_kws={'label': 'Co-occurrence Score', 'shrink': 0.8},
-                               ax=ax,
-                               annot_kws={'size': 8, 'weight': 'normal', 'color': 'black'},
-                               xticklabels=True,
-                               yticklabels=True)
-                    
-                    # Rotate labels for better readability
-                    ax.set_xticklabels(ax.get_xticklabels(), rotation=45, ha='right')
-                    ax.set_yticklabels(ax.get_yticklabels(), rotation=0)
-                    
-                    # Set labels with better formatting
-                    ax.set_xlabel('To Phenotype', fontsize=11, fontweight='bold')
-                    ax.set_ylabel('From Phenotype', fontsize=11, fontweight='bold')
-                    ax.set_title(f'Co-occurrence Analysis at {selected_distance} µm', 
-                               fontsize=13, fontweight='bold', pad=15)
-                    
-                    self.sq_cooccur_canvas.figure.tight_layout()
-                    self.sq_cooccur_canvas.draw()
+                    style = dense_heatmap_style(
+                        n_rows=df.shape[0],
+                        n_cols=df.shape[1],
+                        row_labels=df.index.astype(str).tolist(),
+                        col_labels=df.columns.astype(str).tolist(),
+                        base_tick_fontsize=9.5,
+                        base_annotation_fontsize=8.5,
+                        allow_annotations=True,
+                    )
+                    annot_data = np.round(df.to_numpy(), 3) if style['show_annotations'] else False
+
+                    sns.heatmap(
+                        df,
+                        annot=annot_data,
+                        fmt='.3f',
+                        cmap='YlOrRd',
+                        square=style['square_cells'],
+                        linewidths=style['linewidths'],
+                        cbar_kws={
+                            'label': 'Co-occurrence Score',
+                            'shrink': style['colorbar_shrink'],
+                            'fraction': style['colorbar_fraction'],
+                            'pad': style['colorbar_pad'],
+                        },
+                        ax=ax,
+                        annot_kws={
+                            'size': style['annotation_fontsize'],
+                            'weight': 'normal',
+                            'color': 'black',
+                        },
+                        xticklabels=True,
+                        yticklabels=True,
+                    )
+
+                    ax.set_xticklabels(
+                        ax.get_xticklabels(),
+                        rotation=style['x_rotation'],
+                        ha='right',
+                        fontsize=style['tick_fontsize'],
+                    )
+                    ax.set_yticklabels(ax.get_yticklabels(), rotation=0, fontsize=style['tick_fontsize'])
+
+                    ax.set_xlabel('To Phenotype', fontsize=style['axis_fontsize'], fontweight='bold')
+                    ax.set_ylabel('From Phenotype', fontsize=style['axis_fontsize'], fontweight='bold')
+                    ax.set_title(
+                        f'Co-occurrence Analysis at {selected_distance} µm',
+                        fontsize=style['title_fontsize'],
+                        fontweight='bold',
+                        pad=12,
+                    )
+                    ax.tick_params(axis='both', labelsize=style['tick_fontsize'])
+
+                    colorbar = ax.collections[0].colorbar if ax.collections else None
+                    if colorbar is not None:
+                        colorbar.ax.tick_params(labelsize=style['colorbar_fontsize'])
+                        colorbar.set_label('Co-occurrence Score', fontsize=style['axis_fontsize'])
+
+                    self._fit_canvas(self.sq_cooccur_canvas, pad=0.95)
                     return
                 else:
                     ax = self.sq_cooccur_canvas.figure.add_subplot(111)
@@ -2143,69 +2446,40 @@ class AdvancedSpatialAnalysisDialog(QtWidgets.QDialog):
             else:
                 df = pd.DataFrame(cluster_data, columns=categories_list)
             
-            # Create mapping from cluster IDs to display names for legend
-            cluster_display_map = {cat: self._get_cluster_display_name(cat) for cat in categories_list}
-            
-            # Create DataFrame with display names for columns (for legend)
-            df_display = df.copy()
-            df_display.columns = [cluster_display_map.get(col, str(col)) for col in df_display.columns]
-            
-            # Melt to long format like squidpy
-            df_melted = df_display.melt(var_name=cluster_key, value_name="probability")
-            df_melted["distance"] = np.tile(interval, len(categories_list))
-            
-            # Use seaborn lineplot like squidpy
-            # Convert palette dict to list if needed (seaborn can handle both)
-            plot_palette = palette
-            if isinstance(palette, dict):
-                # Convert dict to list in the order of categories_list
-                plot_palette = [palette.get(cat, '#000000') for cat in categories_list]
-            
-            # Use display names for hue_order
-            hue_order_display = [cluster_display_map.get(cat, str(cat)) for cat in categories_list]
-            
-            sns.lineplot(
-                x="distance",
-                y="probability",
-                data=df_melted,
-                dashes=False,
-                hue=cluster_key,
-                hue_order=hue_order_display,
-                palette=plot_palette,
-                ax=ax,
-                legend='full',  # Ensure all entries are shown
-            )
-            
-            # Set legend like squidpy - ensure all entries are shown
-            legend_kwargs = {"loc": "center left", "bbox_to_anchor": (1, 0.5)}
-            
-            # Get all handles and labels from the axes (works across matplotlib versions)
+            cluster_display_map = {cat: self._get_cluster_display_name(cat) for cat in df.columns}
+
+            for column in df.columns:
+                display_name = cluster_display_map.get(column, str(column))
+                ax.plot(
+                    interval,
+                    df[column].to_numpy(),
+                    linewidth=2.0,
+                    color=palette.get(column, '#444444'),
+                    label=display_name,
+                )
+
+            legend_kwargs = {"loc": "center left", "bbox_to_anchor": (1, 0.5), "fontsize": 8}
             handles, labels = ax.get_legend_handles_labels()
-            
-            # Remove duplicates while preserving order
-            seen = set()
-            unique_handles = []
-            unique_labels = []
-            for h, l in zip(handles, labels):
-                if l not in seen:
-                    seen.add(l)
-                    unique_handles.append(h)
-                    unique_labels.append(l)
-            
-            # Recreate legend with all unique entries (labels already have display names)
-            if unique_handles:
+            if handles:
+                seen = set()
+                unique_handles = []
+                unique_labels = []
+                for handle, label in zip(handles, labels):
+                    if label in seen:
+                        continue
+                    seen.add(label)
+                    unique_handles.append(handle)
+                    unique_labels.append(label)
                 ax.legend(unique_handles, unique_labels, **legend_kwargs)
-            else:
-                # If no handles, create default legend
-                ax.legend(**legend_kwargs)
-            
-            # Set title like squidpy (LaTeX format) with display name
-            g_display = cluster_display_map.get(g, str(g))
-            ax.set_title(rf"$\frac{{p(exp|{g_display})}}{{p(exp)}}$")
-            ax.set_ylabel("value")
+
+            g_display = self._get_cluster_display_name(g)
+            ax.set_title(rf"$\frac{{p(exp|{g_display})}}{{p(exp)}}$", fontsize=10)
+            ax.set_xlabel("Distance (µm)", fontsize=9)
+            ax.set_ylabel("Co-occurrence score", fontsize=9)
+            ax.tick_params(axis='both', labelsize=8)
+            ax.grid(True, alpha=0.25)
         
-        self.sq_cooccur_canvas.figure.tight_layout()
-        self.sq_cooccur_canvas.draw()
+        self._fit_canvas(self.sq_cooccur_canvas, rect=[0.0, 0.0, 0.84, 1.0], pad=0.95)
     
     def _save_sq_cooccur_plot(self):
         """Save the co-occurrence plot."""
@@ -2227,7 +2501,11 @@ class AdvancedSpatialAnalysisDialog(QtWidgets.QDialog):
             # Parse markers
             markers = None
             if markers_str.lower() != 'all' and markers_str:
-                markers = [m.strip() for m in markers_str.split(',')]
+                markers = [
+                    self._get_feature_name_from_display(marker.strip())
+                    for marker in markers_str.split(',')
+                    if marker.strip()
+                ]
             
             # Get AnnData dict - filter to selected ROI if needed
             if roi_id is None:
@@ -2293,11 +2571,60 @@ class AdvancedSpatialAnalysisDialog(QtWidgets.QDialog):
             # Plot results
             self._plot_sq_autocorrelation(plot_adata)
             self.sq_autocorr_save_btn.setEnabled(True)
+            self.sq_autocorr_export_btn.setEnabled(True)
                 
         except Exception as e:
             import traceback
             traceback.print_exc()
             QtWidgets.QMessageBox.critical(self, "Error", f"Error running autocorrelation: {str(e)}")
+
+    def _extract_moran_arrays(self, moran_data):
+        """Extract Moran's I values, p-values, and variable names from supported result formats."""
+        I_values = None
+        p_values = None
+        gene_names = None
+
+        if isinstance(moran_data, pd.DataFrame):
+            if 'I' in moran_data.columns:
+                I_values = moran_data['I'].to_numpy()
+            elif 'moranI' in moran_data.columns:
+                I_values = moran_data['moranI'].to_numpy()
+
+            p_column, _ = self._get_preferred_moran_pvalue_columns(list(moran_data.columns))
+            if p_column is not None:
+                p_values = moran_data[p_column].to_numpy()
+
+            if 'var_names' in moran_data.columns:
+                gene_names = moran_data['var_names'].astype(str).to_numpy()
+            elif moran_data.index.name == 'var_names' or all(isinstance(x, str) for x in moran_data.index):
+                gene_names = moran_data.index.astype(str).to_numpy()
+            else:
+                gene_names = np.array([str(x) for x in moran_data.index], dtype=object)
+
+        elif isinstance(moran_data, dict):
+            I_values = moran_data.get('I')
+            for key in ['pval_sim', 'pval_z_sim', 'pval_norm', 'pval']:
+                if key in moran_data:
+                    p_values = moran_data.get(key)
+                    break
+            gene_names = moran_data.get('var_names')
+
+        return (
+            self._coerce_numeric_vector(I_values, allow_none=True),
+            self._coerce_numeric_vector(p_values, allow_none=True),
+            np.asarray(gene_names, dtype=object).flatten() if gene_names is not None else np.array([], dtype=object),
+        )
+
+    def _coerce_numeric_vector(self, values, *, allow_none=False):
+        """Convert vector-like values to a 1D float array, coercing invalid entries to NaN."""
+        if values is None:
+            return None if allow_none else np.array([], dtype=float)
+        if hasattr(values, 'toarray'):
+            values = values.toarray()
+        array = np.asarray(values).reshape(-1)
+        if array.size == 0:
+            return np.array([], dtype=float)
+        return pd.to_numeric(pd.Series(array), errors='coerce').to_numpy(dtype=float)
     
     def _plot_sq_autocorrelation(self, adata: 'ad.AnnData'):
         """Plot spatial autocorrelation results using squidpy's plotting function."""
@@ -2334,88 +2661,48 @@ class AdvancedSpatialAnalysisDialog(QtWidgets.QDialog):
         self.sq_autocorr_canvas.figure.clear()
         ax = self.sq_autocorr_canvas.figure.add_subplot(111)
         moran_data = adata.uns[moran_key]
-        
-        
-        # Extract I values and p-values
-        I_values = None
-        p_values = None
-        gene_names = None
-        
-        if isinstance(moran_data, pd.DataFrame):
-            # DataFrame format - extract columns
-            if 'I' in moran_data.columns:
-                I_values = moran_data['I'].values
-            elif 'moranI' in moran_data.columns:
-                I_values = moran_data['moranI'].values
-            
-            if 'pval_norm' in moran_data.columns:
-                p_values = moran_data['pval_norm'].values
-            elif 'pval' in moran_data.columns:
-                p_values = moran_data['pval'].values
-            
-            # Get gene names from index or var_names column
-            if 'var_names' in moran_data.columns:
-                gene_names = moran_data['var_names'].values
-            elif moran_data.index.name == 'var_names' or all(isinstance(x, str) for x in moran_data.index):
-                gene_names = moran_data.index.values
-            else:
-                # Try to infer from index
-                gene_names = [str(x) for x in moran_data.index]
-        
-        elif isinstance(moran_data, dict):
-            I_values = None
-            p_values = None
-            gene_names = None
-            
-            # Try different possible keys
-            if 'I' in moran_data:
-                I_values = moran_data['I']
-                if isinstance(I_values, np.ndarray):
-                    pass  # Good
-                elif isinstance(I_values, (list, tuple)):
-                    I_values = np.array(I_values)
-                else:
-                    I_values = None
-            
-            if 'pval_norm' in moran_data:
-                p_values = moran_data['pval_norm']
-                if isinstance(p_values, np.ndarray):
-                    pass
-                elif isinstance(p_values, (list, tuple)):
-                    p_values = np.array(p_values)
-                else:
-                    p_values = None
-            elif 'pval' in moran_data:
-                p_values = moran_data['pval']
-                if isinstance(p_values, np.ndarray):
-                    pass
-                elif isinstance(p_values, (list, tuple)):
-                    p_values = np.array(p_values)
-                else:
-                    p_values = None
-            
-            # Get gene names
-            if 'var_names' in moran_data:
-                gene_names = moran_data['var_names']
-            elif hasattr(adata, 'var_names'):
-                gene_names = adata.var_names.values
-            else:
-                gene_names = [f"Feature_{i}" for i in range(len(I_values))] if I_values is not None else []
-        
+
+        I_values, p_values, gene_names = self._extract_moran_arrays(moran_data)
+        if (gene_names.size == 0) and hasattr(adata, 'var_names'):
+            gene_names = np.asarray(adata.var_names, dtype=object).flatten()
+
         # Plot the data (works for both DataFrame and dict formats)
         if I_values is not None and len(I_values) > 0:
+            finite_mask = np.isfinite(I_values)
+            if p_values is not None and len(p_values) == len(I_values):
+                p_values = np.where(np.isfinite(p_values), p_values, 1.0)
+            if gene_names.size == len(I_values):
+                gene_names = gene_names[finite_mask]
+            I_values = I_values[finite_mask]
+            if p_values is not None and len(p_values) == len(finite_mask):
+                p_values = p_values[finite_mask]
+
+            if len(I_values) == 0:
+                ax.text(0.5, 0.5, 'No finite Moran\'s I values were available to plot.',
+                       ha='center', va='center', transform=ax.transAxes)
+                self._fit_canvas(self.sq_autocorr_canvas, pad=0.95)
+                return
+
             # Create bar plot
-            sorted_idx = np.argsort(I_values)[::-1]  # Sort by I value descending
+            if p_values is not None and len(p_values) == len(I_values):
+                sorted_idx = np.lexsort((p_values, -I_values))
+            else:
+                sorted_idx = np.argsort(I_values)[::-1]
             top_n = min(self.sq_autocorr_topk_spin.value(), len(sorted_idx))  # Use spinbox value
             
             top_I = I_values[sorted_idx[:top_n]]
             top_p = p_values[sorted_idx[:top_n]] if p_values is not None and len(p_values) > 0 else None
-            top_genes = [gene_names[i] for i in sorted_idx[:top_n]] if len(gene_names) > 0 else [f"Feature_{i}" for i in sorted_idx[:top_n]]
+            top_genes = (
+                [self._get_feature_display_name(str(gene_names[i])) for i in sorted_idx[:top_n]]
+                if len(gene_names) > 0
+                else [f"Feature_{i}" for i in sorted_idx[:top_n]]
+            )
             
             colors = ['red' if (top_p is not None and p < 0.05) else 'gray' for p in (top_p if top_p is not None else [1.0] * top_n)]
             ax.barh(range(top_n), top_I, color=colors)
             ax.set_yticks(range(top_n))
             ax.set_yticklabels(top_genes, fontsize=8)
+            ax.invert_yaxis()
             ax.set_xlabel("Moran's I")
             ax.set_title(f"Spatial Autocorrelation (Top {top_n})")
             ax.axvline(x=0, color='black', linestyle='--', linewidth=1)
@@ -2424,8 +2711,7 @@ class AdvancedSpatialAnalysisDialog(QtWidgets.QDialog):
             ax.text(0.5, 0.5, 'Unable to extract Moran\'s I values.\nData format not recognized.\nCheck debug output for details.', 
                    ha='center', va='center', transform=ax.transAxes)
         
-        self.sq_autocorr_canvas.figure.tight_layout()
-        self.sq_autocorr_canvas.draw()
+        self._fit_canvas(self.sq_autocorr_canvas, pad=0.95)
     
     def _save_sq_autocorr_plot(self):
         """Save the spatial autocorrelation plot."""
@@ -2488,18 +2774,14 @@ class AdvancedSpatialAnalysisDialog(QtWidgets.QDialog):
         if var_name in adata.var_names:
             # Variable is in var (feature matrix)
             var_idx = list(adata.var_names).index(var_name)
-            var_values = adata.X[:, var_idx]
-            if hasattr(var_values, 'toarray'):  # Handle sparse matrices
-                var_values = var_values.toarray().flatten()
-            else:
-                var_values = np.asarray(var_values).flatten()
+            var_values = self._coerce_numeric_vector(adata.X[:, var_idx], allow_none=True)
         elif hasattr(adata, 'obs') and var_name in adata.obs.columns:
             # Variable is in obs (metadata)
-            var_values = np.asarray(adata.obs[var_name].values).flatten()
             if not pd.api.types.is_numeric_dtype(adata.obs[var_name]):
                 QtWidgets.QMessageBox.warning(self, "Invalid Variable", 
                     f"Variable '{var_name}' is not numeric. Please select a numeric variable.")
                 return
+            var_values = self._coerce_numeric_vector(adata.obs[var_name].values, allow_none=True)
         else:
             QtWidgets.QMessageBox.warning(self, "Variable Not Found", 
                 f"Variable '{var_name}' not found in data.")
@@ -2510,14 +2792,33 @@ class AdvancedSpatialAnalysisDialog(QtWidgets.QDialog):
             QtWidgets.QMessageBox.warning(self, "No Data", 
                 f"No data available for variable '{var_name}'.")
             return
+
+        n_obs = len(adata.obs) if hasattr(adata, 'obs') else None
+        if n_obs is not None and len(var_values) != n_obs:
+            QtWidgets.QMessageBox.warning(
+                self,
+                "Dimension Mismatch",
+                f"Variable '{var_name}' has {len(var_values)} values but the ROI contains {n_obs} cells.",
+            )
+            return
         
         # Handle NaN and inf values
-        if np.any(~np.isfinite(var_values)):
-            n_invalid = np.sum(~np.isfinite(var_values))
+        finite_mask = np.isfinite(var_values)
+        if np.any(~finite_mask):
+            n_invalid = int(np.sum(~finite_mask))
             QtWidgets.QMessageBox.warning(self, "Invalid Values", 
                 f"Variable '{var_name}' contains {n_invalid} NaN or infinite values. "
                 "These will be replaced with 0 for visualization.")
             var_values = np.nan_to_num(var_values, nan=0.0, posinf=0.0, neginf=0.0)
+
+        if np.allclose(var_values, var_values[0]):
+            QtWidgets.QMessageBox.warning(
+                self,
+                "Low Variability",
+                f"Variable '{var_name}' is constant within the selected ROI. "
+                "Moran visualizations require at least some variability.",
+            )
+            return
         
         if viz_type == "Moran Scatter Plot":
             self._plot_moran_scatter(adata, var_name, var_values)
@@ -2530,12 +2831,12 @@ class AdvancedSpatialAnalysisDialog(QtWidgets.QDialog):
         """Plot Moran scatter plot: variable vs spatial lag."""
         self.sq_autocorr_canvas.figure.clear()
         ax = self.sq_autocorr_canvas.figure.add_subplot(111)
+        display_var_name = self._get_feature_display_name(str(var_name))
         
-        # Ensure var_values is a 1D array
-        if hasattr(var_values, 'toarray'):
-            var_values = var_values.toarray().flatten()
-        else:
-            var_values = np.asarray(var_values).flatten()
+        var_values = self._coerce_numeric_vector(var_values)
+        if len(var_values) == 0:
+            QtWidgets.QMessageBox.warning(self, "No Data", f"No numeric values were available for '{var_name}'.")
+            return
         
         # Get spatial weights matrix
         W = adata.obsp['spatial_connectivities']
@@ -2543,6 +2844,15 @@ class AdvancedSpatialAnalysisDialog(QtWidgets.QDialog):
             W = W.toarray()
         else:
             W = np.array(W)
+        W = np.asarray(W, dtype=float)
+
+        if W.shape[0] != len(var_values) or W.shape[1] != len(var_values):
+            QtWidgets.QMessageBox.warning(
+                self,
+                "Dimension Mismatch",
+                f"Spatial weights for '{var_name}' do not match the number of cells in this ROI.",
+            )
+            return
         
         # Standardize variable (mean-center and scale)
         var_centered = var_values - np.mean(var_values)
@@ -2560,13 +2870,21 @@ class AdvancedSpatialAnalysisDialog(QtWidgets.QDialog):
         
         # Ensure spatial_lag is 1D
         spatial_lag = np.asarray(spatial_lag).flatten()
+        if len(spatial_lag) != len(var_standardized):
+            QtWidgets.QMessageBox.warning(
+                self,
+                "Dimension Mismatch",
+                f"Spatial lag for '{var_name}' could not be computed consistently.",
+            )
+            return
         
         # Compute Moran's I from the slope
         # Moran's I = (n/W0) * (x' W x) / (x' x)
         # where W0 is sum of weights
         n = len(var_standardized)
         W0 = np.sum(W)
-        if W0 > 0:
+        denom = var_standardized @ var_standardized
+        if W0 > 0 and denom > 0:
             moran_I = (n / W0) * (var_standardized @ W @ var_standardized) / (var_standardized @ var_standardized)
         else:
             moran_I = 0.0
@@ -2601,26 +2919,25 @@ class AdvancedSpatialAnalysisDialog(QtWidgets.QDialog):
                 bbox=dict(boxstyle='round', facecolor='lightgreen', alpha=0.7))
         
         # Labels and title
-        ax.set_xlabel(f'{var_name} (standardized)', fontsize=11, fontweight='bold')
+        ax.set_xlabel(f'{display_var_name} (standardized)', fontsize=11, fontweight='bold')
         ax.set_ylabel('Spatial Lag (Wx)', fontsize=11, fontweight='bold')
-        ax.set_title(f"Moran Scatter Plot: {var_name}\nSlope = {slope:.3f} (Moran's I ≈ {moran_I:.3f})", 
+        ax.set_title(f"Moran Scatter Plot: {display_var_name}\nSlope = {slope:.3f} (Moran's I ≈ {moran_I:.3f})", 
                      fontsize=12, fontweight='bold')
         ax.legend(loc='best')
         ax.grid(True, alpha=0.3)
         
-        self.sq_autocorr_canvas.figure.tight_layout()
-        self.sq_autocorr_canvas.draw()
+        self._fit_canvas(self.sq_autocorr_canvas, pad=0.95)
     
     def _plot_spatial_map(self, adata: 'ad.AnnData', var_name: str, var_values: np.ndarray):
         """Plot spatial map colored by variable."""
         self.sq_autocorr_canvas.figure.clear()
         ax = self.sq_autocorr_canvas.figure.add_subplot(111)
+        display_var_name = self._get_feature_display_name(str(var_name))
         
-        # Ensure var_values is a 1D array
-        if hasattr(var_values, 'toarray'):
-            var_values = var_values.toarray().flatten()
-        else:
-            var_values = np.asarray(var_values).flatten()
+        var_values = self._coerce_numeric_vector(var_values)
+        if len(var_values) == 0:
+            QtWidgets.QMessageBox.warning(self, "No Data", f"No numeric values were available for '{var_name}'.")
+            return
         
         # Get spatial coordinates
         if 'spatial' in adata.obsm:
@@ -2631,6 +2948,7 @@ class AdvancedSpatialAnalysisDialog(QtWidgets.QDialog):
             QtWidgets.QMessageBox.warning(self, "No Coordinates", 
                 "Spatial coordinates not found. Cannot create spatial map.")
             return
+        coords = np.asarray(coords, dtype=float)
         
         # Validate dimensions match
         if len(var_values) != len(coords):
@@ -2645,18 +2963,17 @@ class AdvancedSpatialAnalysisDialog(QtWidgets.QDialog):
         
         # Add colorbar
         cbar = self.sq_autocorr_canvas.figure.colorbar(scatter, ax=ax)
-        cbar.set_label(var_name, fontsize=11, fontweight='bold')
+        cbar.set_label(display_var_name, fontsize=11, fontweight='bold')
         
         # Labels and title
         ax.set_xlabel('X coordinate (µm)', fontsize=11, fontweight='bold')
         ax.set_ylabel('Y coordinate (µm)', fontsize=11, fontweight='bold')
-        ax.set_title(f"Spatial Map: {var_name}\n(This map visualizes the variable used to compute Moran's I)", 
+        ax.set_title(f"Spatial Map: {display_var_name}\n(This map visualizes the variable used to compute Moran's I)", 
                      fontsize=12, fontweight='bold')
         ax.set_aspect('equal', adjustable='box')
         ax.grid(True, alpha=0.3)
         
-        self.sq_autocorr_canvas.figure.tight_layout()
-        self.sq_autocorr_canvas.draw()
+        self._fit_canvas(self.sq_autocorr_canvas, pad=0.95)
     
     def _run_sq_ripley(self):
         """Run Ripley analysis using core function."""
@@ -2734,6 +3051,11 @@ class AdvancedSpatialAnalysisDialog(QtWidgets.QDialog):
                 else:
                     # Use first ROI for plotting
                     plot_adata = list(results.values())[0]
+
+                if roi_id is None:
+                    self.aggregated_results['ripley'] = plot_adata
+                else:
+                    self.aggregated_results.pop('ripley', None)
                 
                 QtWidgets.QMessageBox.information(self, "Ripley Complete", 
                     f"Ripley analysis completed for {len(results)} ROI(s).")
@@ -2741,6 +3063,7 @@ class AdvancedSpatialAnalysisDialog(QtWidgets.QDialog):
                 # Plot results
                 self._plot_sq_ripley(plot_adata, cluster_key)
                 self.sq_ripley_save_btn.setEnabled(True)
+                self.sq_ripley_export_btn.setEnabled(True)
             else:
                 QtWidgets.QMessageBox.warning(self, "No Results", 
                     "Ripley analysis completed but no results to plot. "
@@ -2762,7 +3085,8 @@ class AdvancedSpatialAnalysisDialog(QtWidgets.QDialog):
         # Collect all stat dataframes
         stat_dfs = []
         sims_stat_dfs = []
-        all_bins = None
+        pvalue_dfs = []
+        all_bins = set()
         all_clusters = set()
         
         for roi_id, adata in results.items():
@@ -2780,17 +3104,41 @@ class AdvancedSpatialAnalysisDialog(QtWidgets.QDialog):
             if cluster_key in stat_df.columns:
                 all_clusters.update(stat_df[cluster_key].unique())
             if 'bins' in stat_df.columns:
-                if all_bins is None:
-                    all_bins = stat_df['bins'].unique()
-                else:
-                    # Ensure bins match across ROIs
-                    bins_this_roi = stat_df['bins'].unique()
-                    if len(bins_this_roi) != len(all_bins) or not np.allclose(bins_this_roi, all_bins):
-                        pass
+                all_bins.update(pd.to_numeric(stat_df['bins'], errors='coerce').dropna().tolist())
             
             # Collect simulation stats if available
             if sims_stat_key in ripley_data:
                 sims_stat_dfs.append(ripley_data[sims_stat_key])
+
+            raw_pvalues = ripley_data.get('pvalues')
+            if raw_pvalues is not None:
+                pvalue_matrix = np.asarray(raw_pvalues, dtype=float)
+                if pvalue_matrix.ndim == 2:
+                    if hasattr(adata, 'obs') and cluster_key in adata.obs.columns and hasattr(adata.obs[cluster_key], 'cat'):
+                        cluster_categories = list(adata.obs[cluster_key].cat.categories)
+                    elif cluster_key in stat_df.columns:
+                        cluster_categories = list(pd.Series(stat_df[cluster_key]).dropna().unique())
+                    else:
+                        cluster_categories = [f'Cluster_{idx}' for idx in range(pvalue_matrix.shape[0])]
+
+                    bins = ripley_data.get('bins')
+                    if bins is None:
+                        bins = np.sort(pd.to_numeric(stat_df['bins'], errors='coerce').dropna().unique())
+                    else:
+                        bins = np.asarray(bins, dtype=float).reshape(-1)
+
+                    pvalue_rows = []
+                    for cluster_idx, cluster_id in enumerate(cluster_categories[:pvalue_matrix.shape[0]]):
+                        for bin_idx, distance_um in enumerate(bins[:pvalue_matrix.shape[1]]):
+                            pvalue_rows.append(
+                                {
+                                    cluster_key: cluster_id,
+                                    'bins': float(distance_um),
+                                    'p_value': float(pvalue_matrix[cluster_idx, bin_idx]) if np.isfinite(pvalue_matrix[cluster_idx, bin_idx]) else np.nan,
+                                }
+                            )
+                    if pvalue_rows:
+                        pvalue_dfs.append(pd.DataFrame(pvalue_rows))
         
         if not stat_dfs:
             # Fallback: return first result
@@ -2816,6 +3164,41 @@ class AdvancedSpatialAnalysisDialog(QtWidgets.QDialog):
                 aggregated_sims_stat = grouped_sims.agg({'stats': 'mean'}).reset_index(drop=True)
             else:  # sum
                 aggregated_sims_stat = grouped_sims.agg({'stats': 'sum'}).reset_index(drop=True)
+
+        aggregated_pvalues = None
+        aggregated_pvalues_adjusted = None
+        ordered_clusters = sort_cluster_values(
+            all_clusters,
+            annotation_map=self.cluster_annotation_map,
+            canonical=False,
+        ) if all_clusters else []
+        ordered_bins = np.asarray(sorted(all_bins), dtype=float) if all_bins else np.array([], dtype=float)
+
+        if pvalue_dfs and ordered_clusters and ordered_bins.size > 0:
+            combined_pvalue_df = pd.concat(pvalue_dfs, ignore_index=True)
+            grouped_pvalues = combined_pvalue_df.groupby([cluster_key, 'bins'])['p_value']
+            combined_rows = []
+            for (cluster_id, bin_value), series in grouped_pvalues:
+                combined_rows.append(
+                    {
+                        cluster_key: cluster_id,
+                        'bins': float(bin_value),
+                        'p_value': combine_pvalues_fisher(series.to_numpy(dtype=float, copy=False)),
+                    }
+                )
+
+            if combined_rows:
+                combined_pvalue_df = pd.DataFrame(combined_rows)
+                cluster_to_idx = {cluster_id: idx for idx, cluster_id in enumerate(ordered_clusters)}
+                bin_to_idx = {float(bin_value): idx for idx, bin_value in enumerate(ordered_bins)}
+                aggregated_pvalues = np.full((len(ordered_clusters), len(ordered_bins)), np.nan, dtype=float)
+                for _, row in combined_pvalue_df.iterrows():
+                    cluster_idx = cluster_to_idx.get(row[cluster_key])
+                    bin_idx = bin_to_idx.get(float(row['bins']))
+                    if cluster_idx is None or bin_idx is None:
+                        continue
+                    aggregated_pvalues[cluster_idx, bin_idx] = float(row['p_value'])
+                aggregated_pvalues_adjusted = benjamini_hochberg_adjust_matrix(aggregated_pvalues)
         
         # Create aggregated result structure
         aggregated_ripley_data = {
@@ -2823,12 +3206,23 @@ class AdvancedSpatialAnalysisDialog(QtWidgets.QDialog):
         }
         if aggregated_sims_stat is not None:
             aggregated_ripley_data[sims_stat_key] = aggregated_sims_stat
+        if ordered_bins.size > 0:
+            aggregated_ripley_data['bins'] = ordered_bins
+        if aggregated_pvalues is not None:
+            aggregated_ripley_data['pvalues'] = aggregated_pvalues
+            aggregated_ripley_data['pvalues_fdr_bh'] = aggregated_pvalues_adjusted
         
         # Create a new AnnData object with aggregated results
         # Use the first ROI's structure as template
         first_adata = list(results.values())[0]
         aggregated_adata = first_adata.copy()
         aggregated_adata.uns['ripley'] = aggregated_ripley_data
+        if ordered_clusters and hasattr(aggregated_adata, 'obs') and cluster_key in aggregated_adata.obs.columns:
+            aggregated_adata.obs[cluster_key] = pd.Categorical(
+                aggregated_adata.obs[cluster_key],
+                categories=ordered_clusters,
+                ordered=True,
+            )
         
         
         return aggregated_adata
@@ -2883,7 +3277,11 @@ class AdvancedSpatialAnalysisDialog(QtWidgets.QDialog):
             if hasattr(adata.obs[cluster_key], 'cat'):
                 categories_list = list(adata.obs[cluster_key].cat.categories)
             else:
-                categories_list = sorted(adata.obs[cluster_key].unique())
+                categories_list = sort_cluster_values(
+                    adata.obs[cluster_key].unique(),
+                    annotation_map=self.cluster_annotation_map,
+                    canonical=False,
+                )
         else:
             categories_list = []
         
@@ -2911,60 +3309,655 @@ class AdvancedSpatialAnalysisDialog(QtWidgets.QDialog):
         # Create mapping from cluster IDs to display names
         cluster_display_map = {cat: self._get_cluster_display_name(cat) for cat in categories_list}
         
-        # Create a copy of stat_df with display names for the hue column
-        stat_df_display = stat_df.copy()
-        if cluster_key in stat_df_display.columns:
-            stat_df_display[cluster_key] = stat_df_display[cluster_key].map(
-                lambda x: cluster_display_map.get(x, str(x))
-            )
-        
-        # Convert palette dict to list if needed (seaborn can handle both)
-        plot_palette = palette
-        if isinstance(palette, dict):
-            # Convert dict to list in the order of categories_list
-            plot_palette = [palette.get(cat, '#000000') for cat in categories_list]
-        
-        # Use display names for hue_order
-        hue_order_display = [cluster_display_map.get(cat, str(cat)) for cat in categories_list]
-        
-        # Use seaborn lineplot like squidpy does
-        sns.lineplot(
-            y="stats",
-            x="bins",
-            hue=cluster_key,
-            data=stat_df_display,
-            hue_order=hue_order_display,
-            palette=plot_palette,
-            ax=ax,
-        )
-        
-        # Plot simulations if available (like squidpy's plot_sims parameter)
-        if "sims_stat" in res:
-            sns.lineplot(
-                y="stats", 
-                x="bins", 
-                errorbar="sd", 
-                alpha=0.01, 
-                color="gray", 
-                data=res["sims_stat"], 
-                ax=ax
-            )
-        
+        # Draw line-only curves so the GUI view stays clean and export-ready.
+        if cluster_key in stat_df.columns:
+            for cluster_id in categories_list:
+                cluster_df = stat_df[stat_df[cluster_key] == cluster_id].copy()
+                if cluster_df.empty:
+                    continue
+                cluster_df = cluster_df.sort_values('bins')
+                ax.plot(
+                    cluster_df['bins'].to_numpy(dtype=float),
+                    cluster_df['stats'].to_numpy(dtype=float),
+                    linewidth=2.0,
+                    color=palette.get(cluster_id, '#444444'),
+                    label=cluster_display_map.get(cluster_id, str(cluster_id)),
+                )
+
+        # Keep simulations as a dashed reference line instead of an opaque interval band.
+        sims_key = "sims_stat"
+        if sims_key not in res:
+            sims_key = f"sims_{stat_key}"
+        if sims_key in res:
+            sims_df = res[sims_key]
+            if isinstance(sims_df, pd.DataFrame) and {'bins', 'stats'}.issubset(sims_df.columns):
+                sims_summary = (
+                    sims_df.groupby('bins', as_index=False)['stats']
+                    .mean()
+                    .sort_values('bins')
+                )
+                if not sims_summary.empty:
+                    ax.plot(
+                        sims_summary['bins'].to_numpy(dtype=float),
+                        sims_summary['stats'].to_numpy(dtype=float),
+                        linestyle='--',
+                        linewidth=1.4,
+                        color='gray',
+                        alpha=0.9,
+                        label='Simulation mean',
+                    )
+
         # Set legend like squidpy (labels already have display names from stat_df_display)
         legend_kwargs = {"loc": "center left", "bbox_to_anchor": (1, 0.5)}
-        ax.legend(**legend_kwargs)
-        
+        handles, labels = ax.get_legend_handles_labels()
+        if handles:
+            seen = set()
+            unique_handles = []
+            unique_labels = []
+            for handle, label in zip(handles, labels):
+                if label in seen:
+                    continue
+                seen.add(label)
+                unique_handles.append(handle)
+                unique_labels.append(label)
+            ax.legend(unique_handles, unique_labels, **legend_kwargs)
+
         # Set labels like squidpy
         ax.set_ylabel("value")
         ax.set_title(f"Ripley's {mode_enum.s}")
         
-        self.sq_ripley_canvas.figure.tight_layout()
-        self.sq_ripley_canvas.draw()
+        self._fit_canvas(self.sq_ripley_canvas, rect=[0.0, 0.0, 0.84, 1.0], pad=0.95)
     
     def _save_sq_ripley_plot(self):
         """Save the Ripley plot."""
         if save_figure_with_options(self.sq_ripley_canvas.figure, "squidpy_ripley.png", self):
             QtWidgets.QMessageBox.information(self, "Success", "Plot saved successfully")
+
+    def _sanitize_export_component(self, value: Any) -> str:
+        """Return a filesystem-friendly name fragment for exported CSVs."""
+        text = str(value).strip()
+        if not text:
+            return "results"
+        sanitized = "".join(char if char.isalnum() or char in "._-" else "_" for char in text)
+        sanitized = sanitized.strip("_")
+        return sanitized or "results"
+
+    def _export_table_to_csv(
+        self,
+        dataframe: pd.DataFrame,
+        *,
+        title: str,
+        default_filename: str,
+        success_message: str,
+    ) -> bool:
+        """Export a dataframe to a user-selected CSV file."""
+        if dataframe is None or dataframe.empty:
+            return False
+
+        file_path, _ = QtWidgets.QFileDialog.getSaveFileName(
+            self,
+            title,
+            default_filename,
+            "CSV Files (*.csv)"
+        )
+        if not file_path:
+            return False
+
+        try:
+            dataframe.to_csv(file_path, index=False)
+            QtWidgets.QMessageBox.information(self, "Export Complete", f"{success_message}\n{file_path}")
+            return True
+        except Exception as e:
+            import traceback
+            traceback.print_exc()
+            QtWidgets.QMessageBox.critical(self, "Export Error", f"Failed to export results: {str(e)}")
+            return False
+
+    def _find_uns_key(self, adata: Any, preferred_keys: List[str], *, contains: Optional[List[str]] = None) -> Optional[str]:
+        """Return the first matching `uns` key from an AnnData-like object."""
+        if adata is None or not hasattr(adata, 'uns'):
+            return None
+
+        uns_keys = list(getattr(adata, 'uns', {}).keys())
+        for key in preferred_keys:
+            if key in uns_keys:
+                return key
+
+        contains = contains or []
+        for key in uns_keys:
+            lowered = key.lower()
+            if all(token in lowered for token in contains):
+                return key
+        return None
+
+    def _get_obs_categories(self, adata: Any, cluster_key: str, expected_size: Optional[int] = None) -> List[Any]:
+        """Return cluster categories aligned to the expected matrix width when possible."""
+        categories: List[Any] = []
+        if adata is not None and hasattr(adata, 'obs') and cluster_key in adata.obs.columns:
+            series = adata.obs[cluster_key]
+            if hasattr(series, 'cat'):
+                categories = list(series.cat.categories)
+            else:
+                categories = list(
+                    sort_cluster_values(
+                        pd.Series(series).dropna().unique(),
+                        annotation_map=self.cluster_annotation_map,
+                        canonical=False,
+                    )
+                )
+
+        if expected_size is None:
+            return categories
+        if len(categories) >= expected_size:
+            return list(categories[:expected_size])
+
+        padded = list(categories)
+        padded.extend(f"Cluster_{idx}" for idx in range(len(padded), expected_size))
+        return padded
+
+    def _get_matrix_from_mapping(self, mapping: Dict[str, Any], *keys: str) -> Optional[np.ndarray]:
+        """Return the first 2D matrix stored under any of the requested keys."""
+        for key in keys:
+            value = mapping.get(key)
+            if isinstance(value, np.ndarray) and value.ndim == 2:
+                return np.asarray(value, dtype=float)
+        return None
+
+    def _get_preferred_moran_pvalue_columns(self, columns: List[str]) -> Tuple[Optional[str], Optional[str]]:
+        """Pick the best available Moran p-value and adjusted-p-value columns."""
+        base_priority = ['pval_sim', 'pval_z_sim', 'pval_norm', 'pval']
+        adjusted_priority = [
+            'pval_sim_fdr_bh',
+            'pval_z_sim_fdr_bh',
+            'pval_norm_fdr_bh',
+            'pval_fdr_bh',
+        ]
+
+        base_column = next((column for column in base_priority if column in columns), None)
+        if base_column is not None:
+            preferred_adjusted = f'{base_column}_fdr_bh'
+            if preferred_adjusted in columns:
+                return base_column, preferred_adjusted
+
+        adjusted_column = next((column for column in adjusted_priority if column in columns), None)
+        return base_column, adjusted_column
+
+    def _build_sq_nhood_export_df(
+        self,
+        adata: Any,
+        *,
+        roi_label: str,
+        cluster_key: str,
+        aggregation_method: Optional[str] = None,
+    ) -> pd.DataFrame:
+        """Flatten neighborhood enrichment matrices into a CSV-friendly table."""
+        uns_key = self._find_uns_key(
+            adata,
+            ['nhood_enrichment', f'{cluster_key}_nhood_enrichment', 'nhood_enrichment_zscore'],
+            contains=['nhood'],
+        )
+        if uns_key is None:
+            return pd.DataFrame()
+
+        enrichment_data = adata.uns[uns_key]
+        matrices: Dict[str, np.ndarray] = {}
+        if isinstance(enrichment_data, dict):
+            for key, value in enrichment_data.items():
+                if isinstance(value, np.ndarray) and value.ndim == 2:
+                    matrices[key] = np.asarray(value, dtype=float)
+        elif isinstance(enrichment_data, np.ndarray) and enrichment_data.ndim == 2:
+            matrices['zscore'] = np.asarray(enrichment_data, dtype=float)
+
+        if not matrices:
+            return pd.DataFrame()
+
+        z_matrix = matrices.get('zscore')
+        if z_matrix is None:
+            z_matrix = matrices.get('stat')
+        if z_matrix is None:
+            z_matrix = next(iter(matrices.values()))
+        n_rows, n_cols = z_matrix.shape
+        categories = self._get_obs_categories(adata, cluster_key, expected_size=max(n_rows, n_cols))
+        row_categories = categories[:n_rows]
+        col_categories = categories[:n_cols]
+        count_matrix = matrices.get('count')
+        stat_matrix = matrices.get('stat')
+        pvalue_matrix = self._get_matrix_from_mapping(
+            matrices,
+            'pvalue',
+            'p_value',
+            'pval',
+        )
+        adjusted_pvalue_matrix = self._get_matrix_from_mapping(
+            matrices,
+            'pvalue_fdr_bh',
+            'pvalue_adjusted',
+            'p_value_adjusted',
+            'pval_fdr_bh',
+        )
+        significant_counts = getattr(adata, '_significant_counts', None)
+
+        rows = []
+        for row_idx, cluster_a in enumerate(row_categories):
+            for col_idx, cluster_b in enumerate(col_categories):
+                row = {
+                    'roi_id': roi_label,
+                    'cluster_A': cluster_a,
+                    'cluster_A_label': self._get_cluster_display_name(cluster_a),
+                    'cluster_B': cluster_b,
+                    'cluster_B_label': self._get_cluster_display_name(cluster_b),
+                    'z_score': float(z_matrix[row_idx, col_idx]) if np.isfinite(z_matrix[row_idx, col_idx]) else np.nan,
+                }
+                if count_matrix is not None and count_matrix.shape == z_matrix.shape:
+                    row['count'] = float(count_matrix[row_idx, col_idx]) if np.isfinite(count_matrix[row_idx, col_idx]) else np.nan
+                if stat_matrix is not None and stat_matrix.shape == z_matrix.shape:
+                    row['stat'] = float(stat_matrix[row_idx, col_idx]) if np.isfinite(stat_matrix[row_idx, col_idx]) else np.nan
+                if pvalue_matrix is not None and pvalue_matrix.shape == z_matrix.shape:
+                    row['p_value'] = float(pvalue_matrix[row_idx, col_idx]) if np.isfinite(pvalue_matrix[row_idx, col_idx]) else np.nan
+                if adjusted_pvalue_matrix is not None and adjusted_pvalue_matrix.shape == z_matrix.shape:
+                    row['p_value_adjusted'] = float(adjusted_pvalue_matrix[row_idx, col_idx]) if np.isfinite(adjusted_pvalue_matrix[row_idx, col_idx]) else np.nan
+                if isinstance(significant_counts, np.ndarray) and significant_counts.shape == z_matrix.shape:
+                    row['significant_roi_count'] = int(significant_counts[row_idx, col_idx])
+                rows.append(row)
+
+        export_df = pd.DataFrame(rows)
+        if export_df.empty:
+            return export_df
+
+        if 'p_value' not in export_df.columns:
+            export_df['p_value'] = np.nan
+            finite_mask = np.isfinite(export_df['z_score'].to_numpy(dtype=float, copy=False))
+            if np.any(finite_mask):
+                export_df.loc[finite_mask, 'p_value'] = 2.0 * stats.norm.sf(
+                    np.abs(export_df.loc[finite_mask, 'z_score'].to_numpy(dtype=float, copy=False))
+                )
+            export_df['p_value_source'] = 'z_score_normal_approximation'
+        else:
+            export_df['p_value_source'] = 'permutation'
+
+        if 'p_value_adjusted' not in export_df.columns:
+            export_df['p_value_adjusted'] = benjamini_hochberg_adjust(
+                export_df['p_value'].to_numpy(dtype=float, copy=False)
+            )
+        if aggregation_method:
+            export_df['aggregation_method'] = aggregation_method
+        return export_df
+
+    def _build_sq_cooccur_export_df(
+        self,
+        adata: Any,
+        *,
+        roi_label: str,
+        cluster_key: str,
+    ) -> pd.DataFrame:
+        """Flatten co-occurrence arrays into a long-form table."""
+        cooccur_key = self._find_uns_key(adata, ['co_occurrence'], contains=['co', 'occur'])
+        if cooccur_key is None:
+            return pd.DataFrame()
+
+        cooccur_data = adata.uns[cooccur_key]
+        if not isinstance(cooccur_data, dict) or 'occ' not in cooccur_data:
+            return pd.DataFrame()
+
+        occ = np.asarray(cooccur_data['occ'], dtype=float)
+        if occ.ndim != 3:
+            return pd.DataFrame()
+
+        raw_interval = cooccur_data.get('interval', cooccur_data.get('distances'))
+        if raw_interval is None:
+            distances = list(range(occ.shape[2]))
+        else:
+            interval_values = np.asarray(raw_interval, dtype=float).reshape(-1).tolist()
+            if len(interval_values) == occ.shape[2] + 1:
+                distances = interval_values[1:]
+            else:
+                distances = interval_values[:occ.shape[2]]
+        if len(distances) < occ.shape[2]:
+            distances.extend(float(idx) for idx in range(len(distances), occ.shape[2]))
+
+        categories = self._get_obs_categories(adata, cluster_key, expected_size=occ.shape[0])
+
+        rows = []
+        for source_idx, source_cluster in enumerate(categories):
+            for target_idx, target_cluster in enumerate(categories):
+                for dist_idx, distance_um in enumerate(distances[:occ.shape[2]]):
+                    rows.append(
+                        {
+                            'roi_id': roi_label,
+                            'source_cluster': source_cluster,
+                            'source_cluster_label': self._get_cluster_display_name(source_cluster),
+                            'target_cluster': target_cluster,
+                            'target_cluster_label': self._get_cluster_display_name(target_cluster),
+                            'distance_um': float(distance_um),
+                            'co_occurrence_score': float(occ[source_idx, target_idx, dist_idx]),
+                        }
+                    )
+
+        return pd.DataFrame(rows)
+
+    def _build_sq_autocorr_export_df(
+        self,
+        adata: Any,
+        *,
+        roi_label: str,
+        aggregation_method: Optional[str] = None,
+    ) -> pd.DataFrame:
+        """Flatten Moran autocorrelation results into a CSV-friendly table."""
+        moran_key = self._find_uns_key(adata, ['moranI'], contains=['moran'])
+        if moran_key is None:
+            return pd.DataFrame()
+
+        moran_data = adata.uns[moran_key]
+        if isinstance(moran_data, pd.DataFrame):
+            export_df = moran_data.copy()
+            if 'var_names' not in export_df.columns:
+                export_df.insert(0, 'var_names', export_df.index.astype(str))
+            export_df = export_df.reset_index(drop=True)
+        elif isinstance(moran_data, dict):
+            I_values, p_values, gene_names = self._extract_moran_arrays(moran_data)
+            i_len = len(I_values) if I_values is not None else 0
+            p_len = len(p_values) if p_values is not None else 0
+            n_rows = int(max(i_len, p_len, len(gene_names)))
+            if n_rows == 0:
+                return pd.DataFrame()
+
+            if gene_names.size == 0:
+                gene_names = np.asarray([f"feature_{idx}" for idx in range(n_rows)], dtype=object)
+
+            data: Dict[str, Any] = {'var_names': gene_names}
+            for key, value in moran_data.items():
+                if key == 'var_names':
+                    continue
+                if np.isscalar(value):
+                    data[key] = np.repeat(value, n_rows)
+                    continue
+                if hasattr(value, 'toarray'):
+                    value = value.toarray()
+                array = np.asarray(value).reshape(-1)
+                if array.size == n_rows:
+                    data[key] = array
+
+            if 'I' not in data and I_values is not None and len(I_values) == n_rows:
+                data['I'] = I_values
+            if 'pval_norm' not in data and p_values is not None and len(p_values) == n_rows:
+                data['pval_norm'] = p_values
+            export_df = pd.DataFrame(data)
+        else:
+            return pd.DataFrame()
+
+        if export_df.empty:
+            return export_df
+
+        export_df['roi_id'] = roi_label
+        export_df['feature'] = export_df['var_names'].astype(str)
+        export_df['feature_label'] = export_df['feature'].map(self._get_feature_display_name)
+
+        moran_column = 'I' if 'I' in export_df.columns else 'moranI' if 'moranI' in export_df.columns else None
+        if moran_column is not None:
+            export_df['moran_i'] = pd.to_numeric(export_df[moran_column], errors='coerce')
+
+        p_column, p_adjusted_column = self._get_preferred_moran_pvalue_columns(list(export_df.columns))
+        if p_column is not None:
+            export_df['p_value'] = pd.to_numeric(export_df[p_column], errors='coerce')
+            export_df['p_value_source'] = p_column
+            if p_adjusted_column is not None:
+                export_df['p_value_adjusted'] = pd.to_numeric(export_df[p_adjusted_column], errors='coerce')
+            else:
+                export_df['p_value_adjusted'] = benjamini_hochberg_adjust(
+                    export_df['p_value'].to_numpy(dtype=float, copy=False)
+                )
+        else:
+            export_df['p_value'] = np.nan
+            export_df['p_value_adjusted'] = np.nan
+
+        if aggregation_method:
+            export_df['aggregation_method'] = aggregation_method
+
+        sort_columns = [column for column in ['p_value', 'moran_i'] if column in export_df.columns]
+        if sort_columns:
+            ascending = [True if column == 'p_value' else False for column in sort_columns]
+            export_df = export_df.sort_values(sort_columns, ascending=ascending, na_position='last').reset_index(drop=True)
+        return export_df
+
+    def _build_sq_ripley_export_df(
+        self,
+        adata: Any,
+        *,
+        roi_label: str,
+        cluster_key: str,
+        aggregation_method: Optional[str] = None,
+    ) -> pd.DataFrame:
+        """Flatten Ripley results and simulation summaries into one table."""
+        ripley_key = self._find_uns_key(adata, ['ripley'], contains=['ripley'])
+        if ripley_key is None:
+            return pd.DataFrame()
+
+        ripley_data = adata.uns[ripley_key]
+        if not isinstance(ripley_data, dict):
+            return pd.DataFrame()
+
+        mode = self.sq_ripley_mode_combo.currentText()
+        stat_key = f"{mode}_stat"
+        if stat_key not in ripley_data or not isinstance(ripley_data[stat_key], pd.DataFrame):
+            return pd.DataFrame()
+
+        export_df = ripley_data[stat_key].copy().reset_index(drop=True)
+        if export_df.empty:
+            return export_df
+
+        export_df['roi_id'] = roi_label
+        export_df['mode'] = mode
+        export_df['distance_um'] = pd.to_numeric(export_df.get('bins'), errors='coerce')
+        export_df['stat_value'] = pd.to_numeric(export_df.get('stats'), errors='coerce')
+
+        cluster_column = cluster_key if cluster_key in export_df.columns else 'cluster' if 'cluster' in export_df.columns else None
+        if cluster_column is not None:
+            export_df['cluster'] = export_df[cluster_column]
+            export_df['cluster_label'] = export_df['cluster'].map(self._get_cluster_display_name)
+
+        sims_key = 'sims_stat' if 'sims_stat' in ripley_data else f'sims_{stat_key}'
+        if sims_key in ripley_data and isinstance(ripley_data[sims_key], pd.DataFrame):
+            sims_summary = (
+                ripley_data[sims_key]
+                .groupby('bins', as_index=False)
+                .agg(
+                    simulation_mean=('stats', 'mean'),
+                    simulation_std=('stats', 'std'),
+                    simulation_count=('stats', 'count'),
+                )
+                .rename(columns={'bins': 'distance_um'})
+            )
+            export_df = export_df.merge(sims_summary, on='distance_um', how='left')
+
+        pvalue_matrix = None
+        if 'pvalues' in ripley_data:
+            raw_pvalues = np.asarray(ripley_data['pvalues'], dtype=float)
+            if raw_pvalues.ndim == 2:
+                pvalue_matrix = raw_pvalues
+        adjusted_pvalue_matrix = None
+        if 'pvalues_fdr_bh' in ripley_data:
+            raw_adjusted = np.asarray(ripley_data['pvalues_fdr_bh'], dtype=float)
+            if raw_adjusted.ndim == 2:
+                adjusted_pvalue_matrix = raw_adjusted
+        elif pvalue_matrix is not None:
+            adjusted_pvalue_matrix = benjamini_hochberg_adjust_matrix(pvalue_matrix)
+
+        if pvalue_matrix is not None:
+            category_labels = self._get_obs_categories(adata, cluster_key, expected_size=pvalue_matrix.shape[0])
+            bin_values = ripley_data.get('bins')
+            if bin_values is None:
+                bin_values = np.sort(export_df['distance_um'].dropna().unique())
+            else:
+                bin_values = np.asarray(bin_values, dtype=float).reshape(-1)
+
+            pvalue_rows = []
+            for cluster_idx, cluster_id in enumerate(category_labels[:pvalue_matrix.shape[0]]):
+                for bin_idx, distance_um in enumerate(bin_values[:pvalue_matrix.shape[1]]):
+                    pvalue_row = {
+                        'cluster': cluster_id,
+                        'distance_um': float(distance_um),
+                        'p_value': float(pvalue_matrix[cluster_idx, bin_idx]) if np.isfinite(pvalue_matrix[cluster_idx, bin_idx]) else np.nan,
+                    }
+                    if adjusted_pvalue_matrix is not None and adjusted_pvalue_matrix.shape == pvalue_matrix.shape:
+                        pvalue_row['p_value_adjusted'] = (
+                            float(adjusted_pvalue_matrix[cluster_idx, bin_idx])
+                            if np.isfinite(adjusted_pvalue_matrix[cluster_idx, bin_idx])
+                            else np.nan
+                        )
+                    pvalue_rows.append(pvalue_row)
+
+            if pvalue_rows:
+                pvalue_df = pd.DataFrame(pvalue_rows)
+                export_df = export_df.merge(pvalue_df, on=['cluster', 'distance_um'], how='left')
+                export_df['p_value_source'] = 'simulation'
+
+        if aggregation_method:
+            export_df['aggregation_method'] = aggregation_method
+
+        preferred_columns = [
+            'roi_id',
+            'mode',
+            'distance_um',
+            'cluster',
+            'cluster_label',
+            'stat_value',
+            'p_value',
+            'p_value_adjusted',
+            'simulation_mean',
+            'simulation_std',
+            'simulation_count',
+        ]
+        remaining_columns = [column for column in export_df.columns if column not in preferred_columns]
+        ordered_columns = [column for column in preferred_columns if column in export_df.columns] + remaining_columns
+        return export_df.loc[:, ordered_columns]
+
+    def _export_sq_nhood_results(self):
+        """Export neighborhood enrichment results to CSV."""
+        roi_id = self._get_selected_roi(self.sq_nhood_roi_combo)
+        cluster_key = self.sq_nhood_cluster_combo.currentText()
+        aggregation_method = self.sq_nhood_agg_combo.currentText().lower() if roi_id is None else None
+
+        if roi_id is None:
+            adata = self.aggregated_results.get('nhood_enrichment')
+            roi_label = "All ROIs"
+        else:
+            adata = self.anndata_cache.get(roi_id)
+            roi_label = str(roi_id)
+
+        export_df = self._build_sq_nhood_export_df(
+            adata,
+            roi_label=roi_label,
+            cluster_key=cluster_key,
+            aggregation_method=aggregation_method,
+        )
+        if export_df.empty:
+            QtWidgets.QMessageBox.warning(self, "No Results", "No neighborhood enrichment results are available to export.")
+            return
+
+        filename = f"squidpy_nhood_enrichment_{self._sanitize_export_component(roi_label)}.csv"
+        self._export_table_to_csv(
+            export_df,
+            title="Export Neighborhood Enrichment Results",
+            default_filename=filename,
+            success_message="Neighborhood enrichment results exported to:",
+        )
+
+    def _export_sq_cooccur_results(self):
+        """Export co-occurrence results to CSV."""
+        roi_id = self._get_selected_roi(self.sq_cooccur_roi_combo)
+        cluster_key = self.sq_cooccur_cluster_combo.currentText()
+
+        if roi_id is None:
+            export_frames = []
+            for current_roi_id, adata in self.anndata_cache.items():
+                export_df = self._build_sq_cooccur_export_df(
+                    adata,
+                    roi_label=str(current_roi_id),
+                    cluster_key=cluster_key,
+                )
+                if not export_df.empty:
+                    export_frames.append(export_df)
+            export_df = pd.concat(export_frames, ignore_index=True, sort=False) if export_frames else pd.DataFrame()
+            roi_label = "all_rois"
+        else:
+            export_df = self._build_sq_cooccur_export_df(
+                self.anndata_cache.get(roi_id),
+                roi_label=str(roi_id),
+                cluster_key=cluster_key,
+            )
+            roi_label = str(roi_id)
+
+        if export_df.empty:
+            QtWidgets.QMessageBox.warning(self, "No Results", "No co-occurrence results are available to export.")
+            return
+
+        filename = f"squidpy_cooccurrence_{self._sanitize_export_component(roi_label)}.csv"
+        self._export_table_to_csv(
+            export_df,
+            title="Export Co-occurrence Results",
+            default_filename=filename,
+            success_message="Co-occurrence results exported to:",
+        )
+
+    def _export_sq_autocorr_results(self):
+        """Export spatial autocorrelation results to CSV."""
+        roi_id = self._get_selected_roi(self.sq_autocorr_roi_combo)
+        aggregation_method = self.sq_autocorr_agg_combo.currentText().lower() if roi_id is None else None
+
+        if roi_id is None:
+            adata = self.aggregated_results.get('autocorrelation')
+            roi_label = "All ROIs"
+        else:
+            adata = self.anndata_cache.get(roi_id)
+            roi_label = str(roi_id)
+
+        export_df = self._build_sq_autocorr_export_df(
+            adata,
+            roi_label=roi_label,
+            aggregation_method=aggregation_method,
+        )
+        if export_df.empty:
+            QtWidgets.QMessageBox.warning(self, "No Results", "No spatial autocorrelation results are available to export.")
+            return
+
+        filename = f"squidpy_autocorrelation_{self._sanitize_export_component(roi_label)}.csv"
+        self._export_table_to_csv(
+            export_df,
+            title="Export Spatial Autocorrelation Results",
+            default_filename=filename,
+            success_message="Spatial autocorrelation results exported to:",
+        )
+
+    def _export_sq_ripley_results(self):
+        """Export Ripley analysis results to CSV."""
+        roi_id = self._get_selected_roi(self.sq_ripley_roi_combo)
+        cluster_key = self.sq_ripley_cluster_combo.currentText()
+        aggregation_method = self.sq_ripley_agg_combo.currentText().lower() if roi_id is None else None
+
+        if roi_id is None:
+            adata = self.aggregated_results.get('ripley')
+            roi_label = "All ROIs"
+        else:
+            adata = self.anndata_cache.get(roi_id)
+            roi_label = str(roi_id)
+
+        export_df = self._build_sq_ripley_export_df(
+            adata,
+            roi_label=roi_label,
+            cluster_key=cluster_key,
+            aggregation_method=aggregation_method,
+        )
+        if export_df.empty:
+            QtWidgets.QMessageBox.warning(self, "No Results", "No Ripley analysis results are available to export.")
+            return
+
+        filename = f"squidpy_ripley_{self._sanitize_export_component(roi_label)}_{self.sq_ripley_mode_combo.currentText()}.csv"
+        self._export_table_to_csv(
+            export_df,
+            title="Export Ripley Results",
+            default_filename=filename,
+            success_message="Ripley analysis results exported to:",
+        )
     
     def _export_to_anndata(self):
         """Export data to AnnData format using core function."""
@@ -3062,7 +4055,14 @@ class AdvancedSpatialAnalysisDialog(QtWidgets.QDialog):
         
         # Disable save buttons
         save_button_names = [
-            'sq_nhood_save_btn', 'sq_cooccur_save_btn', 'sq_autocorr_save_btn', 'sq_ripley_save_btn'
+            'sq_nhood_save_btn',
+            'sq_nhood_export_btn',
+            'sq_cooccur_save_btn',
+            'sq_cooccur_export_btn',
+            'sq_autocorr_save_btn',
+            'sq_autocorr_export_btn',
+            'sq_ripley_save_btn',
+            'sq_ripley_export_btn',
         ]
         for btn_name in save_button_names:
             if hasattr(self, btn_name):
@@ -3098,15 +4098,19 @@ class AdvancedSpatialAnalysisDialog(QtWidgets.QDialog):
                 self.batch_corrected_dataframe = None
                 self.feature_dataframe = self.original_feature_dataframe.copy()
         
-        # Update cluster annotation map if available
-        if hasattr(parent, 'cluster_annotation_map'):
-            self.cluster_annotation_map = parent.cluster_annotation_map.copy()
-        
+        label_source = self._get_label_source_dialog()
+        if label_source is not None and hasattr(label_source, 'cluster_annotation_map'):
+            self.cluster_annotation_map = normalize_cluster_annotation_map(label_source.cluster_annotation_map or {})
+        if label_source is not None and hasattr(label_source, 'feature_label_map'):
+            self.feature_label_map = dict(label_source.feature_label_map or {})
+        self._apply_cluster_annotations_to_dataframes()
+
         # Clear AnnData cache since dataframe changed
         self.anndata_cache = {}
         
         # Refresh ROI combo boxes and other UI elements that depend on dataframe
         self._populate_roi_combo()
+        self._update_autocorr_var_combo()
     
     def on_clusters_changed(self):
         """Handle cluster changes - reset analysis and refresh dataframe."""

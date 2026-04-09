@@ -847,6 +847,24 @@ class TestFeatureExtractionRegression:
                                  if col not in metadata_cols]
         target_feature_cols = [col for col in target_features.columns 
                               if col not in metadata_cols]
+
+        unexpected_feature_cols = sorted(set(extracted_feature_cols) - set(target_feature_cols))
+        missing_feature_cols = sorted(set(target_feature_cols) - set(extracted_feature_cols))
+        if unexpected_feature_cols or missing_feature_cols:
+            error_msg = "Feature extraction schema regression detected:\n"
+            if unexpected_feature_cols:
+                error_msg += (
+                    f"  Unexpected extracted feature columns ({len(unexpected_feature_cols)}): "
+                    f"{unexpected_feature_cols[:10]}\n"
+                )
+            if missing_feature_cols:
+                error_msg += (
+                    f"  Missing extracted feature columns ({len(missing_feature_cols)}): "
+                    f"{missing_feature_cols[:10]}\n"
+                )
+            error_msg += f"\n  Extracted features saved to: {temp_dir / 'extracted_features.csv'}\n"
+            error_msg += f"  Target features: {target_features_path}\n"
+            pytest.fail(error_msg)
         
         # Find common feature columns
         common_cols = set(extracted_feature_cols) & set(target_feature_cols)
@@ -884,6 +902,22 @@ class TestFeatureExtractionRegression:
             
             extracted_vals = extracted_vals[valid_mask]
             target_vals = target_vals[valid_mask]
+
+            if (
+                pd.api.types.is_bool_dtype(extracted_features[col])
+                or pd.api.types.is_bool_dtype(target_features[col])
+            ):
+                if np.any(extracted_vals != target_vals):
+                    failed_cols.append({
+                        'column': col,
+                        'max_abs_diff': 1.0,
+                        'max_rel_diff': 1.0,
+                        'mean_abs_diff': float(np.mean(extracted_vals != target_vals)),
+                        'mean_rel_diff': 1.0,
+                    })
+                    max_abs_diff = max(max_abs_diff, 1.0)
+                    max_rel_diff = max(max_rel_diff, 1.0)
+                continue
             
             # Calculate differences
             abs_diff = np.abs(extracted_vals - target_vals)
@@ -941,4 +975,3 @@ class TestFeatureExtractionRegression:
         
         # If we get here, all features match within tolerance
         assert len(common_cols) > 0, "No common feature columns to compare"
-

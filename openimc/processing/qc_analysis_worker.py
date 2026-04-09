@@ -29,7 +29,7 @@ import tifffile
 
 from openimc.data.mcd_loader import MCDLoader, AcquisitionInfo
 from openimc.data.ometiff_loader import OMETIFFLoader
-from openimc.core import qc_analysis
+from openimc.core import _compute_cell_signal_metrics, qc_analysis
 
 # Optional scikit-image for pixel-level QC
 try:
@@ -43,8 +43,17 @@ except ImportError:
 def qc_process_acquisition_worker(task_data):
     """Thin wrapper around core.qc_analysis for multiprocessing."""
     
-    # Handle task format: (acq_id, original_acq_id, acq_name, channels, analysis_mode, mask_path, source_file, loader_type, acq_to_file_map)
-    if len(task_data) == 9:
+    denoise_settings = None
+    cell_signal_settings = None
+
+    # Handle task format:
+    # (acq_id, original_acq_id, acq_name, channels, analysis_mode, mask_path,
+    #  source_file, loader_type, acq_to_file_map, denoise_settings, cell_signal_settings)
+    if len(task_data) == 11:
+        acq_id, original_acq_id, acq_name, channels, analysis_mode, mask_path, loader_path, loader_type, _, denoise_settings, cell_signal_settings = task_data
+    elif len(task_data) == 10:
+        acq_id, original_acq_id, acq_name, channels, analysis_mode, mask_path, loader_path, loader_type, _, denoise_settings = task_data
+    elif len(task_data) == 9:
         acq_id, original_acq_id, acq_name, channels, analysis_mode, mask_path, loader_path, loader_type, _ = task_data
     elif len(task_data) == 8:
         # Old format (without loader_type): assume loader_type based on file extension
@@ -147,7 +156,9 @@ def qc_process_acquisition_worker(task_data):
                     acquisition=acquisition,
                     channels=channels,
                     mode=analysis_mode,
-                    mask=mask
+                    mask=mask,
+                    denoise_settings=denoise_settings,
+                    **(cell_signal_settings or {}),
                 )
             except Exception as e:
                 import traceback
@@ -252,7 +263,14 @@ def qc_calculate_pixel_metrics_worker(img: np.ndarray, channel: str) -> Optional
         return None
 
 
-def qc_calculate_cell_metrics_worker(img: np.ndarray, channel: str, mask: np.ndarray) -> Optional[Dict[str, Any]]:
+def qc_calculate_cell_metrics_worker(
+    img: np.ndarray,
+    channel: str,
+    mask: np.ndarray,
+    cell_signal_method: str = "positive_pixels",
+    positive_threshold_sd: float = 2.0,
+    upper_quantile: float = 0.90,
+) -> Optional[Dict[str, Any]]:
     """Calculate cell-level QC metrics using segmentation masks (module-level for multiprocessing).
     
     This is a separate worker function for QC analysis to avoid conflicts.
@@ -276,19 +294,26 @@ def qc_calculate_cell_metrics_worker(img: np.ndarray, channel: str, mask: np.nda
         foreground = img_float[cell_mask]
         background = img_float[background_mask]
         
-        # Calculate metrics
-        signal_mean = np.mean(foreground)
-        signal_std = np.std(foreground)
         background_mean = np.mean(background)
         background_std = np.std(background)
+        img_min = np.min(img_float)
+        img_max = np.max(img_float)
+        signal_metrics = _compute_cell_signal_metrics(
+            img_float,
+            mask,
+            float(background_mean),
+            float(background_std),
+            float(img_min),
+            float(img_max),
+            cell_signal_method=cell_signal_method,
+            positive_threshold_sd=positive_threshold_sd,
+            upper_quantile=upper_quantile,
+        )
+        signal_mean = signal_metrics['signal_mean']
+        signal_std = signal_metrics['signal_std']
+        snr = signal_metrics['snr']
         
-        # SNR: (signal_mean - background_mean) / background_std
-        if background_std > 0:
-            snr = (signal_mean - background_mean) / background_std
-        else:
-            snr = 0.0
-        
-        # Intensity metrics
+        # Intensity metrics (raw image intensities for consistency with core.qc_analysis)
         mean_intensity = np.mean(img_float)
         median_intensity = np.median(img_float)
         max_intensity = np.max(img_float)
@@ -309,6 +334,13 @@ def qc_calculate_cell_metrics_worker(img: np.ndarray, channel: str, mask: np.nda
             'signal_std': signal_std,
             'background_mean': background_mean,
             'background_std': background_std,
+            'cell_signal_method': cell_signal_method,
+            'signal_threshold': signal_metrics['signal_threshold'],
+            'signal_quantile': signal_metrics['signal_quantile'],
+            'n_signal_pixels': signal_metrics['n_signal_pixels'],
+            'n_signal_cells': signal_metrics['n_signal_cells'],
+            'signal_fraction': signal_metrics['signal_fraction'],
+            'signal_coverage_pct': signal_metrics['signal_coverage_pct'],
             'mean_intensity': mean_intensity,
             'median_intensity': median_intensity,
             'max_intensity': max_intensity,
@@ -325,4 +357,3 @@ def qc_calculate_cell_metrics_worker(img: np.ndarray, channel: str, mask: np.nda
     except Exception as e:
         print(f"Error calculating cell metrics for {channel}: {e}")
         return None
-

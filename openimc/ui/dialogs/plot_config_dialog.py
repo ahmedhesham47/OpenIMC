@@ -275,8 +275,8 @@ class PlotConfigDialog(QtWidgets.QDialog):
         self.orientation_label = QtWidgets.QLabel("Orientation:")
         orientation_layout.addWidget(self.orientation_label)
         self.orientation_combo = QtWidgets.QComboBox()
-        self.orientation_combo.addItems(["Portrait (Clusters on Y-axis)", "Landscape (Clusters on X-axis)"])
-        self.orientation_combo.setCurrentText("Portrait (Clusters on Y-axis)")
+        self.orientation_combo.addItems(["Landscape (Clusters on X-axis)", "Portrait (Clusters on Y-axis)"])
+        self.orientation_combo.setCurrentText("Landscape (Clusters on X-axis)")
         self.orientation_combo.setToolTip("Orientation of the cluster map: Portrait shows clusters on Y-axis, Landscape shows clusters on X-axis")
         self.orientation_combo.currentTextChanged.connect(self._on_orientation_changed)
         orientation_layout.addWidget(self.orientation_combo)
@@ -322,6 +322,49 @@ class PlotConfigDialog(QtWidgets.QDialog):
         cluster_cell_size_layout.addWidget(self.cluster_cell_size_spinbox)
         cluster_cell_size_layout.addStretch()
         heatmap_layout.addLayout(cluster_cell_size_layout)
+
+        # Cluster Map colorbar thickness (for Cluster Map only)
+        cluster_cbar_width_layout = QtWidgets.QHBoxLayout()
+        self.cluster_cbar_width_label = QtWidgets.QLabel("Colorbar thickness (in):")
+        cluster_cbar_width_layout.addWidget(self.cluster_cbar_width_label)
+        self.cluster_cbar_width_spinbox = QtWidgets.QDoubleSpinBox()
+        self.cluster_cbar_width_spinbox.setRange(0.05, 0.30)
+        self.cluster_cbar_width_spinbox.setSingleStep(0.01)
+        self.cluster_cbar_width_spinbox.setDecimals(2)
+        self.cluster_cbar_width_spinbox.setValue(0.08)
+        self.cluster_cbar_width_spinbox.setToolTip(
+            "Thickness of the Cluster Map colorbar in inches. Lower values keep more room for the map."
+        )
+        self.cluster_cbar_width_spinbox.valueChanged.connect(self._on_cluster_cbar_width_changed)
+        cluster_cbar_width_layout.addWidget(self.cluster_cbar_width_spinbox)
+        cluster_cbar_width_layout.addStretch()
+        heatmap_layout.addLayout(cluster_cbar_width_layout)
+
+        # Cluster Map colorbar position (for Cluster Map only)
+        cluster_cbar_pos_layout = QtWidgets.QHBoxLayout()
+        self.cluster_cbar_pos_label = QtWidgets.QLabel("Colorbar position:")
+        cluster_cbar_pos_layout.addWidget(self.cluster_cbar_pos_label)
+        self.cluster_cbar_pos_combo = QtWidgets.QComboBox()
+        self.cluster_cbar_pos_combo.addItems(["Upper right", "Upper left", "Right side"])
+        self.cluster_cbar_pos_combo.setCurrentText("Upper right")
+        self.cluster_cbar_pos_combo.setToolTip("Place colorbar outside the heatmap area.")
+        self.cluster_cbar_pos_combo.currentTextChanged.connect(self._on_cluster_cbar_position_changed)
+        cluster_cbar_pos_layout.addWidget(self.cluster_cbar_pos_combo)
+        cluster_cbar_pos_layout.addStretch()
+        heatmap_layout.addLayout(cluster_cbar_pos_layout)
+
+        # Cluster Map colorbar orientation (for Cluster Map only)
+        cluster_cbar_orientation_layout = QtWidgets.QHBoxLayout()
+        self.cluster_cbar_orientation_label = QtWidgets.QLabel("Colorbar orientation:")
+        cluster_cbar_orientation_layout.addWidget(self.cluster_cbar_orientation_label)
+        self.cluster_cbar_orientation_combo = QtWidgets.QComboBox()
+        self.cluster_cbar_orientation_combo.addItems(["Vertical", "Horizontal"])
+        self.cluster_cbar_orientation_combo.setCurrentText("Vertical")
+        self.cluster_cbar_orientation_combo.setToolTip("Rotate the Cluster Map colorbar while keeping it outside the heatmap.")
+        self.cluster_cbar_orientation_combo.currentTextChanged.connect(self._on_cluster_cbar_orientation_changed)
+        cluster_cbar_orientation_layout.addWidget(self.cluster_cbar_orientation_combo)
+        cluster_cbar_orientation_layout.addStretch()
+        heatmap_layout.addLayout(cluster_cbar_orientation_layout)
         
         self.heatmap_group.setLayout(heatmap_layout)
         content_layout.addWidget(self.heatmap_group)
@@ -553,6 +596,22 @@ class PlotConfigDialog(QtWidgets.QDialog):
             self.cluster_cell_size_label.setVisible(view == 'Cluster Map')
         if hasattr(self, 'cluster_cell_size_spinbox'):
             self.cluster_cell_size_spinbox.setVisible(view == 'Cluster Map')
+
+        # Cluster colorbar width: Only for Cluster Map
+        if hasattr(self, 'cluster_cbar_width_label'):
+            self.cluster_cbar_width_label.setVisible(view == 'Cluster Map')
+        if hasattr(self, 'cluster_cbar_width_spinbox'):
+            self.cluster_cbar_width_spinbox.setVisible(view == 'Cluster Map')
+
+        # Cluster colorbar position: Only for Cluster Map
+        if hasattr(self, 'cluster_cbar_pos_label'):
+            self.cluster_cbar_pos_label.setVisible(view == 'Cluster Map')
+        if hasattr(self, 'cluster_cbar_pos_combo'):
+            self.cluster_cbar_pos_combo.setVisible(view == 'Cluster Map')
+        if hasattr(self, 'cluster_cbar_orientation_label'):
+            self.cluster_cbar_orientation_label.setVisible(view == 'Cluster Map')
+        if hasattr(self, 'cluster_cbar_orientation_combo'):
+            self.cluster_cbar_orientation_combo.setVisible(view == 'Cluster Map')
         
         # Heatmap source: Only for Heatmap (not Cluster Map)
         if hasattr(self, 'heatmap_source_label'):
@@ -742,6 +801,27 @@ class PlotConfigDialog(QtWidgets.QDialog):
                 self.cluster_cell_size_spinbox.setValue(int(self.parent_dialog.cluster_map_cell_size))
         elif hasattr(self, 'cluster_cell_size_spinbox'):
             self.cluster_cell_size_spinbox.setValue(14)  # Default
+
+        # Cluster Map colorbar width
+        if hasattr(self.parent_dialog, 'cluster_map_colorbar_width'):
+            if hasattr(self, 'cluster_cbar_width_spinbox'):
+                self.cluster_cbar_width_spinbox.setValue(float(self.parent_dialog.cluster_map_colorbar_width))
+        elif hasattr(self, 'cluster_cbar_width_spinbox'):
+            self.cluster_cbar_width_spinbox.setValue(0.08)  # Default
+
+        # Cluster Map colorbar position
+        if hasattr(self.parent_dialog, 'cluster_map_colorbar_position'):
+            if hasattr(self, 'cluster_cbar_pos_combo'):
+                self.cluster_cbar_pos_combo.setCurrentText(str(self.parent_dialog.cluster_map_colorbar_position))
+        elif hasattr(self, 'cluster_cbar_pos_combo'):
+            self.cluster_cbar_pos_combo.setCurrentText("Upper right")  # Default
+
+        # Cluster Map colorbar orientation
+        if hasattr(self.parent_dialog, 'cluster_map_colorbar_orientation'):
+            if hasattr(self, 'cluster_cbar_orientation_combo'):
+                self.cluster_cbar_orientation_combo.setCurrentText(str(self.parent_dialog.cluster_map_colorbar_orientation))
+        elif hasattr(self, 'cluster_cbar_orientation_combo'):
+            self.cluster_cbar_orientation_combo.setCurrentText("Vertical")  # Default
         
         # Patient annotation - populate column options
         # Block signals to prevent triggering dialogs during population
@@ -864,6 +944,32 @@ class PlotConfigDialog(QtWidgets.QDialog):
         if hasattr(self.parent_dialog, 'view_combo') and self.parent_dialog.view_combo.currentText() == 'Cluster Map':
             if hasattr(self.parent_dialog, '_show_cluster_map'):
                 self.parent_dialog._show_cluster_map()
+
+    def _on_cluster_cbar_width_changed(self, value: float):
+        """Handle Cluster Map colorbar width change."""
+        if hasattr(self.parent_dialog, 'cluster_map_colorbar_width'):
+            self.parent_dialog.cluster_map_colorbar_width = float(value)
+        # Update parent dialog immediately if Cluster Map is active
+        if hasattr(self.parent_dialog, 'view_combo') and self.parent_dialog.view_combo.currentText() == 'Cluster Map':
+            if hasattr(self.parent_dialog, '_show_cluster_map'):
+                self.parent_dialog._show_cluster_map()
+
+    def _on_cluster_cbar_position_changed(self, text: str):
+        """Handle Cluster Map colorbar position change."""
+        if hasattr(self.parent_dialog, 'cluster_map_colorbar_position'):
+            self.parent_dialog.cluster_map_colorbar_position = str(text)
+        # Update parent dialog immediately if Cluster Map is active
+        if hasattr(self.parent_dialog, 'view_combo') and self.parent_dialog.view_combo.currentText() == 'Cluster Map':
+            if hasattr(self.parent_dialog, '_show_cluster_map'):
+                self.parent_dialog._show_cluster_map()
+
+    def _on_cluster_cbar_orientation_changed(self, text: str):
+        """Handle Cluster Map colorbar orientation change."""
+        if hasattr(self.parent_dialog, 'cluster_map_colorbar_orientation'):
+            self.parent_dialog.cluster_map_colorbar_orientation = str(text)
+        if hasattr(self.parent_dialog, 'view_combo') and self.parent_dialog.view_combo.currentText() == 'Cluster Map':
+            if hasattr(self.parent_dialog, '_show_cluster_map'):
+                self.parent_dialog._show_cluster_map()
     
     def _on_patient_annotation_changed(self, state: int):
         """Handle patient annotation checkbox change."""
@@ -971,6 +1077,16 @@ class PlotConfigDialog(QtWidgets.QDialog):
         # Cluster Map cell size
         if hasattr(self, 'cluster_cell_size_spinbox') and hasattr(self.parent_dialog, 'cluster_map_cell_size'):
             self.parent_dialog.cluster_map_cell_size = int(self.cluster_cell_size_spinbox.value())
+
+        # Cluster Map colorbar width
+        if hasattr(self, 'cluster_cbar_width_spinbox') and hasattr(self.parent_dialog, 'cluster_map_colorbar_width'):
+            self.parent_dialog.cluster_map_colorbar_width = float(self.cluster_cbar_width_spinbox.value())
+
+        # Cluster Map colorbar position
+        if hasattr(self, 'cluster_cbar_pos_combo') and hasattr(self.parent_dialog, 'cluster_map_colorbar_position'):
+            self.parent_dialog.cluster_map_colorbar_position = self.cluster_cbar_pos_combo.currentText()
+        if hasattr(self, 'cluster_cbar_orientation_combo') and hasattr(self.parent_dialog, 'cluster_map_colorbar_orientation'):
+            self.parent_dialog.cluster_map_colorbar_orientation = self.cluster_cbar_orientation_combo.currentText()
         
         # Refresh Cluster Map if it's the current view
         if hasattr(self.parent_dialog, 'view_combo') and self.parent_dialog.view_combo.currentText() == 'Cluster Map':

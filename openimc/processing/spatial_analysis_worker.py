@@ -28,6 +28,19 @@ import numpy as np
 import pandas as pd
 from scipy.spatial import cKDTree
 
+from openimc.ui.cluster_utils import canonicalize_cluster_id, sort_cluster_values
+
+
+def _count_cluster_pairs(label_codes: np.ndarray, edge_sources: np.ndarray, edge_targets: np.ndarray, n_clusters: int) -> np.ndarray:
+    """Count undirected cluster-cluster edge frequencies for a labeling."""
+    edge_codes_a = label_codes[edge_sources]
+    edge_codes_b = label_codes[edge_targets]
+    pair_low = np.minimum(edge_codes_a, edge_codes_b)
+    pair_high = np.maximum(edge_codes_a, edge_codes_b)
+    pair_indices = (pair_low * n_clusters + pair_high).astype(np.int64, copy=False)
+    counts = np.bincount(pair_indices, minlength=n_clusters * n_clusters)
+    return counts.reshape(n_clusters, n_clusters)
+
 
 def roi_enrichment_worker(args):
     """
@@ -46,117 +59,110 @@ def roi_enrichment_worker(args):
     Returns:
         List of dictionaries with enrichment statistics for all cluster pairs in this ROI
     """
-    import os
     roi_id, roi_df, roi_edges, cluster_col, n_perm, seed = args
-    
-    worker_pid = os.getpid()
-    
+
     results = []
-    
-    # Get unique clusters
-    unique_clusters = sorted(roi_df[cluster_col].dropna().unique())
+
+    if roi_df.empty or roi_edges.empty or cluster_col not in roi_df.columns:
+        return results
+
+    roi_cells = roi_df.loc[roi_df[cluster_col].notna(), ['cell_id', cluster_col]].copy()
+    roi_cells.loc[:, cluster_col] = roi_cells[cluster_col].map(canonicalize_cluster_id)
+    roi_cells = roi_cells.loc[roi_cells[cluster_col].notna()].copy()
+    unique_clusters = sort_cluster_values(roi_cells[cluster_col].unique(), canonical=True)
     if len(unique_clusters) < 2:
         return results
-    
-    # Create cell_id to cluster mapping
-    cell_to_cluster = dict(zip(roi_df['cell_id'], roi_df[cluster_col]))
-    
-    # Count observed edges between cluster pairs (optimized)
-    observed_edges = {}
-    # Convert edges to list of tuples for faster iteration
-    edge_list = [(int(row['cell_id_A']), int(row['cell_id_B'])) 
-                 for _, row in roi_edges.iterrows()]
-    
-    for cell_a, cell_b in edge_list:
-        cluster_a = cell_to_cluster.get(cell_a)
-        cluster_b = cell_to_cluster.get(cell_b)
-        
-        if cluster_a is not None and cluster_b is not None:
-            pair = tuple(sorted([cluster_a, cluster_b]))
-            observed_edges[pair] = observed_edges.get(pair, 0) + 1
-    
-    # Get cluster values as array for shuffling (reused for all pairs)
-    cluster_values = roi_df[cluster_col].values.copy()
-    cell_ids = roi_df['cell_id'].values
-    total_cells = len(roi_df)
-    total_edges = len(roi_edges)
-    
+
+    cluster_to_code = {cluster: idx for idx, cluster in enumerate(unique_clusters)}
+    cell_ids = roi_cells['cell_id'].astype(int).to_numpy()
+    cluster_codes = roi_cells[cluster_col].map(cluster_to_code).to_numpy(dtype=np.int32, copy=False)
+    cell_id_to_pos = {cell_id: idx for idx, cell_id in enumerate(cell_ids)}
+
+    edge_pairs = (
+        roi_edges[['cell_id_A', 'cell_id_B']]
+        .dropna()
+        .astype(int)
+        .to_numpy()
+    )
+    edge_sources = []
+    edge_targets = []
+    for cell_a, cell_b in edge_pairs:
+        pos_a = cell_id_to_pos.get(int(cell_a))
+        pos_b = cell_id_to_pos.get(int(cell_b))
+        if pos_a is None or pos_b is None:
+            continue
+        edge_sources.append(pos_a)
+        edge_targets.append(pos_b)
+
+    if not edge_sources:
+        return results
+
+    edge_sources = np.asarray(edge_sources, dtype=np.int32)
+    edge_targets = np.asarray(edge_targets, dtype=np.int32)
+
+    n_clusters = len(unique_clusters)
+    total_cells = int(cluster_codes.size)
+    total_edges = int(edge_sources.size)
     if total_edges == 0:
         return results
-    
-    # Process each cluster pair
-    for i, cluster_a in enumerate(unique_clusters):
-        for j, cluster_b in enumerate(unique_clusters):
-            if j < i:
-                continue
-            
-            pair = tuple(sorted([cluster_a, cluster_b]))
-            observed = observed_edges.get(pair, 0)
-            
-            # Get cells in each cluster
-            cells_a = set(roi_df[roi_df[cluster_col] == cluster_a]['cell_id'])
-            cells_b = set(roi_df[roi_df[cluster_col] == cluster_b]['cell_id'])
-            
-            n_a = len(cells_a)
-            n_b = len(cells_b)
-            
-            # Expected number of edges (proportional to cluster sizes)
-            if cluster_a == cluster_b:
-                # Self-pair: number of possible edges within group = n_a*(n_a-1)/2
-                expected = (n_a * (n_a - 1) / (total_cells * (total_cells - 1))) * total_edges
-            else:
-                # Cross-pair: number of possible edges between groups = n_a*n_b
-                expected = (2 * n_a * n_b / (total_cells * (total_cells - 1))) * total_edges
-            
-            # Permutation test for this cluster pair
-            permuted_counts = []
-            for perm_idx in range(n_perm):
-                # Use a different seed per pair AND permutation for independent null distributions
-                np.random.seed(seed + i * len(unique_clusters) * n_perm + j * n_perm + perm_idx)
-                # Shuffle cluster labels
-                shuffled_clusters = cluster_values.copy()
-                np.random.shuffle(shuffled_clusters)
-                
-                # Create temporary mapping
-                temp_cell_to_cluster = dict(zip(cell_ids, shuffled_clusters))
-                
-                # Count edges for this permutation
-                perm_count = 0
-                for cell_a, cell_b in edge_list:
-                    perm_cluster_a = temp_cell_to_cluster.get(cell_a)
-                    perm_cluster_b = temp_cell_to_cluster.get(cell_b)
-                    
-                    if perm_cluster_a is not None and perm_cluster_b is not None:
-                        perm_pair = tuple(sorted([perm_cluster_a, perm_cluster_b]))
-                        if perm_pair == pair:
-                            perm_count += 1
-                
-                permuted_counts.append(perm_count)
-            
-            # Calculate statistics
-            permuted_counts = np.array(permuted_counts)
-            expected_mean = np.mean(permuted_counts)
-            expected_std = np.std(permuted_counts)
-            
-            if expected_std > 0:
-                z_score = (observed - expected_mean) / expected_std
-                # Two-tailed p-value from permutation distribution
-                p_value = np.mean(np.abs(permuted_counts - expected_mean) >= abs(observed - expected_mean))
-            else:
-                z_score = 0.0
-                p_value = 1.0
-            
-            results.append({
-                'roi_id': str(roi_id),
-                'cluster_A': cluster_a,
-                'cluster_B': cluster_b,
-                'observed': observed,
-                'expected': expected,
-                'p_value': p_value,
-                'z_score': z_score,
-                'n_permutations': n_perm
-            })
-    
+
+    observed_counts = _count_cluster_pairs(cluster_codes, edge_sources, edge_targets, n_clusters)
+    cluster_sizes = np.bincount(cluster_codes, minlength=n_clusters)
+    pair_rows, pair_cols = np.triu_indices(n_clusters)
+    observed_vector = observed_counts[pair_rows, pair_cols]
+    permuted_vectors = np.empty((n_perm, len(pair_rows)), dtype=np.int32)
+
+    for perm_idx in range(n_perm):
+        shuffled_codes = cluster_codes.copy()
+        rng = np.random.RandomState(seed + perm_idx)
+        rng.shuffle(shuffled_codes)
+        permuted_counts = _count_cluster_pairs(shuffled_codes, edge_sources, edge_targets, n_clusters)
+        permuted_vectors[perm_idx] = permuted_counts[pair_rows, pair_cols]
+
+    expected_means = permuted_vectors.mean(axis=0)
+    expected_stds = permuted_vectors.std(axis=0)
+
+    denominator = total_cells * (total_cells - 1)
+    for pair_idx, (row_idx, col_idx) in enumerate(zip(pair_rows, pair_cols)):
+        cluster_a = unique_clusters[row_idx]
+        cluster_b = unique_clusters[col_idx]
+        observed = int(observed_vector[pair_idx])
+        n_a = int(cluster_sizes[row_idx])
+        n_b = int(cluster_sizes[col_idx])
+
+        if denominator <= 0:
+            expected = 0.0
+        elif row_idx == col_idx:
+            expected = (n_a * (n_a - 1) / denominator) * total_edges
+        else:
+            expected = (2 * n_a * n_b / denominator) * total_edges
+
+        expected_mean = float(expected_means[pair_idx])
+        expected_std = float(expected_stds[pair_idx])
+
+        if expected_std > 0:
+            z_score = float((observed - expected_mean) / expected_std)
+            p_value = float(
+                np.mean(
+                    np.abs(permuted_vectors[:, pair_idx] - expected_mean)
+                    >= abs(observed - expected_mean)
+                )
+            )
+        else:
+            z_score = 0.0
+            p_value = 1.0
+
+        results.append({
+            'roi_id': str(roi_id),
+            'cluster_A': cluster_a,
+            'cluster_B': cluster_b,
+            'observed': observed,
+            'expected': float(expected),
+            'p_value': p_value,
+            'z_score': z_score,
+            'n_permutations': n_perm
+        })
+
     return results
 
 
@@ -258,92 +264,87 @@ def distance_distribution_worker(args):
         List of dictionaries with distance data for this ROI
     """
     roi_id, roi_df, cluster_col, pixel_size_um = args
-    
+
     distance_data = []
-    
-    # Convert coordinates to micrometers
-    coords_um = roi_df[["centroid_x", "centroid_y"]].to_numpy() * pixel_size_um
-    cell_ids = roi_df["cell_id"].astype(int).to_numpy()
-    cell_clusters = roi_df[cluster_col].values
-    
-    # Get unique clusters in this ROI, filtering out NaN values
-    unique_clusters = sorted([c for c in roi_df[cluster_col].dropna().unique() if pd.notna(c)])
-    
+
+    if roi_df.empty or cluster_col not in roi_df.columns:
+        return distance_data
+
+    roi_cells = roi_df.loc[
+        roi_df[cluster_col].notna(),
+        ['cell_id', 'centroid_x', 'centroid_y', cluster_col],
+    ].copy()
+    roi_cells.loc[:, cluster_col] = roi_cells[cluster_col].map(canonicalize_cluster_id)
+    roi_cells = roi_cells.loc[roi_cells[cluster_col].notna()].copy()
+    if roi_cells.empty:
+        return distance_data
+
+    coords_um = roi_cells[["centroid_x", "centroid_y"]].to_numpy(dtype=float) * float(pixel_size_um)
+    cell_ids = roi_cells["cell_id"].astype(int).to_numpy()
+    cell_clusters = roi_cells[cluster_col].to_numpy()
+    unique_clusters = sort_cluster_values(roi_cells[cluster_col].unique(), canonical=True)
+
     if len(unique_clusters) == 0:
         return distance_data
-    
-    # Create KDTree for efficient nearest neighbor search
-    tree = cKDTree(coords_um)
-    
-    # Pre-compute cluster masks for efficiency
-    cluster_masks = {}
+
+    cluster_targets = {}
     for cluster in unique_clusters:
-        cluster_masks[cluster] = (cell_clusters == cluster)
-    
-    # For each cell, find nearest neighbor of each cluster type
-    for pos_idx in range(len(roi_df)):
-        cell_id = int(cell_ids[pos_idx])
-        cell_cluster = cell_clusters[pos_idx]
-        cell_coord = coords_um[pos_idx]
-        
-        # Skip cells with NaN cluster assignments
-        if pd.isna(cell_cluster):
+        cluster_indices = np.flatnonzero(cell_clusters == cluster)
+        if cluster_indices.size == 0:
             continue
-        
-        # Find nearest neighbor for each cluster type
-        for target_cluster in unique_clusters:
-            # Get mask for target cluster
-            target_mask = cluster_masks[target_cluster]
-            
-            if target_cluster == cell_cluster:
-                # For same cluster, find nearest neighbor excluding self
-                # Create mask excluding current cell
-                target_mask_excluding_self = target_mask.copy()
-                target_mask_excluding_self[pos_idx] = False
-                
-                if np.sum(target_mask_excluding_self) < 1:
-                    continue
-                
-                # Get coordinates of target cells (excluding self)
-                target_coords = coords_um[target_mask_excluding_self]
-                target_cell_ids = cell_ids[target_mask_excluding_self]
-                
-                # Use KDTree query to find nearest neighbor
-                # Query with k=2 to get self and nearest neighbor, then take the second one
-                if len(target_coords) > 0:
-                    # Create a tree for target cells only
-                    target_tree = cKDTree(target_coords)
-                    min_distance, nearest_target_idx = target_tree.query(cell_coord, k=1)
-                    nearest_cell_id = int(target_cell_ids[nearest_target_idx])
-                else:
-                    min_distance = float('inf')
-                    nearest_cell_id = None
+        cluster_targets[cluster] = {
+            'indices': cluster_indices,
+            'cell_ids': cell_ids[cluster_indices],
+            'tree': cKDTree(coords_um[cluster_indices]),
+        }
+
+    for target_cluster in unique_clusters:
+        target_info = cluster_targets.get(target_cluster)
+        if target_info is None:
+            continue
+
+        nearest_distances, nearest_indices = target_info['tree'].query(coords_um, k=1)
+        nearest_distances = np.asarray(nearest_distances, dtype=float)
+        nearest_indices = np.asarray(nearest_indices)
+        nearest_cell_ids = target_info['cell_ids'][nearest_indices].astype(np.int64, copy=False)
+        valid_mask = np.isfinite(nearest_distances)
+
+        same_cluster_mask = cell_clusters == target_cluster
+        if np.any(same_cluster_mask):
+            if len(target_info['cell_ids']) < 2:
+                valid_mask[same_cluster_mask] = False
             else:
-                # For different clusters, find nearest neighbor
-                if not np.any(target_mask):
-                    continue
-                
-                # Get coordinates of target cells
-                target_coords = coords_um[target_mask]
-                target_cell_ids = cell_ids[target_mask]
-                
-                # Use KDTree query to find nearest neighbor
-                # Create a temporary tree for just the target cluster
-                target_tree = cKDTree(target_coords)
-                min_distance, nearest_target_idx = target_tree.query(cell_coord, k=1)
-                nearest_cell_id = int(target_cell_ids[nearest_target_idx])
-            
-            # Record the nearest neighbor distance
-            if min_distance != float('inf') and nearest_cell_id is not None:
-                distance_data.append({
-                    'roi_id': roi_id,
-                    'cell_A_id': cell_id,
-                    'cell_A_cluster': cell_cluster,
-                    'nearest_B_cluster': target_cluster,
-                    'nearest_B_dist_um': float(min_distance),
-                    'nearest_B_cell_id': nearest_cell_id
-                })
-    
+                same_coords = coords_um[same_cluster_mask]
+                same_cell_ids = cell_ids[same_cluster_mask]
+                same_distances, same_indices = target_info['tree'].query(same_coords, k=2)
+                same_distances = np.atleast_2d(same_distances).astype(float, copy=False)
+                same_indices = np.atleast_2d(same_indices)
+                same_neighbor_ids = target_info['cell_ids'][same_indices].astype(np.int64, copy=False)
+                first_is_other = same_neighbor_ids[:, 0] != same_cell_ids
+                replacement_col = np.where(first_is_other, 0, 1)
+                row_positions = np.arange(len(same_cell_ids))
+                same_nearest_distances = same_distances[row_positions, replacement_col]
+                same_nearest_cell_ids = same_neighbor_ids[row_positions, replacement_col]
+                nearest_distances[same_cluster_mask] = same_nearest_distances
+                nearest_cell_ids[same_cluster_mask] = same_nearest_cell_ids
+                valid_mask[same_cluster_mask] = (
+                    np.isfinite(same_nearest_distances)
+                    & (same_nearest_cell_ids != same_cell_ids)
+                )
+
+        valid_indices = np.flatnonzero(valid_mask)
+        distance_data.extend(
+            {
+                'roi_id': roi_id,
+                'cell_A_id': int(cell_ids[idx]),
+                'cell_A_cluster': cell_clusters[idx],
+                'nearest_B_cluster': target_cluster,
+                'nearest_B_dist_um': float(nearest_distances[idx]),
+                'nearest_B_cell_id': int(nearest_cell_ids[idx]),
+            }
+            for idx in valid_indices
+        )
+
     return distance_data
 
 
@@ -490,4 +491,3 @@ def ripley_worker(args):
         })
     
     return ripley_data
-

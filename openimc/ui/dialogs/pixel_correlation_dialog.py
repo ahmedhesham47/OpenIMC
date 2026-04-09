@@ -40,8 +40,9 @@ from statsmodels.stats.multitest import multipletests
 from openimc.data.mcd_loader import MCDLoader, AcquisitionInfo
 from openimc.data.ometiff_loader import OMETIFFLoader
 from openimc.core import pixel_correlation
+from openimc.ui.figure_layout import fit_canvas_and_draw
 from openimc.ui.dialogs.figure_save_dialog import save_figure_with_options
-from openimc.ui.dialogs.progress_dialog import ProgressDialog
+from openimc.ui.dialogs.progress_dialog import run_blocking_task_with_progress_then_finalize
 from openimc.utils.logger import get_logger
 import tifffile
 import multiprocessing as mp
@@ -400,7 +401,58 @@ class PixelCorrelationDialog(QtWidgets.QDialog):
         self.analyze_within_masks = False
         
         self._create_ui()
+        self._plot_resize_in_progress = False
+        self._plot_resize_timer = QtCore.QTimer(self)
+        self._plot_resize_timer.setSingleShot(True)
+        self._plot_resize_timer.timeout.connect(self._refresh_current_plot_after_resize)
+        if hasattr(self, 'tabs'):
+            self.tabs.currentChanged.connect(self._queue_plot_resize_refresh)
         self._check_masks_available()  # This will set default to "Within Cell Masks" if masks exist
+
+    def _fit_correlation_canvas(self):
+        """Fit the correlation heatmap to the live canvas and redraw."""
+        if self.correlation_canvas.width() < 10 or self.correlation_canvas.height() < 10:
+            return
+        rect = [0.0, 0.0, 1.0, 0.96] if getattr(self.correlation_canvas.figure, '_suptitle', None) is not None else None
+        fit_canvas_and_draw(self.correlation_canvas, rect=rect, pad=0.95, allow_text_compaction=True)
+
+    def _queue_plot_resize_refresh(self, *_args):
+        """Debounce heatmap reflow while the dialog or tabs resize."""
+        if self._plot_resize_in_progress or not self.isVisible():
+            return
+        if getattr(self, 'tabs', None) is None or self.tabs.currentIndex() != 1:
+            return
+        if not self.correlation_canvas.figure.axes:
+            return
+        self._plot_resize_timer.start(140)
+
+    def _refresh_current_plot_after_resize(self):
+        """Refit the correlation heatmap after a resize or tab switch."""
+        if self._plot_resize_in_progress:
+            return
+        if getattr(self, 'tabs', None) is None or self.tabs.currentIndex() != 1:
+            return
+        if not self.correlation_canvas.figure.axes:
+            return
+        try:
+            self._plot_resize_in_progress = True
+            self._fit_correlation_canvas()
+        finally:
+            self._plot_resize_in_progress = False
+
+    def resizeEvent(self, event):
+        """Keep the visible correlation heatmap fitted to the dialog."""
+        super().resizeEvent(event)
+        if event is None:
+            return
+        try:
+            old_size = event.oldSize()
+            new_size = event.size()
+            if old_size.isValid() and new_size == old_size:
+                return
+        except Exception:
+            pass
+        self._queue_plot_resize_refresh()
     
     def _on_use_conditions_changed(self, checked):
         """Handle use conditions checkbox change."""
@@ -1031,7 +1083,7 @@ class PixelCorrelationDialog(QtWidgets.QDialog):
                 return ", ".join(sorted_files[:3]) + f" and {len(sorted_files) - 3} more"
     
     def _run_analysis(self):
-        """Run pixel-level correlation analysis with multiprocessing."""
+        """Run pixel-level correlation analysis with responsive progress handling."""
         use_conditions = self.use_conditions_chk.isChecked()
         
         if use_conditions:
@@ -1061,12 +1113,7 @@ class PixelCorrelationDialog(QtWidgets.QDialog):
         
         # Get selected channels
         selected_channels = self._get_selected_channels()
-        
-        # Show progress dialog
-        progress_dlg = ProgressDialog("Running Correlation Analysis...", self)
-        progress_dlg.update_progress(0, "Correlating pixel intensities...", "Preparing analysis...")
-        progress_dlg.show()
-        QtWidgets.QApplication.processEvents()
+        temp_mask_paths = []
         
         try:
             # Prepare tasks for multiprocessing - one task per ROI
@@ -1097,6 +1144,7 @@ class PixelCorrelationDialog(QtWidgets.QDialog):
                                 try:
                                     mask = self.parent_window.segmentation_masks[acq_id]
                                     tifffile.imwrite(mask_path, mask.astype(np.uint32))
+                                    temp_mask_paths.append(mask_path)
                                 except Exception:
                                     mask_path = None
                             else:
@@ -1140,6 +1188,7 @@ class PixelCorrelationDialog(QtWidgets.QDialog):
                             try:
                                 mask = self.parent_window.segmentation_masks[acq_id]
                                 tifffile.imwrite(mask_path, mask.astype(np.uint32))
+                                temp_mask_paths.append(mask_path)
                             except Exception:
                                 mask_path = None
                         else:
@@ -1162,343 +1211,72 @@ class PixelCorrelationDialog(QtWidgets.QDialog):
                     roi_info.append((None, acq_name, acq_id))
             
             if not tasks:
-                progress_dlg.close()
                 QtWidgets.QMessageBox.warning(
                     self,
                     "No Tasks",
                     "No ROIs to process."
                 )
                 return
-            
-            # Group tasks by file path
-            # IMPORTANT: Only group MCD files together. OME-TIFF files should be processed individually
-            # (one file per worker) since each OME-TIFF file is typically a single acquisition.
-            # MCD files need grouping to avoid file locking issues with readimc.
-            from collections import defaultdict
-            file_groups = defaultdict(list)
-            file_roi_info = defaultdict(list)  # Map file_path to list of roi_info indices
-            ometiff_tasks = []  # OME-TIFF tasks processed individually
-            ometiff_roi_info = []  # ROI info for OME-TIFF tasks
-            
-            for i, task in enumerate(tasks):
-                file_path = task[2]  # file_path is at index 2 in the task tuple
-                loader_type = task[3]  # loader_type is at index 3 in the task tuple
-                
-                # Only group MCD files. OME-TIFF files are processed individually
-                if loader_type == "mcd":
-                    file_groups[file_path].append(task)
-                    file_roi_info[file_path].append(i)
+
+            num_workers = max(1, min(mp.cpu_count() - 2, len(tasks)))
+
+            def _compute_correlations():
+                return self._execute_pixel_correlation_tasks(tasks, roi_info, num_workers)
+
+            def _finalize_correlations(all_correlations, _progress):
+                if not all_correlations:
+                    QtWidgets.QMessageBox.warning(
+                        self,
+                        "No Results",
+                        "No correlation data was computed. Please check your data and settings."
+                    )
+                    return
+
+                self.correlation_results = pd.DataFrame(all_correlations)
+                self._aggregate_results(use_conditions)
+                self._update_results_display(use_conditions)
+
+                logger = get_logger()
+                acquisitions = []
+                if use_conditions:
+                    for widget in self.condition_widgets:
+                        _, roi_items = widget.get_condition_data()
+                        if roi_items:
+                            for acq_id, acq_name, file_path, loader_type in roi_items:
+                                acquisitions.append(acq_id)
                 else:
-                    # OME-TIFF: each file gets its own "group" (will be processed individually)
-                    ometiff_tasks.append(task)
-                    ometiff_roi_info.append(i)
-            
-            # Process with multiprocessing
-            all_correlations = []
-            total_tasks = len(tasks)
-            num_unique_files = len(file_groups) + len(ometiff_tasks)  # Count MCD groups + OME-TIFF files
-            progress_dlg.set_maximum(total_tasks)
-            
-            # Use ProcessPoolExecutor for true parallelization
-            # Use spawn method to ensure isolation
-            num_workers = max(1, min(mp.cpu_count() - 2, total_tasks))
-            if num_workers > 1 and total_tasks > 1:
-                ctx = mp.get_context('spawn')
-                
-                # Process each file sequentially, but all ROIs from each file in parallel
-                file_num = 0
-                completed_rois = 0
-                worker_timeout = 300  # 5 minutes per worker
-                
-                try:
-                    for file_path, file_tasks in file_groups.items():
-                        file_num += 1
-                        file_basename = os.path.basename(file_path) if os.path.isfile(file_path) else os.path.basename(os.path.dirname(file_path))
-                        file_roi_indices = file_roi_info[file_path]
-                        
-                        if progress_dlg.is_cancelled():
-                            break
-                        
-                        # Update progress for file start
-                        progress_dlg.update_progress(
-                            completed_rois,
-                            f"File {file_num}/{num_unique_files}: {file_basename}",
-                            f"Processing {len(file_tasks)} ROIs from this file..."
-                        )
-                        QtWidgets.QApplication.processEvents()
-                        
-                        with ctx.Pool(processes=min(num_workers, len(file_tasks))) as pool:
-                            # Submit all ROIs from this file
-                            futures = []
-                            for task in file_tasks:
-                                future = pool.apply_async(_correlation_process_roi_worker, (task,))
-                                futures.append(future)
-                            
-                            # Collect results as they complete
-                            completed_for_file = 0
-                            for roi_idx, future in enumerate(futures):
-                                if progress_dlg.is_cancelled():
-                                    pool.terminate()
-                                    pool.join()
-                                    break
-                                
-                                try:
-                                    correlations = future.get(timeout=worker_timeout)
-                                    if correlations:
-                                        # Add ROI metadata using the original roi_info index
-                                        roi_info_idx = file_roi_indices[roi_idx]
-                                        condition_name, acq_name, acq_id = roi_info[roi_info_idx]
-                                        for corr_data in correlations:
-                                            if condition_name:
-                                                corr_data['condition'] = condition_name
-                                            corr_data['roi'] = acq_name
-                                            corr_data['roi_id'] = acq_id
-                                        all_correlations.extend(correlations)
-                                    completed_for_file += 1
-                                    completed_rois += 1
-                                    
-                                    # Update progress
-                                    progress = int((completed_rois / total_tasks) * 100)
-                                    progress_dlg.update_progress(
-                                        completed_rois,
-                                        f"File {file_num}/{num_unique_files}: {file_basename}",
-                                        f"Processed {completed_for_file}/{len(file_tasks)} ROIs from this file ({completed_rois}/{total_tasks} total)"
-                                    )
-                                    QtWidgets.QApplication.processEvents()
-                                except mp.TimeoutError:
-                                    print(f"[PixelCorr] [ERROR] Pixel correlation timed out for ROI from {file_basename} after {worker_timeout}s")
-                                    completed_for_file += 1
-                                    completed_rois += 1
-                                    progress = int((completed_rois / total_tasks) * 100)
-                                    progress_dlg.update_progress(
-                                        completed_rois,
-                                        f"File {file_num}/{num_unique_files}: {file_basename}",
-                                        f"Processed {completed_for_file}/{len(file_tasks)} ROIs from this file..."
-                                    )
-                                    QtWidgets.QApplication.processEvents()
-                                except Exception as e:
-                                    # Handle errors
-                                    print(f"[PixelCorr] [ERROR] Pixel correlation failed for ROI from {file_basename}: {e}")
-                                    import traceback
-                                    traceback.print_exc()
-                                    completed_for_file += 1
-                                    completed_rois += 1
-                                    progress = int((completed_rois / total_tasks) * 100)
-                                    progress_dlg.update_progress(
-                                        completed_rois,
-                                        f"File {file_num}/{num_unique_files}: {file_basename}",
-                                        f"Processed {completed_for_file}/{len(file_tasks)} ROIs from this file..."
-                                    )
-                                    QtWidgets.QApplication.processEvents()
-                        
-                        print(f"[PixelCorr] Completed MCD file {file_basename}: {completed_for_file}/{len(file_tasks)} ROIs")
-                    
-                    # Process OME-TIFF files: each file individually (one file = one worker)
-                    # OME-TIFF files don't need grouping since each file is typically a single acquisition
-                    # and there are no file locking issues with OME-TIFF loaders
-                    if ometiff_tasks:
-                        print(f"[PixelCorr] Processing {len(ometiff_tasks)} OME-TIFF files individually")
-                        with ctx.Pool(processes=min(num_workers, len(ometiff_tasks))) as pool:
-                            futures = []
-                            for task in ometiff_tasks:
-                                future = pool.apply_async(_correlation_process_roi_worker, (task,))
-                                futures.append(future)
-                            
-                            # Collect results as they complete
-                            completed_ometiff = 0
-                            
-                            for roi_idx, future in enumerate(futures):
-                                if progress_dlg.is_cancelled():
-                                    pool.terminate()
-                                    pool.join()
-                                    break
-                                
-                                try:
-                                    correlations = future.get(timeout=worker_timeout)
-                                    if correlations:
-                                        # Add ROI metadata using the original roi_info index
-                                        roi_info_idx = ometiff_roi_info[roi_idx]
-                                        condition_name, acq_name, acq_id = roi_info[roi_info_idx]
-                                        for corr_data in correlations:
-                                            if condition_name:
-                                                corr_data['condition'] = condition_name
-                                            corr_data['roi'] = acq_name
-                                            corr_data['roi_id'] = acq_id
-                                        all_correlations.extend(correlations)
-                                    completed_ometiff += 1
-                                    completed_rois += 1
-                                    
-                                    # Update progress
-                                    progress = int((completed_rois / total_tasks) * 100)
-                                    progress_dlg.update_progress(
-                                        completed_rois,
-                                        f"Processing OME-TIFF files...",
-                                        f"Processed {completed_ometiff}/{len(ometiff_tasks)} OME-TIFF files ({completed_rois}/{total_tasks} total)"
-                                    )
-                                    QtWidgets.QApplication.processEvents()
-                                except mp.TimeoutError:
-                                    print(f"[PixelCorr] [ERROR] Pixel correlation timed out for OME-TIFF ROI after {worker_timeout}s")
-                                    completed_ometiff += 1
-                                    completed_rois += 1
-                                    progress = int((completed_rois / total_tasks) * 100)
-                                    progress_dlg.update_progress(
-                                        completed_rois,
-                                        f"Processing OME-TIFF files...",
-                                        f"Processed {completed_ometiff}/{len(ometiff_tasks)} OME-TIFF files..."
-                                    )
-                                    QtWidgets.QApplication.processEvents()
-                                except Exception as e:
-                                    import traceback
-                                    traceback.print_exc()
-                                    print(f"[PixelCorr] [ERROR] Pixel correlation failed for OME-TIFF ROI: {e}")
-                                    completed_ometiff += 1
-                                    completed_rois += 1
-                                    progress = int((completed_rois / total_tasks) * 100)
-                                    progress_dlg.update_progress(
-                                        completed_rois,
-                                        f"Processing OME-TIFF files...",
-                                        f"Processed {completed_ometiff}/{len(ometiff_tasks)} OME-TIFF files..."
-                                    )
-                                    QtWidgets.QApplication.processEvents()
-                        
-                        print(f"[PixelCorr] Completed {completed_ometiff}/{len(ometiff_tasks)} OME-TIFF files")
-                    
-                    # Final update
-                    progress_dlg.update_progress(
-                        total_tasks,
-                        "Correlating pixel intensities...",
-                        f"Processed {completed_rois}/{total_tasks} ROIs"
-                    )
-                    QtWidgets.QApplication.processEvents()
-                
-                except Exception as mp_error:
-                    print(f"[PixelCorr] Multiprocessing failed, falling back to sequential processing: {mp_error}")
-                    import traceback
-                    traceback.print_exc()
-                    progress_dlg.update_progress(0, "Multiprocessing failed, using sequential processing", "Processing ROIs one by one")
-                    
-                    # Fallback to sequential processing
-                    for i, task in enumerate(tasks):
-                        if progress_dlg.is_cancelled():
-                            break
-                        
-                        try:
-                            correlations = _correlation_process_roi_worker(task)
-                            if correlations:
-                                # Add ROI metadata
-                                condition_name, acq_name, acq_id = roi_info[i]
-                                for corr_data in correlations:
-                                    if condition_name:
-                                        corr_data['condition'] = condition_name
-                                    corr_data['roi'] = acq_name
-                                    corr_data['roi_id'] = acq_id
-                                all_correlations.extend(correlations)
-                            
-                            progress_dlg.update_progress(
-                                i + 1,
-                                "Correlating pixel intensities...",
-                                f"Processing ROI {i + 1} of {total_tasks}: {roi_info[i][1]}"
-                            )
-                            QtWidgets.QApplication.processEvents()
-                        except Exception as e:
-                            print(f"[PixelCorr] [ERROR] Sequential pixel correlation failed: {e}")
-                            import traceback
-                            traceback.print_exc()
-            else:
-                # Single-threaded processing (fallback)
-                for i, task in enumerate(tasks):
-                    if progress_dlg.is_cancelled():
-                        break
-                    
-                    correlations = _correlation_process_roi_worker(task)
-                    if correlations:
-                        # Add ROI metadata
-                        condition_name, acq_name, acq_id = roi_info[i]
-                        for corr_data in correlations:
-                            if condition_name:
-                                corr_data['condition'] = condition_name
-                            corr_data['roi'] = acq_name
-                            corr_data['roi_id'] = acq_id
-                        all_correlations.extend(correlations)
-                    
-                    progress_dlg.update_progress(
-                        i + 1,
-                        "Correlating pixel intensities...",
-                        f"Processing ROI {i + 1} of {total_tasks}: {roi_info[i][1]}"
-                    )
-                    QtWidgets.QApplication.processEvents()
-            
-            # Clean up temp mask files
-            import tempfile
-            temp_dir = tempfile.gettempdir()
-            for condition_name, acq_name, acq_id in roi_info:
-                temp_mask_path = os.path.join(temp_dir, f"corr_mask_{acq_id}.tif")
-                if os.path.exists(temp_mask_path):
-                    try:
-                        os.remove(temp_mask_path)
-                    except Exception:
-                        pass
-            
-            if not all_correlations:
-                progress_dlg.close()
-                QtWidgets.QMessageBox.warning(
-                    self,
-                    "No Results",
-                    "No correlation data was computed. Please check your data and settings."
+                    for acq_id, acq_name, file_path, loader_type in self.roi_items:
+                        acquisitions.append(acq_id)
+
+                params = {
+                    "scope": "within_cell_masks" if self.analyze_within_masks else "entire_roi",
+                    "selected_channels": self._get_selected_channels() is not None,
+                    "n_channels": len(self._get_selected_channels()) if self._get_selected_channels() else "all",
+                    "use_conditions": use_conditions
+                }
+                source_file = self._get_source_files_for_logging()
+
+                logger._write_entry(
+                    entry_type="pixel_correlation",
+                    operation="spearman_correlation",
+                    parameters=params,
+                    acquisitions=acquisitions,
+                    notes=f"Pixel-level correlation analysis: {len(self.correlation_results)} marker pair correlations computed",
+                    source_file=source_file
                 )
-                return
-            
-            # Create results dataframe
-            self.correlation_results = pd.DataFrame(all_correlations)
-            
-            # Aggregate results
-            self._aggregate_results(use_conditions)
-            
-            # Update UI
-            self._update_results_display(use_conditions)
-            
-            progress_dlg.close()
-            
-            # Log pixel correlation analysis
-            logger = get_logger()
-            # Collect acquisition IDs
-            acquisitions = []
-            if use_conditions:
-                for widget in self.condition_widgets:
-                    name, roi_items = widget.get_condition_data()
-                    if roi_items:
-                        for acq_id, acq_name, file_path, loader_type in roi_items:
-                            acquisitions.append(acq_id)
-            else:
-                for acq_id, acq_name, file_path, loader_type in self.roi_items:
-                    acquisitions.append(acq_id)
-            
-            params = {
-                "scope": "within_cell_masks" if self.analyze_within_masks else "entire_roi",
-                "selected_channels": self._get_selected_channels() is not None,
-                "n_channels": len(self._get_selected_channels()) if self._get_selected_channels() else "all",
-                "use_conditions": use_conditions
-            }
-            source_file = self._get_source_files_for_logging()
-            
-            logger._write_entry(
-                entry_type="pixel_correlation",
-                operation="spearman_correlation",
-                parameters=params,
-                acquisitions=acquisitions,
-                notes=f"Pixel-level correlation analysis: {len(self.correlation_results)} marker pair correlations computed",
-                source_file=source_file
-            )
-            
-            QtWidgets.QMessageBox.information(
-                self,
-                "Analysis Complete",
-                f"Correlation analysis completed successfully.\n"
-                f"Computed {len(self.correlation_results)} marker pair correlations."
+
+            run_blocking_task_with_progress_then_finalize(
+                parent=self,
+                window_title="Running Correlation Analysis",
+                initial_message="Running pixel-level correlation analysis",
+                detail_text="Processing ROIs and marker pairs in the background.",
+                task=_compute_correlations,
+                finalize=_finalize_correlations,
+                finishing_message="Rendering correlation results",
+                finishing_detail_text="Updating the heatmap and result table.",
             )
             
         except Exception as e:
-            progress_dlg.close()
             QtWidgets.QMessageBox.critical(
                 self,
                 "Analysis Error",
@@ -1506,6 +1284,94 @@ class PixelCorrelationDialog(QtWidgets.QDialog):
             )
             import traceback
             traceback.print_exc()
+        finally:
+            for temp_mask_path in temp_mask_paths:
+                if temp_mask_path and os.path.exists(temp_mask_path):
+                    try:
+                        os.remove(temp_mask_path)
+                    except Exception:
+                        pass
+
+    def _execute_pixel_correlation_tasks(self, tasks, roi_info, num_workers: int):
+        """Execute ROI correlation tasks without blocking the UI thread."""
+        from collections import defaultdict
+
+        file_groups = defaultdict(list)
+        file_roi_info = defaultdict(list)
+        ometiff_tasks = []
+        ometiff_roi_info = []
+        for index, task in enumerate(tasks):
+            file_path = task[2]
+            loader_type = task[3]
+            if loader_type == "mcd":
+                file_groups[file_path].append(task)
+                file_roi_info[file_path].append(index)
+            else:
+                ometiff_tasks.append(task)
+                ometiff_roi_info.append(index)
+
+        all_correlations = []
+        total_tasks = len(tasks)
+        worker_timeout = 300
+        num_workers = max(1, min(int(num_workers), total_tasks))
+
+        def _append_with_metadata(correlations, info_index):
+            if not correlations:
+                return
+            condition_name, acq_name, acq_id = roi_info[info_index]
+            for corr_data in correlations:
+                if condition_name:
+                    corr_data['condition'] = condition_name
+                corr_data['roi'] = acq_name
+                corr_data['roi_id'] = acq_id
+            all_correlations.extend(correlations)
+
+        if num_workers > 1 and total_tasks > 1:
+            ctx = mp.get_context('spawn')
+            try:
+                for file_path, file_tasks in file_groups.items():
+                    file_roi_indices = file_roi_info[file_path]
+                    with ctx.Pool(processes=min(num_workers, len(file_tasks))) as pool:
+                        futures = [pool.apply_async(_correlation_process_roi_worker, (task,)) for task in file_tasks]
+                        for roi_idx, future in enumerate(futures):
+                            try:
+                                correlations = future.get(timeout=worker_timeout)
+                                _append_with_metadata(correlations, file_roi_indices[roi_idx])
+                            except mp.TimeoutError:
+                                print(f"[PixelCorr] [ERROR] Pixel correlation timed out after {worker_timeout}s")
+                            except Exception as exc:
+                                print(f"[PixelCorr] [ERROR] Pixel correlation failed: {exc}")
+
+                if ometiff_tasks:
+                    with ctx.Pool(processes=min(num_workers, len(ometiff_tasks))) as pool:
+                        futures = [pool.apply_async(_correlation_process_roi_worker, (task,)) for task in ometiff_tasks]
+                        for roi_idx, future in enumerate(futures):
+                            try:
+                                correlations = future.get(timeout=worker_timeout)
+                                _append_with_metadata(correlations, ometiff_roi_info[roi_idx])
+                            except mp.TimeoutError:
+                                print(f"[PixelCorr] [ERROR] Pixel correlation timed out after {worker_timeout}s")
+                            except Exception as exc:
+                                print(f"[PixelCorr] [ERROR] Pixel correlation failed: {exc}")
+            except Exception as mp_error:
+                print(f"[PixelCorr] Multiprocessing failed, falling back to sequential processing: {mp_error}")
+                traceback.print_exc()
+                all_correlations = []
+                for index, task in enumerate(tasks):
+                    try:
+                        correlations = _correlation_process_roi_worker(task)
+                        _append_with_metadata(correlations, index)
+                    except Exception as exc:
+                        print(f"[PixelCorr] [ERROR] Sequential pixel correlation failed: {exc}")
+        else:
+            for index, task in enumerate(tasks):
+                try:
+                    correlations = _correlation_process_roi_worker(task)
+                    _append_with_metadata(correlations, index)
+                except Exception as exc:
+                    print(f"[PixelCorr] [ERROR] Sequential pixel correlation failed: {exc}")
+
+        return all_correlations
     
     def _process_roi(self, acq_id: str, acq_name: str, file_path: str, loader_type: str, selected_channels: Optional[List[str]]):
         """Process a single ROI and return correlations."""
@@ -1757,8 +1623,7 @@ class PixelCorrelationDialog(QtWidgets.QDialog):
             self._plot_single_heatmap(markers, ax)
             ax.set_title("Pixel-Level Correlation Matrix", fontsize=12)
         
-        fig.tight_layout()
-        self.correlation_canvas.draw()
+        self._fit_correlation_canvas()
     
     def _plot_single_heatmap(self, markers: List[str], ax):
         """Plot single heatmap for all ROIs."""
@@ -1974,4 +1839,3 @@ class PixelCorrelationDialog(QtWidgets.QDialog):
                     "Export Error",
                     f"Error exporting results: {str(e)}"
                 )
-

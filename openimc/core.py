@@ -30,7 +30,7 @@ import sys
 import gc
 import multiprocessing as mp
 from pathlib import Path
-from typing import TYPE_CHECKING, Any, Dict, List, Optional, Tuple, Union
+from typing import TYPE_CHECKING, Any, Dict, List, Literal, Optional, Tuple, Union
 
 if TYPE_CHECKING:
     import anndata as ad
@@ -75,12 +75,227 @@ from openimc.processing.spillover_matrix import (
 )
 from openimc.processing.deconvolution_worker import RLD_HRIMC_circle
 from openimc.processing.spatial_analysis_worker import roi_enrichment_worker, distance_distribution_worker
+from openimc.ui.cluster_utils import canonicalize_cluster_id, sort_cluster_values
 from openimc.ui.utils import (
     arcsinh_normalize,
+    benjamini_hochberg_adjust_matrix,
     percentile_clip_normalize,
     channelwise_minmax_normalize,
-    combine_channels
+    combine_channels,
+    combine_pvalues_fisher,
 )
+
+QC_CELL_SIGNAL_METHODS = (
+    "positive_pixels",
+    "upper_quantile",
+    "all_cell_mean",
+)
+
+
+def _validate_qc_cell_signal_method(method: str) -> str:
+    """Validate the configured QC cell signal method."""
+    if method not in QC_CELL_SIGNAL_METHODS:
+        raise ValueError(
+            f"Invalid cell_signal_method {method!r}; expected one of {QC_CELL_SIGNAL_METHODS}"
+        )
+    return method
+
+
+def _qc_min_background_std(
+    background_mean: float,
+    background_std: float,
+    img_min: Optional[float] = None,
+    img_max: Optional[float] = None,
+) -> float:
+    """Return the robust minimum background standard deviation used in QC."""
+    min_std_relative = abs(background_mean) * 0.001
+    min_std_absolute = 1e-6
+    min_std_range = 0.0
+    if img_min is not None and img_max is not None:
+        img_range = img_max - img_min
+        if img_range > 0:
+            min_std_range = img_range * 0.0001
+    return max(float(background_std), min_std_relative, min_std_absolute, min_std_range)
+
+
+def _calculate_qc_snr(
+    signal_mean: float,
+    background_mean: float,
+    background_std: float,
+    img_min: Optional[float] = None,
+    img_max: Optional[float] = None,
+) -> float:
+    """Calculate Signal-to-Noise Ratio with robust handling."""
+    signal_diff = signal_mean - background_mean
+    min_std = _qc_min_background_std(background_mean, background_std, img_min, img_max)
+    return signal_diff / min_std
+
+
+def _compute_cell_signal_metrics(
+    img: np.ndarray,
+    mask: np.ndarray,
+    background_mean: float,
+    background_std: float,
+    img_min: float,
+    img_max: float,
+    *,
+    cell_signal_method: str = "positive_pixels",
+    positive_threshold_sd: float = 2.0,
+    upper_quantile: float = 0.90,
+) -> Dict[str, Any]:
+    """Compute cell-level QC signal metrics for the configured signal definition."""
+    method = _validate_qc_cell_signal_method(cell_signal_method)
+    if positive_threshold_sd < 0:
+        raise ValueError("positive_threshold_sd must be non-negative")
+    if not (0.0 < upper_quantile <= 1.0):
+        raise ValueError("upper_quantile must be in the interval (0, 1]")
+
+    cell_mask = mask > 0
+    total_cell_pixels = int(np.count_nonzero(cell_mask))
+    total_pixels = int(mask.size)
+
+    signal_threshold = np.nan
+    signal_quantile = np.nan
+
+    if total_cell_pixels == 0 or total_pixels == 0:
+        return {
+            "signal_mean": float(background_mean),
+            "signal_std": 0.0,
+            "snr": 0.0,
+            "signal_threshold": signal_threshold,
+            "signal_quantile": signal_quantile,
+            "n_signal_pixels": 0,
+            "n_signal_cells": 0,
+            "signal_fraction": 0.0,
+            "signal_coverage_pct": 0.0,
+        }
+
+    cell_ids = np.unique(mask[cell_mask])
+    n_cells = int(len(cell_ids))
+    cell_pixels = img[cell_mask]
+
+    if method == "all_cell_mean":
+        signal_pixels = cell_pixels
+        n_signal_cells = n_cells
+    elif method == "positive_pixels":
+        sigma_bg_robust = _qc_min_background_std(background_mean, background_std, img_min, img_max)
+        signal_threshold = float(background_mean + (positive_threshold_sd * sigma_bg_robust))
+        signal_mask = cell_mask & (img > signal_threshold)
+        signal_pixels = img[signal_mask]
+        if signal_pixels.size == 0:
+            return {
+                "signal_mean": float(background_mean),
+                "signal_std": 0.0,
+                "snr": 0.0,
+                "signal_threshold": signal_threshold,
+                "signal_quantile": signal_quantile,
+                "n_signal_pixels": 0,
+                "n_signal_cells": 0,
+                "signal_fraction": 0.0,
+                "signal_coverage_pct": 0.0,
+            }
+        n_signal_cells = int(len(np.unique(mask[signal_mask])))
+    else:
+        signal_quantile = float(upper_quantile)
+        try:
+            from scipy import ndimage as ndi
+
+            cell_counts = ndi.labeled_comprehension(
+                np.ones_like(img, dtype=np.float64),
+                mask,
+                cell_ids,
+                np.sum,
+                float,
+                0.0,
+            )
+            cell_sums = ndi.labeled_comprehension(
+                img.astype(np.float64),
+                mask,
+                cell_ids,
+                np.sum,
+                float,
+                0.0,
+            )
+            valid_cells = cell_counts > 0
+            valid_cell_ids = cell_ids[valid_cells]
+            if not np.any(valid_cells):
+                return {
+                    "signal_mean": float(background_mean),
+                    "signal_std": 0.0,
+                    "snr": 0.0,
+                    "signal_threshold": signal_threshold,
+                    "signal_quantile": signal_quantile,
+                    "n_signal_pixels": 0,
+                    "n_signal_cells": 0,
+                    "signal_fraction": 0.0,
+                    "signal_coverage_pct": 0.0,
+                }
+            cell_means = np.divide(
+                cell_sums[valid_cells],
+                cell_counts[valid_cells],
+                out=np.zeros_like(cell_sums[valid_cells], dtype=np.float64),
+                where=(cell_counts[valid_cells] > 0),
+            )
+        except ImportError:
+            valid_cell_ids = []
+            cell_means = []
+            cell_mask_values = mask[cell_mask]
+            for cell_id in cell_ids:
+                cell_values = cell_pixels[cell_mask_values == cell_id]
+                if len(cell_values) == 0:
+                    continue
+                valid_cell_ids.append(cell_id)
+                cell_means.append(float(np.mean(cell_values)))
+            if not valid_cell_ids:
+                return {
+                    "signal_mean": float(background_mean),
+                    "signal_std": 0.0,
+                    "snr": 0.0,
+                    "signal_threshold": signal_threshold,
+                    "signal_quantile": signal_quantile,
+                    "n_signal_pixels": 0,
+                    "n_signal_cells": 0,
+                    "signal_fraction": 0.0,
+                    "signal_coverage_pct": 0.0,
+                }
+            valid_cell_ids = np.asarray(valid_cell_ids)
+            cell_means = np.asarray(cell_means, dtype=np.float64)
+
+        cutoff = float(np.quantile(cell_means, upper_quantile))
+        selected_cell_ids = np.asarray(valid_cell_ids)[cell_means >= cutoff]
+        if selected_cell_ids.size == 0:
+            return {
+                "signal_mean": float(background_mean),
+                "signal_std": 0.0,
+                "snr": 0.0,
+                "signal_threshold": signal_threshold,
+                "signal_quantile": signal_quantile,
+                "n_signal_pixels": 0,
+                "n_signal_cells": 0,
+                "signal_fraction": 0.0,
+                "signal_coverage_pct": 0.0,
+            }
+        signal_mask = np.isin(mask, selected_cell_ids)
+        signal_pixels = img[signal_mask]
+        n_signal_cells = int(selected_cell_ids.size)
+
+    n_signal_pixels = int(signal_pixels.size)
+    signal_mean = float(np.mean(signal_pixels))
+    signal_std = float(np.std(signal_pixels))
+    signal_fraction = float(n_signal_pixels / total_cell_pixels) if total_cell_pixels > 0 else 0.0
+    signal_coverage_pct = float((n_signal_pixels / total_pixels) * 100.0) if total_pixels > 0 else 0.0
+
+    return {
+        "signal_mean": signal_mean,
+        "signal_std": signal_std,
+        "snr": _calculate_qc_snr(signal_mean, background_mean, background_std, img_min, img_max),
+        "signal_threshold": signal_threshold,
+        "signal_quantile": signal_quantile,
+        "n_signal_pixels": n_signal_pixels,
+        "n_signal_cells": n_signal_cells,
+        "signal_fraction": signal_fraction,
+        "signal_coverage_pct": signal_coverage_pct,
+    }
 
 
 def load_mcd(
@@ -1848,64 +2063,74 @@ def pixel_correlation(
         if len(channels) > n_channels:
             channels = channels[:n_channels]
     
-    # Flatten images and apply mask if provided
-    pixel_data = {}
-    for i, channel in enumerate(channels):
-        if i >= n_channels:
+    all_channels = loader.get_channels(original_acq_id)
+    selected_pairs = []
+    for channel in channels:
+        if channel not in all_channels:
             continue
-        # Extract channel from HWC format: (H, W, C) -> (H, W)
-        channel_img = img_stack[:, :, i] if img_stack.ndim == 3 else img_stack
-        
-        if mask is not None:
-            # Only use pixels within cells
-            if mask.shape == channel_img.shape:
-                cell_mask = mask > 0
-                pixels = channel_img[cell_mask]
-            else:
-                # Mask dimensions don't match, skip mask
-                pixels = channel_img.flatten()
-        else:
-            # Use all pixels
-            pixels = channel_img.flatten()
-        
-        # Remove NaN and infinite values
-        pixels = pixels[~np.isnan(pixels) & ~np.isinf(pixels)]
-        pixel_data[channel] = pixels
-    
-    # Compute pairwise correlations
-    correlations = []
-    channel_list = list(pixel_data.keys())
-    for i, ch1 in enumerate(channel_list):
-        for j, ch2 in enumerate(channel_list):
-            if i >= j:  # Only compute upper triangle
-                continue
-            
-            data1 = pixel_data[ch1]
-            data2 = pixel_data[ch2]
-            
-            # Ensure same length (take minimum)
-            min_len = min(len(data1), len(data2))
-            if min_len < 3:  # Need at least 3 points for correlation
-                continue
-            
-            data1 = data1[:min_len]
-            data2 = data2[:min_len]
-            
-            # Compute Spearman correlation
-            try:
-                corr_coef, p_value = spearmanr(data1, data2)
-                
-                if not np.isnan(corr_coef) and not np.isinf(corr_coef):
-                    correlations.append({
-                        'marker1': ch1,
-                        'marker2': ch2,
-                        'correlation': corr_coef,
-                        'p_value': p_value,
-                        'n_pixels': min_len
-                    })
-            except Exception:
-                continue
-    
+        channel_idx = all_channels.index(channel)
+        if channel_idx >= n_channels:
+            continue
+        selected_pairs.append((channel, channel_idx))
+
+    if len(selected_pairs) < 2:
+        return pd.DataFrame(columns=['marker1', 'marker2', 'correlation', 'p_value', 'n_pixels'])
+
+    selected_channels = [channel for channel, _ in selected_pairs]
+    selected_indices = [channel_idx for _, channel_idx in selected_pairs]
+    pixel_matrix = img_stack[:, :, selected_indices].reshape(-1, len(selected_indices)).astype(np.float64, copy=False)
+
+    if mask is not None and mask.shape == img_stack.shape[:2]:
+        pixel_matrix = pixel_matrix[mask.reshape(-1) > 0]
+
+    if pixel_matrix.size == 0:
+        return pd.DataFrame(columns=['marker1', 'marker2', 'correlation', 'p_value', 'n_pixels'])
+
+    valid_rows = np.all(np.isfinite(pixel_matrix), axis=1)
+    pixel_matrix = pixel_matrix[valid_rows]
+    n_pixels = int(pixel_matrix.shape[0])
+    if n_pixels < 3:
+        return pd.DataFrame(columns=['marker1', 'marker2', 'correlation', 'p_value', 'n_pixels'])
+
+    # Compute correlations for all marker pairs in a single vectorized call.
+    corr_result = spearmanr(pixel_matrix, axis=0)
+    corr_matrix = getattr(corr_result, 'statistic', corr_result[0] if isinstance(corr_result, tuple) else corr_result)
+    p_matrix = getattr(corr_result, 'pvalue', corr_result[1] if isinstance(corr_result, tuple) else None)
+    corr_matrix = np.asarray(corr_matrix, dtype=float)
+    p_matrix = np.asarray(p_matrix, dtype=float) if p_matrix is not None else np.full_like(corr_matrix, np.nan, dtype=float)
+
+    if corr_matrix.ndim == 0 and len(selected_channels) == 2:
+        corr_value = float(corr_matrix)
+        p_value = float(p_matrix) if np.ndim(p_matrix) == 0 else np.nan
+        correlations = [{
+            'marker1': selected_channels[0],
+            'marker2': selected_channels[1],
+            'correlation': corr_value,
+            'p_value': p_value,
+            'n_pixels': n_pixels,
+        }] if np.isfinite(corr_value) else []
+    else:
+        correlations = []
+        if corr_matrix.ndim != 2:
+            return pd.DataFrame(columns=['marker1', 'marker2', 'correlation', 'p_value', 'n_pixels'])
+        # Compute pairwise correlations
+        channel_list = list(selected_channels)
+        for i, ch1 in enumerate(channel_list):
+            for j, ch2 in enumerate(channel_list):
+                if i >= j:  # Only compute upper triangle
+                    continue
+                corr_coef = corr_matrix[i, j]
+                p_value = p_matrix[i, j] if p_matrix.ndim == 2 else np.nan
+                if np.isnan(corr_coef) or np.isinf(corr_coef):
+                    continue
+                correlations.append({
+                    'marker1': ch1,
+                    'marker2': ch2,
+                    'correlation': float(corr_coef),
+                    'p_value': float(p_value),
+                    'n_pixels': n_pixels,
+                })
+
     # Create results dataframe
     if not correlations:
         return pd.DataFrame(columns=['marker1', 'marker2', 'correlation', 'p_value', 'n_pixels'])
@@ -1930,7 +2155,11 @@ def qc_analysis(
     acquisition: AcquisitionInfo,
     channels: List[str],
     mode: str = "pixel",
-    mask: Optional[np.ndarray] = None
+    mask: Optional[np.ndarray] = None,
+    denoise_settings: Optional[Dict[str, Dict[str, dict]]] = None,
+    cell_signal_method: Literal["positive_pixels", "upper_quantile", "all_cell_mean"] = "positive_pixels",
+    positive_threshold_sd: float = 2.0,
+    upper_quantile: float = 0.90,
 ) -> pd.DataFrame:
     """Perform quality control analysis on IMC data.
     
@@ -1944,6 +2173,11 @@ def qc_analysis(
         channels: List of channel names to analyze
         mode: Analysis mode ('pixel' or 'cell')
         mask: Optional segmentation mask (required for 'cell' mode)
+        denoise_settings: Optional per-channel denoise settings applied before QC
+        cell_signal_method: Cell-mode signal selection method
+        positive_threshold_sd: Number of robust background SDs above background_mean
+            used for the positive-pixel threshold method
+        upper_quantile: Quantile in (0, 1] used for the upper-quantile cell method
     
     Returns:
         DataFrame with QC metrics per channel
@@ -1958,20 +2192,7 @@ def qc_analysis(
     except ImportError:
         _HAVE_SCIKIT_IMAGE = False
     
-    def _calculate_snr(signal_mean: float, background_mean: float, background_std: float,
-                      img_min: Optional[float] = None, img_max: Optional[float] = None) -> float:
-        """Calculate Signal-to-Noise Ratio with robust handling."""
-        signal_diff = signal_mean - background_mean
-        min_std_relative = abs(background_mean) * 0.001
-        min_std_absolute = 1e-6
-        min_std_range = 0.0
-        if img_min is not None and img_max is not None:
-            img_range = img_max - img_min
-            if img_range > 0:
-                min_std_range = img_range * 0.0001
-        min_std = max(background_std, min_std_relative, min_std_absolute, min_std_range)
-        snr = signal_diff / min_std
-        return snr
+    cell_signal_method = _validate_qc_cell_signal_method(cell_signal_method)
     
     results = []
     
@@ -2032,6 +2253,9 @@ def qc_analysis(
             
             if img is None:
                 continue
+
+            if denoise_settings and channel in denoise_settings:
+                img = _apply_denoise_to_channel(img, channel, denoise_settings[channel])
             
             # Optimize: compute statistics more efficiently without flattening
             # Use np.nanmin/nanmax for better performance on large arrays
@@ -2082,7 +2306,7 @@ def qc_analysis(
                             background_mean = img_mean
                             background_std = img_std
                         
-                        snr = _calculate_snr(signal_mean, background_mean, background_std, img_min, img_max)
+                        snr = _calculate_qc_snr(signal_mean, background_mean, background_std, img_min, img_max)
                         coverage = float(len(signal_pixels) / img.size) if img.size > 0 else 0.0
                     except Exception:
                         # Fallback if Otsu fails
@@ -2124,65 +2348,13 @@ def qc_analysis(
                 if mask.shape != img.shape:
                     continue
                 
-                # Get unique cell IDs first (needed for both paths)
-                cell_ids = np.unique(mask[mask > 0])
+                cell_mask = mask > 0
+                background_mask = mask == 0
+                cell_ids = np.unique(mask[cell_mask])
                 if len(cell_ids) == 0:
                     continue
                 
-                # Optimize: vectorized cell intensity calculation using scipy.ndimage
-                # This is much faster than looping through each cell
-                try:
-                    from scipy import ndimage as ndi
-                    
-                    # Vectorized calculation: use labeled_comprehension to compute mean intensity per cell
-                    # This computes mean intensity per cell in one pass (much faster than per-cell loops)
-                    cell_counts = ndi.labeled_comprehension(
-                        np.ones_like(img, dtype=np.float64),
-                        mask, cell_ids, np.sum, float, 0.0
-                    )
-                    cell_sums = ndi.labeled_comprehension(
-                        img.astype(np.float64),
-                        mask, cell_ids, np.sum, float, 0.0
-                    )
-                    
-                    # Avoid division by zero
-                    valid_cells = cell_counts > 0
-                    if np.any(valid_cells):
-                        cell_intensities = np.divide(
-                            cell_sums[valid_cells],
-                            cell_counts[valid_cells],
-                            out=np.zeros_like(cell_sums[valid_cells], dtype=np.float64),
-                            where=(cell_counts[valid_cells] > 0)
-                        )
-                        signal_mean = float(np.mean(cell_intensities))
-                        signal_std = float(np.std(cell_intensities))
-                    else:
-                        signal_mean = img_mean
-                        signal_std = img_std
-                    
-                except ImportError:
-                    # Fallback to optimized loop if scipy not available
-                    # Optimized: use boolean indexing more efficiently
-                    cell_mask = mask > 0
-                    cell_pixels = img[cell_mask]
-                    cell_mask_values = mask[cell_mask]
-                    
-                    # Group by cell_id using numpy operations
-                    cell_intensities = []
-                    for cell_id in cell_ids:
-                        # More efficient: use boolean indexing on already-masked arrays
-                        cell_intensity = np.mean(cell_pixels[cell_mask_values == cell_id])
-                        cell_intensities.append(cell_intensity)
-                    
-                    if len(cell_intensities) == 0:
-                        continue
-                    
-                    cell_intensities = np.array(cell_intensities)
-                    signal_mean = float(np.mean(cell_intensities))
-                    signal_std = float(np.std(cell_intensities))
-                
                 # Background is pixels outside cells - vectorized
-                background_mask = mask == 0
                 if np.any(background_mask):
                     background_pixels = img[background_mask]
                     background_mean = float(np.mean(background_pixels))
@@ -2190,8 +2362,21 @@ def qc_analysis(
                 else:
                     background_mean = img_mean
                     background_std = img_std
-                
-                snr = _calculate_snr(signal_mean, background_mean, background_std, img_min, img_max)
+
+                signal_metrics = _compute_cell_signal_metrics(
+                    img,
+                    mask,
+                    background_mean,
+                    background_std,
+                    img_min,
+                    img_max,
+                    cell_signal_method=cell_signal_method,
+                    positive_threshold_sd=positive_threshold_sd,
+                    upper_quantile=upper_quantile,
+                )
+                signal_mean = signal_metrics["signal_mean"]
+                signal_std = signal_metrics["signal_std"]
+                snr = signal_metrics["snr"]
                 
                 # Coverage: fraction of pixels covered by cells - optimized
                 n_cell_pixels = np.sum(mask > 0)
@@ -2211,6 +2396,13 @@ def qc_analysis(
                     'signal_std': signal_std,
                     'background_mean': background_mean,
                     'background_std': background_std,
+                    'cell_signal_method': cell_signal_method,
+                    'signal_threshold': signal_metrics['signal_threshold'],
+                    'signal_quantile': signal_metrics['signal_quantile'],
+                    'n_signal_pixels': signal_metrics['n_signal_pixels'],
+                    'n_signal_cells': signal_metrics['n_signal_cells'],
+                    'signal_fraction': signal_metrics['signal_fraction'],
+                    'signal_coverage_pct': signal_metrics['signal_coverage_pct'],
                     'intensity_mean': img_mean,
                     'intensity_std': img_std,
                     'intensity_median': img_median,
@@ -2570,29 +2762,35 @@ def spatial_enrichment(
     n_workers = max(1, n_workers)
     
     
+    edge_groups = {}
+    if edges_df is not None and not edges_df.empty and 'roi_id' in edges_df.columns:
+        for roi_id, roi_edges in edges_df.groupby('roi_id', sort=False):
+            edge_groups[str(roi_id)] = roi_edges.loc[:, ['cell_id_A', 'cell_id_B']].copy()
+
     # Collect all ROIs first
     roi_tasks = []
     for roi_id, roi_df in features_df.groupby(roi_column):
-        roi_edges = edges_df[edges_df['roi_id'] == str(roi_id)]
+        roi_edges = edge_groups.get(str(roi_id))
         
-        if roi_edges.empty:
+        if roi_edges is None or roi_edges.empty:
             continue
         
-        # Get unique clusters
-        unique_clusters = sorted(roi_df[cluster_column].dropna().unique())
+        cluster_values = roi_df[cluster_column].map(canonicalize_cluster_id).dropna()
+        unique_clusters = sort_cluster_values(cluster_values.unique(), canonical=True)
         if len(unique_clusters) < 2:
             continue
         
         # Prepare ROI task for worker
         roi_tasks.append((
             roi_id,
-            roi_df.copy(),  # Copy to avoid shared state issues
-            roi_edges.copy(),  # Copy to avoid shared state issues
+            roi_df.loc[:, ['cell_id', cluster_column]].copy(),
+            roi_edges,
             cluster_column,
             n_permutations,
             seed + len(roi_tasks)  # Unique seed for each ROI
         ))
     
+    n_workers = min(n_workers, len(roi_tasks)) if roi_tasks else 1
     
     # Process ROIs with multiprocessing
     enrichment_results = []
@@ -2680,19 +2878,20 @@ def spatial_distance_distribution(
     # Collect all ROIs first
     roi_tasks = []
     for roi_id, roi_df in features_df.groupby(roi_column):
-        # Get unique clusters
-        unique_clusters = sorted(roi_df[cluster_column].dropna().unique())
+        cluster_values = roi_df[cluster_column].map(canonicalize_cluster_id).dropna()
+        unique_clusters = sort_cluster_values(cluster_values.unique(), canonical=True)
         if len(unique_clusters) < 1:
             continue
         
         # Prepare ROI task for worker
         roi_tasks.append((
             str(roi_id),
-            roi_df.copy(),  # Copy to avoid shared state issues
+            roi_df.loc[:, ['cell_id', 'centroid_x', 'centroid_y', cluster_column]].copy(),
             cluster_column,
             pixel_size_um
         ))
     
+    n_workers = min(n_workers, len(roi_tasks)) if roi_tasks else 1
     
     # Process ROIs with multiprocessing
     distance_results = []
@@ -2790,7 +2989,15 @@ def dataframe_to_anndata(
         
         # Create AnnData object
         # X: feature matrix (intensity and morphology features)
-        X = df[feature_cols].values if feature_cols else np.zeros((len(df), 0))
+        if feature_cols:
+            X = (
+                df[feature_cols]
+                .apply(pd.to_numeric, errors='coerce')
+                .astype(float)
+                .to_numpy()
+            )
+        else:
+            X = np.zeros((len(df), 0), dtype=float)
         
         # obs: cell metadata
         obs = df[list(metadata_cols & set(df.columns))].copy()
@@ -2813,7 +3020,7 @@ def dataframe_to_anndata(
                 break
         
         if cluster_col:
-            adata.obs['cluster'] = df[cluster_col].values
+            adata.obs['cluster'] = df[cluster_col].map(canonicalize_cluster_id).values
         
         return adata
         
@@ -2913,8 +3120,12 @@ def build_spatial_graph_anndata(
         # Ensure cluster columns are categorical (required by squidpy)
         for col in ['cluster', 'cluster_phenotype', 'cluster_id']:
             if col in adata.obs.columns:
+                if col in {'cluster', 'cluster_id'}:
+                    adata.obs[col] = adata.obs[col].map(canonicalize_cluster_id)
                 if not hasattr(adata.obs[col], 'cat'):
                     adata.obs[col] = adata.obs[col].astype('category')
+                ordered_categories = sort_cluster_values(adata.obs[col].cat.categories, canonical=True)
+                adata.obs[col] = adata.obs[col].cat.reorder_categories(ordered_categories, ordered=True)
         
         # Build spatial graph
         coords = adata.obsm['spatial']
@@ -3028,11 +3239,66 @@ def spatial_neighborhood_enrichment(
     try:
         import squidpy as sq
         import anndata as ad
+        from squidpy._utils import _get_n_cores, parallelize
+        from squidpy.gr._nhood import _create_function, _nhood_enrichment_helper
     except ImportError:
         raise ImportError("squidpy and anndata are required for neighborhood enrichment")
+
+    def _run_nhood_permutation_test(adata: 'ad.AnnData', *, seed: int = 0, n_perms: int = 1000) -> Dict[str, np.ndarray]:
+        """Mirror Squidpy's permutation test while retaining empirical p-values."""
+        adjacency = adata.obsp['spatial_connectivities'].tocsr()
+        cluster_series = adata.obs[cluster_key]
+        cluster_values = list(cluster_series.cat.categories)
+        cluster_to_code = {cluster: idx for idx, cluster in enumerate(cluster_values)}
+        int_clust = np.asarray([cluster_to_code[value] for value in cluster_series], dtype=np.uint32)
+        indices = adjacency.indices.astype(np.uint32, copy=False)
+        indptr = adjacency.indptr.astype(np.uint32, copy=False)
+        n_clusters = len(cluster_values)
+
+        count_fn = _create_function(n_clusters, parallel=False)
+        observed = count_fn(indices, indptr, int_clust)
+
+        n_jobs = _get_n_cores(None)
+        permutations = parallelize(
+            _nhood_enrichment_helper,
+            collection=np.arange(n_perms).tolist(),
+            extractor=np.vstack,
+            n_jobs=n_jobs,
+            backend='loky',
+            show_progress_bar=False,
+        )(
+            callback=count_fn,
+            indices=indices,
+            indptr=indptr,
+            int_clust=int_clust,
+            libraries=None,
+            n_cls=n_clusters,
+            seed=seed,
+        )
+
+        permutation_mean = permutations.mean(axis=0)
+        permutation_std = permutations.std(axis=0)
+        zscore = np.zeros_like(permutation_mean, dtype=float)
+        valid_std = permutation_std > 0
+        zscore[valid_std] = (observed[valid_std] - permutation_mean[valid_std]) / permutation_std[valid_std]
+
+        observed_delta = np.abs(observed - permutation_mean)
+        permutation_delta = np.abs(permutations - permutation_mean[None, :, :])
+        p_values = (np.sum(permutation_delta >= observed_delta[None, :, :], axis=0) + 1.0) / (n_perms + 1.0)
+        p_values_adjusted = benjamini_hochberg_adjust_matrix(p_values)
+
+        return {
+            'zscore': np.asarray(zscore, dtype=float),
+            'count': np.asarray(observed, dtype=float),
+            'pvalue': np.asarray(p_values, dtype=float),
+            'pvalue_fdr_bh': np.asarray(p_values_adjusted, dtype=float),
+            'n_perms': np.asarray(n_perms, dtype=float),
+        }
     
     results = {}
     enrichment_matrices = []
+    pvalue_matrices = {}
+    pvalue_adjusted_matrices = {}
     roi_cluster_map = {}
     
     for roi_id, adata in anndata_dict.items():
@@ -3053,8 +3319,12 @@ def spatial_neighborhood_enrichment(
             adata = adata[valid_mask].copy()
         
         # Ensure categorical
+        if cluster_key in {'cluster', 'cluster_id'}:
+            adata.obs[cluster_key] = adata.obs[cluster_key].map(canonicalize_cluster_id)
         if not hasattr(adata.obs[cluster_key], 'cat'):
             adata.obs[cluster_key] = adata.obs[cluster_key].astype('category')
+        ordered_categories = sort_cluster_values(adata.obs[cluster_key].cat.categories, canonical=True)
+        adata.obs[cluster_key] = adata.obs[cluster_key].cat.reorder_categories(ordered_categories, ordered=True)
         
         
         # Check graph connectivity
@@ -3068,42 +3338,18 @@ def spatial_neighborhood_enrichment(
         # Check clusters
         if hasattr(adata.obs[cluster_key], 'cat'):
             categories = list(adata.obs[cluster_key].cat.categories)
-            unique_vals = sorted(adata.obs[cluster_key].unique())
+            unique_vals = sort_cluster_values(adata.obs[cluster_key].unique(), canonical=True)
         else:
-            categories = sorted(adata.obs[cluster_key].unique())
+            categories = sort_cluster_values(adata.obs[cluster_key].unique(), canonical=True)
             unique_vals = categories
         
         if len(unique_vals) < 2:
             continue
         
-        # Run neighborhood enrichment
-        sq.gr.nhood_enrichment(adata, cluster_key=cluster_key)
-        
-        # Check ALL keys in uns to see what squidpy stored
-        for key in adata.uns.keys():
-            if 'nhood' in key.lower() or 'enrich' in key.lower():
-                val = adata.uns[key]
-                if isinstance(val, dict):
-                    pass
-        
-        # Extract matrix - try multiple possible keys
-        enrichment_data = None
-        possible_keys = ['nhood_enrichment', f'{cluster_key}_nhood_enrichment', 'nhood_enrichment_zscore']
-        for key in possible_keys:
-            if key in adata.uns:
-                enrichment_data = adata.uns[key]
-                break
-        
-        if enrichment_data is None:
-            # Try to find any key containing 'nhood' or 'enrich'
-            for key in adata.uns.keys():
-                if 'nhood' in key.lower() or 'enrich' in key.lower():
-                    enrichment_data = adata.uns[key]
-                    break
-        
-        if enrichment_data is None:
-            enrichment_data = {}
-        
+        enrichment_data = _run_nhood_permutation_test(adata, seed=int(len(results)))
+        adata.uns['nhood_enrichment'] = enrichment_data
+        adata.uns[f'{cluster_key}_nhood_enrichment'] = enrichment_data
+
         matrix = None
         
         if isinstance(enrichment_data, dict):
@@ -3124,12 +3370,19 @@ def spatial_neighborhood_enrichment(
         if matrix is not None and isinstance(matrix, np.ndarray) and matrix.ndim == 2:
             results[roi_id] = adata
             enrichment_matrices.append((roi_id, matrix))
+            if isinstance(enrichment_data, dict):
+                p_matrix = enrichment_data.get('pvalue')
+                if isinstance(p_matrix, np.ndarray) and p_matrix.shape == matrix.shape:
+                    pvalue_matrices[roi_id] = np.asarray(p_matrix, dtype=float)
+                p_adjusted_matrix = enrichment_data.get('pvalue_fdr_bh')
+                if isinstance(p_adjusted_matrix, np.ndarray) and p_adjusted_matrix.shape == matrix.shape:
+                    pvalue_adjusted_matrices[roi_id] = np.asarray(p_adjusted_matrix, dtype=float)
             
             # Get cluster categories
             if hasattr(adata.obs[cluster_key], 'cat'):
                 clusters = list(adata.obs[cluster_key].cat.categories)
             else:
-                clusters = sorted(adata.obs[cluster_key].unique())
+                clusters = sort_cluster_values(adata.obs[cluster_key].unique(), canonical=True)
             roi_cluster_map[roi_id] = clusters
         else:
             if matrix is not None:
@@ -3137,17 +3390,24 @@ def spatial_neighborhood_enrichment(
     
     # Aggregate if multiple ROIs
     aggregated_matrix = None
+    aggregated_pvalue_matrix = None
+    aggregated_pvalue_adjusted_matrix = None
     significant_counts_matrix = None
     all_clusters_union = []
     
     if len(enrichment_matrices) > 1:
         # Get union of all clusters
         all_cluster_sets = [set(clusters) for clusters in roi_cluster_map.values()]
-        all_clusters_union = sorted(set().union(*all_cluster_sets)) if all_cluster_sets else []
+        all_clusters_union = (
+            sort_cluster_values(set().union(*all_cluster_sets), canonical=True)
+            if all_cluster_sets
+            else []
+        )
         
         if all_clusters_union:
             # Align all matrices to the union of clusters
             aligned_matrices = []
+            aligned_pvalue_matrices = []
             significant_matrices = []  # Track significant interactions per ROI
             n_clusters = len(all_clusters_union)
             
@@ -3157,10 +3417,12 @@ def spatial_neighborhood_enrichment(
                 if roi_clusters is not None:
                     # Create aligned matrix
                     aligned_matrix = np.full((n_clusters, n_clusters), np.nan)
+                    aligned_pvalue_matrix = np.full((n_clusters, n_clusters), np.nan)
                     significant_matrix = np.zeros((n_clusters, n_clusters), dtype=bool)
                     
                     # Map old indices to new indices
                     cluster_to_new_idx = {clust: idx for idx, clust in enumerate(all_clusters_union)}
+                    roi_pvalues = pvalue_matrices.get(roi_id)
                     
                     # Fill in values where clusters overlap
                     for i, old_clust_i in enumerate(roi_clusters):
@@ -3170,14 +3432,18 @@ def spatial_neighborhood_enrichment(
                                 if old_clust_j in cluster_to_new_idx:
                                     new_j = cluster_to_new_idx[old_clust_j]
                                     aligned_matrix[new_i, new_j] = matrix[i, j]
+                                    if isinstance(roi_pvalues, np.ndarray) and roi_pvalues.shape == matrix.shape:
+                                        aligned_pvalue_matrix[new_i, new_j] = roi_pvalues[i, j]
                                     # Mark as significant if |z-score| > threshold
                                     if not np.isnan(matrix[i, j]) and abs(matrix[i, j]) > significance_threshold:
                                         significant_matrix[new_i, new_j] = True
                     
                     aligned_matrices.append(aligned_matrix)
+                    aligned_pvalue_matrices.append(aligned_pvalue_matrix)
                     significant_matrices.append(significant_matrix)
                 else:
                     aligned_matrices.append(matrix)
+                    aligned_pvalue_matrices.append(np.asarray(pvalue_matrices.get(roi_id), dtype=float) if roi_id in pvalue_matrices else np.full(matrix.shape, np.nan))
                     # Create significant matrix for this ROI
                     significant_matrix = np.abs(matrix) > significance_threshold
                     significant_matrices.append(significant_matrix)
@@ -3192,6 +3458,17 @@ def spatial_neighborhood_enrichment(
             # Count significant interactions across ROIs
             significant_stacked = np.stack(significant_matrices, axis=0)
             significant_counts_matrix = np.sum(significant_stacked, axis=0).astype(int)
+            if aligned_pvalue_matrices:
+                aggregated_pvalue_matrix = np.full((n_clusters, n_clusters), np.nan, dtype=float)
+                for row_idx in range(n_clusters):
+                    for col_idx in range(n_clusters):
+                        p_values = [
+                            matrix[row_idx, col_idx]
+                            for matrix in aligned_pvalue_matrices
+                            if isinstance(matrix, np.ndarray) and np.isfinite(matrix[row_idx, col_idx])
+                        ]
+                        aggregated_pvalue_matrix[row_idx, col_idx] = combine_pvalues_fisher(p_values)
+                aggregated_pvalue_adjusted_matrix = benjamini_hochberg_adjust_matrix(aggregated_pvalue_matrix)
         else:
             aggregated_matrix = enrichment_matrices[0][1] if enrichment_matrices else None
             if aggregated_matrix is not None:
@@ -3201,11 +3478,15 @@ def spatial_neighborhood_enrichment(
         all_clusters_union = roi_cluster_map.get(enrichment_matrices[0][0], [])
         if aggregated_matrix is not None:
             significant_counts_matrix = (np.abs(aggregated_matrix) > significance_threshold).astype(int)
+        aggregated_pvalue_matrix = pvalue_matrices.get(enrichment_matrices[0][0])
+        aggregated_pvalue_adjusted_matrix = pvalue_adjusted_matrices.get(enrichment_matrices[0][0])
     
     
     return {
         'results': results,
         'aggregated': aggregated_matrix,
+        'aggregated_p_values': aggregated_pvalue_matrix,
+        'aggregated_p_values_adjusted': aggregated_pvalue_adjusted_matrix,
         'cluster_categories': all_clusters_union,
         'significant_counts': significant_counts_matrix
     }
@@ -3268,7 +3549,8 @@ def spatial_cooccurrence(
 def spatial_autocorrelation(
     anndata_dict: Dict[str, 'ad.AnnData'],
     markers: Optional[List[str]] = None,
-    aggregation: str = "mean"
+    aggregation: str = "mean",
+    n_permutations: Optional[int] = 999,
 ) -> Dict[str, Any]:
     """Compute spatial autocorrelation (Moran's I) using squidpy.
     
@@ -3286,6 +3568,45 @@ def spatial_autocorrelation(
         import squidpy as sq
     except ImportError:
         raise ImportError("squidpy is required for spatial autocorrelation")
+
+    def _moran_to_dataframe(moran_data: Any) -> pd.DataFrame:
+        if isinstance(moran_data, pd.DataFrame):
+            frame = moran_data.copy()
+            if 'var_names' not in frame.columns:
+                frame.insert(0, 'var_names', frame.index.astype(str))
+            return frame.reset_index(drop=True)
+
+        if isinstance(moran_data, dict):
+            data: Dict[str, Any] = {}
+            gene_names = moran_data.get('var_names')
+            if gene_names is not None:
+                gene_names = np.asarray(gene_names, dtype=object).reshape(-1)
+                data['var_names'] = gene_names.astype(str)
+                n_rows = len(gene_names)
+            else:
+                n_rows = 0
+
+            for key, value in moran_data.items():
+                if key == 'var_names':
+                    continue
+                if np.isscalar(value):
+                    if n_rows == 0:
+                        continue
+                    data[key] = np.repeat(value, n_rows)
+                    continue
+                array = np.asarray(value).reshape(-1)
+                if array.size == 0:
+                    continue
+                if n_rows == 0:
+                    n_rows = array.size
+                if array.size == n_rows:
+                    data[key] = array
+
+            if 'var_names' not in data and n_rows > 0:
+                data['var_names'] = np.asarray([f'feature_{idx}' for idx in range(n_rows)], dtype=object)
+            return pd.DataFrame(data)
+
+        return pd.DataFrame()
     
     results = {}
     moran_results = []
@@ -3305,7 +3626,14 @@ def spatial_autocorrelation(
             available_genes = [g for g in markers_filtered if g in var_names_list]
             if not available_genes:
                 continue
-            sq.gr.spatial_autocorr(adata, mode="moran", genes=available_genes)
+            sq.gr.spatial_autocorr(
+                adata,
+                mode="moran",
+                genes=available_genes,
+                n_perms=n_permutations,
+                corr_method='fdr_bh',
+                show_progress_bar=False,
+            )
             all_genes.update(available_genes)
         else:
             # Filter out 'touches_edge' before running autocorrelation
@@ -3313,14 +3641,26 @@ def spatial_autocorrelation(
                 # Create a filtered view excluding touches_edge
                 var_mask = adata.var_names != 'touches_edge'
                 adata_filtered = adata[:, var_mask].copy()
-                sq.gr.spatial_autocorr(adata_filtered, mode="moran")
+                sq.gr.spatial_autocorr(
+                    adata_filtered,
+                    mode="moran",
+                    n_perms=n_permutations,
+                    corr_method='fdr_bh',
+                    show_progress_bar=False,
+                )
                 # Copy results back to original adata
                 if 'moranI' in adata_filtered.uns:
                     adata.uns['moranI'] = adata_filtered.uns['moranI']
                 var_names_list_filtered = [v for v in var_names_list if v != 'touches_edge']
                 all_genes.update(var_names_list_filtered)
             else:
-                sq.gr.spatial_autocorr(adata, mode="moran")
+                sq.gr.spatial_autocorr(
+                    adata,
+                    mode="moran",
+                    n_perms=n_permutations,
+                    corr_method='fdr_bh',
+                    show_progress_bar=False,
+                )
                 all_genes.update(var_names_list)
         
         # Extract results
@@ -3344,63 +3684,98 @@ def spatial_autocorrelation(
             results[roi_id] = adata
             moran_results.append({
                 'adata': adata,
-                'moranI': moran_data
+                'moranI': moran_data,
+                'frame': _moran_to_dataframe(moran_data),
             })
     
     # Aggregate results if multiple ROIs
     aggregated_adata = None
     if len(moran_results) > 1:
         common_genes = sorted(all_genes)
-        I_values_agg = []
-        p_values_agg = []
-        
+        pvalue_columns = sorted(
+            {
+                column
+                for result in moran_results
+                for column in result['frame'].columns
+                if column.startswith('pval') and not column.endswith('_fdr_bh')
+            }
+        )
+        variance_columns = sorted(
+            {
+                column
+                for result in moran_results
+                for column in result['frame'].columns
+                if column.startswith('var_')
+            }
+        )
+
+        aggregated_rows = []
         for gene in common_genes:
+            row: Dict[str, Any] = {'var_names': gene}
             I_vals = []
-            p_vals = []
             for result in moran_results:
-                moranI = result['moranI']
-                
-                # Handle DataFrame format
-                if isinstance(moranI, pd.DataFrame):
-                    if gene in moranI.index:
-                        I_val = moranI.loc[gene, 'I'] if 'I' in moranI.columns else None
-                        p_val = moranI.loc[gene, 'pval_norm'] if 'pval_norm' in moranI.columns else None
-                        if I_val is not None:
-                            I_vals.append(float(I_val))
-                        if p_val is not None:
-                            p_vals.append(float(p_val))
-                # Handle dict format
-                elif isinstance(moranI, dict):
-                    if 'I' in moranI and 'var_names' in moranI:
-                        var_names = moranI.get('var_names', [])
-                        if gene in var_names:
-                            idx = list(var_names).index(gene)
-                            I_vals.append(moranI['I'][idx] if isinstance(moranI['I'], (list, np.ndarray)) else moranI['I'])
-                            if 'pval_norm' in moranI:
-                                p_vals.append(moranI['pval_norm'][idx] if isinstance(moranI['pval_norm'], (list, np.ndarray)) else moranI['pval_norm'])
-            
+                frame = result['frame']
+                if frame.empty or 'var_names' not in frame.columns:
+                    continue
+                matched = frame.loc[frame['var_names'].astype(str) == str(gene)]
+                if matched.empty:
+                    continue
+                matched_row = matched.iloc[0]
+                if 'I' in matched_row.index and pd.notna(matched_row['I']):
+                    I_vals.append(float(matched_row['I']))
+                elif 'moranI' in matched_row.index and pd.notna(matched_row['moranI']):
+                    I_vals.append(float(matched_row['moranI']))
+
             if I_vals:
-                if aggregation == 'mean':
-                    I_values_agg.append(np.nanmean(I_vals))
-                else:  # sum
-                    I_values_agg.append(np.nansum(I_vals))
-                if p_vals:
-                    p_values_agg.append(np.nanmean(p_vals))
-                else:
-                    p_values_agg.append(1.0)
-        
-        # Create aggregated result
-        class TempAnnData:
-            def __init__(self, I_vals, p_vals, genes):
-                self.uns = {
-                    'moranI': {
-                        'I': np.array(I_vals),
-                        'pval_norm': np.array(p_vals) if p_vals else None,
-                        'var_names': genes
-                    }
-                }
-        
-        aggregated_adata = TempAnnData(I_values_agg, p_values_agg, common_genes)
+                row['I'] = float(np.nanmean(I_vals) if aggregation == 'mean' else np.nansum(I_vals))
+
+            for variance_column in variance_columns:
+                variance_values = []
+                for result in moran_results:
+                    frame = result['frame']
+                    if frame.empty or variance_column not in frame.columns:
+                        continue
+                    matched = frame.loc[frame['var_names'].astype(str) == str(gene), variance_column]
+                    if matched.empty:
+                        continue
+                    value = pd.to_numeric(matched, errors='coerce').iloc[0]
+                    if pd.notna(value):
+                        variance_values.append(float(value))
+                if variance_values:
+                    row[variance_column] = float(np.nanmean(variance_values))
+
+            for pvalue_column in pvalue_columns:
+                gene_pvalues = []
+                for result in moran_results:
+                    frame = result['frame']
+                    if frame.empty or pvalue_column not in frame.columns:
+                        continue
+                    matched = frame.loc[frame['var_names'].astype(str) == str(gene), pvalue_column]
+                    if matched.empty:
+                        continue
+                    value = pd.to_numeric(matched, errors='coerce').iloc[0]
+                    if pd.notna(value):
+                        gene_pvalues.append(float(value))
+                if gene_pvalues:
+                    row[pvalue_column] = combine_pvalues_fisher(gene_pvalues)
+
+            aggregated_rows.append(row)
+
+        aggregated_frame = pd.DataFrame(aggregated_rows)
+        if not aggregated_frame.empty:
+            for pvalue_column in pvalue_columns:
+                if pvalue_column in aggregated_frame.columns:
+                    aggregated_frame[f'{pvalue_column}_fdr_bh'] = benjamini_hochberg_adjust_matrix(
+                        aggregated_frame[pvalue_column].to_numpy(dtype=float, copy=False)
+                    )
+            if 'I' in aggregated_frame.columns:
+                aggregated_frame = aggregated_frame.sort_values('I', ascending=False, na_position='last').reset_index(drop=True)
+
+            class TempAnnData:
+                def __init__(self, frame: pd.DataFrame):
+                    self.uns = {'moranI': frame}
+
+            aggregated_adata = TempAnnData(aggregated_frame)
     elif len(moran_results) == 1:
         aggregated_adata = moran_results[0]['adata']
     
@@ -3473,6 +3848,13 @@ def spatial_ripley(
         try:
             # Run Ripley analysis
             sq.gr.ripley(adata, cluster_key=cluster_key, mode=mode, max_dist=max_dist)
+            ripley_key = next((key for key in adata.uns.keys() if 'ripley' in key.lower()), None)
+            if ripley_key is not None:
+                ripley_data = adata.uns.get(ripley_key)
+                if isinstance(ripley_data, dict):
+                    p_values = ripley_data.get('pvalues')
+                    if p_values is not None:
+                        ripley_data['pvalues_fdr_bh'] = benjamini_hochberg_adjust_matrix(p_values)
             results[roi_id] = adata
         except (ValueError, Exception) as e:
             # Skip if insufficient samples

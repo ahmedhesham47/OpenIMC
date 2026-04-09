@@ -26,13 +26,14 @@ import os
 import re
 import numpy as np
 import pandas as pd
-from PyQt5 import QtWidgets, QtGui
+from PyQt5 import QtWidgets, QtGui, QtCore
 from PyQt5.QtCore import Qt, QThread, pyqtSignal as Signal
 from matplotlib.backends.backend_qt5agg import FigureCanvasQTAgg as FigureCanvas
 from matplotlib.figure import Figure
 
 from openimc.processing.spillover_matrix import build_spillover_from_comp_mcd
 from openimc.core import generate_spillover_matrix
+from openimc.ui.figure_layout import fit_canvas_and_draw
 from openimc.ui.dialogs.progress_dialog import ProgressDialog
 from openimc.ui.dialogs.figure_save_dialog import save_figure_with_options
 from openimc.data.mcd_loader import MCDLoader
@@ -96,6 +97,62 @@ class GenerateSpilloverMatrixDialog(QtWidgets.QDialog):
         self.resize(1200, 900)
         
         self._create_ui()
+        self._matrix_layout_rect = None
+        self._plot_resize_in_progress = False
+        self._plot_resize_timer = QtCore.QTimer(self)
+        self._plot_resize_timer.setSingleShot(True)
+        self._plot_resize_timer.timeout.connect(self._refresh_current_plot_after_resize)
+        if hasattr(self, 'main_tabs'):
+            self.main_tabs.currentChanged.connect(self._queue_plot_resize_refresh)
+
+    def _fit_matrix_canvas(self):
+        """Fit the spillover matrix plot to the live visualization canvas."""
+        if self.matrix_canvas.width() < 10 or self.matrix_canvas.height() < 10:
+            return
+        fit_canvas_and_draw(
+            self.matrix_canvas,
+            rect=self._matrix_layout_rect,
+            pad=0.95,
+            allow_text_compaction=True,
+        )
+
+    def _queue_plot_resize_refresh(self, *_args):
+        """Debounce matrix reflow while the dialog or tabs resize."""
+        if self._plot_resize_in_progress or not self.isVisible():
+            return
+        if getattr(self, 'main_tabs', None) is None or self.main_tabs.currentIndex() != 1:
+            return
+        if not self.matrix_canvas.figure.axes:
+            return
+        self._plot_resize_timer.start(140)
+
+    def _refresh_current_plot_after_resize(self):
+        """Refit the visible spillover matrix plot to the latest canvas size."""
+        if self._plot_resize_in_progress:
+            return
+        if getattr(self, 'main_tabs', None) is None or self.main_tabs.currentIndex() != 1:
+            return
+        if not self.matrix_canvas.figure.axes:
+            return
+        try:
+            self._plot_resize_in_progress = True
+            self._fit_matrix_canvas()
+        finally:
+            self._plot_resize_in_progress = False
+
+    def resizeEvent(self, event):
+        """Keep the visible spillover matrix fitted to the dialog size."""
+        super().resizeEvent(event)
+        if event is None:
+            return
+        try:
+            old_size = event.oldSize()
+            new_size = event.size()
+            if old_size.isValid() and new_size == old_size:
+                return
+        except Exception:
+            pass
+        self._queue_plot_resize_refresh()
     
     def _create_ui(self):
         """Create the user interface."""
@@ -883,9 +940,9 @@ class GenerateSpilloverMatrixDialog(QtWidgets.QDialog):
         ax.set_ylabel('Donor Channel', fontsize=10)
         ax.set_title('Spillover Matrix', fontsize=12, fontweight='bold')
         
-        # Adjust layout to accommodate rotated labels
-        fig.tight_layout(rect=[0, 0.03, 1, 0.97] if x_rotation == 90 else None)
-        self.matrix_canvas.draw()
+        # Keep the matrix inside the live canvas while leaving room for dense labels.
+        self._matrix_layout_rect = [0.0, 0.03, 1.0, 0.97] if x_rotation == 90 else None
+        self._fit_matrix_canvas()
     
     def _display_qc(self, qc: pd.DataFrame):
         """Display QC metrics in the table."""

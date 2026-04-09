@@ -24,8 +24,37 @@ import pytest
 import json
 import tempfile
 from pathlib import Path
+from types import SimpleNamespace
 
-from openimc.cli import load_data, parse_denoise_settings
+import numpy as np
+import pandas as pd
+import tifffile
+
+from openimc.cli import load_data, parse_denoise_settings, qc_analysis_command
+from openimc.core import qc_analysis
+from openimc.data.mcd_loader import AcquisitionInfo
+
+
+class _DummyQCLoader:
+    def __init__(self, stack, acquisition):
+        self._stack = stack
+        self._acquisition = acquisition
+
+    def list_acquisitions(self):
+        return [self._acquisition]
+
+    def get_channels(self, _acq_id):
+        return list(self._acquisition.channels)
+
+    def get_all_channels(self, _acq_id):
+        return self._stack
+
+    def get_image(self, _acq_id, channel):
+        index = self._acquisition.channels.index(channel)
+        return self._stack[:, :, index]
+
+    def close(self):
+        return None
 
 
 @pytest.mark.unit
@@ -98,3 +127,80 @@ class TestParseDenoiseSettings:
         with pytest.raises(ValueError, match="Invalid JSON"):
             parse_denoise_settings("{invalid json}")
 
+
+@pytest.mark.unit
+class TestQCAnalysisCLI:
+    """Tests for QC CLI signal-definition plumbing."""
+
+    def test_qc_analysis_command_round_trips_cell_signal_options(self, temp_dir, monkeypatch):
+        channels = ["MarkerA"]
+        img = np.array(
+            [
+                [12.0, 12.0, 0.0, 2.0, 2.0],
+                [12.0, 12.0, 0.0, 2.0, 2.0],
+                [1.0, 2.0, 1.0, 2.0, 1.0],
+                [2.0, 2.0, 0.0, 2.0, 2.0],
+                [2.0, 2.0, 0.0, 2.0, 2.0],
+            ],
+            dtype=np.float32,
+        )
+        mask = np.array(
+            [
+                [1, 1, 0, 2, 2],
+                [1, 1, 0, 2, 2],
+                [0, 0, 0, 0, 0],
+                [3, 3, 0, 4, 4],
+                [3, 3, 0, 4, 4],
+            ],
+            dtype=np.uint32,
+        )
+        stack = np.stack([img], axis=-1)
+        acquisition = AcquisitionInfo(
+            id="ROI_1",
+            name="ROI_1",
+            well="A1",
+            size=img.shape,
+            channels=channels,
+            channel_metals=[""],
+            channel_labels=[""],
+            metadata={},
+            source_file="dummy",
+        )
+        loader = _DummyQCLoader(stack, acquisition)
+        mask_path = temp_dir / "mask.tif"
+        output_path = temp_dir / "qc.csv"
+        tifffile.imwrite(mask_path, mask)
+
+        monkeypatch.setattr("openimc.cli.load_mcd", lambda *_args, **_kwargs: (loader, "ometiff"))
+
+        args = SimpleNamespace(
+            input="dummy_input",
+            output=str(output_path),
+            channel_format="CHW",
+            acquisition=None,
+            channels=None,
+            mask=str(mask_path),
+            mode="cell",
+            cell_signal_method="upper_quantile",
+            positive_threshold_sd=2.5,
+            upper_quantile=0.75,
+        )
+
+        qc_analysis_command(args)
+
+        expected = qc_analysis(
+            loader=loader,
+            acquisition=acquisition,
+            channels=channels,
+            mode="cell",
+            mask=mask,
+            cell_signal_method="upper_quantile",
+            positive_threshold_sd=2.5,
+            upper_quantile=0.75,
+        ).reset_index(drop=True)
+        actual = pd.read_csv(output_path).reset_index(drop=True)
+
+        assert actual.loc[0, "cell_signal_method"] == "upper_quantile"
+        assert actual.loc[0, "signal_quantile"] == pytest.approx(0.75)
+        assert actual.loc[0, "snr"] == pytest.approx(expected.loc[0, "snr"])
+        assert actual.loc[0, "signal_mean"] == pytest.approx(expected.loc[0, "signal_mean"])

@@ -21,6 +21,7 @@ from dataclasses import dataclass
 from typing import List, Optional, Tuple, Dict
 
 import numpy as np
+from scipy import stats
 
 # Optional sklearn for PCA
 _HAVE_SKLEARN = False
@@ -61,6 +62,53 @@ def percentile_clip_normalize(arr: np.ndarray, p_low: float = 1.0, p_high: float
     else:
         normalized = np.zeros_like(clipped)
     return normalized
+
+
+def benjamini_hochberg_adjust(p_values) -> np.ndarray:
+    """Return Benjamini-Hochberg adjusted p-values, preserving NaNs."""
+    values = np.asarray(p_values, dtype=float).reshape(-1)
+    adjusted = np.full(values.shape, np.nan, dtype=float)
+
+    finite_mask = np.isfinite(values)
+    if not np.any(finite_mask):
+        return adjusted
+
+    finite_values = np.clip(values[finite_mask], 0.0, 1.0)
+    order = np.argsort(finite_values)
+    ranked = finite_values[order]
+    n_values = ranked.size
+
+    ranked_adjusted = ranked * n_values / np.arange(1, n_values + 1, dtype=float)
+    ranked_adjusted = np.minimum.accumulate(ranked_adjusted[::-1])[::-1]
+    ranked_adjusted = np.clip(ranked_adjusted, 0.0, 1.0)
+
+    finite_adjusted = np.empty_like(ranked_adjusted)
+    finite_adjusted[order] = ranked_adjusted
+    adjusted[finite_mask] = finite_adjusted
+    return adjusted
+
+
+def benjamini_hochberg_adjust_matrix(p_values) -> np.ndarray:
+    """Return Benjamini-Hochberg adjusted p-values with the original array shape."""
+    values = np.asarray(p_values, dtype=float)
+    return benjamini_hochberg_adjust(values.reshape(-1)).reshape(values.shape)
+
+
+def combine_pvalues_fisher(p_values) -> float:
+    """Combine finite p-values with Fisher's method."""
+    values = np.asarray(p_values, dtype=float).reshape(-1)
+    finite_values = values[np.isfinite(values)]
+    if finite_values.size == 0:
+        return np.nan
+    if finite_values.size == 1:
+        return float(np.clip(finite_values[0], 0.0, 1.0))
+
+    clipped = np.clip(finite_values, np.finfo(float).tiny, 1.0)
+    try:
+        _, combined = stats.combine_pvalues(clipped, method='fisher')
+    except Exception:
+        return float(np.nanmean(clipped))
+    return float(np.clip(combined, 0.0, 1.0))
 
 
 def channelwise_minmax_normalize(arr: np.ndarray) -> np.ndarray:
@@ -234,5 +282,3 @@ def stack_to_rgb(stack: np.ndarray) -> np.ndarray:
         g = (stack[..., 1] - np.min(stack[..., 1])) / (np.max(stack[..., 1]) - np.min(stack[..., 1]) + 1e-8)
         b = (stack[..., 2] - np.min(stack[..., 2])) / (np.max(stack[..., 2]) - np.min(stack[..., 2]) + 1e-8)
         return np.dstack([r, g, b])
-
-

@@ -36,9 +36,9 @@ from matplotlib.figure import Figure
 import matplotlib.pyplot as plt
 from openimc.utils.logger import get_logger
 from openimc.ui.dialogs.figure_save_dialog import save_figure_with_options
-from openimc.ui.dialogs.progress_dialog import ProgressDialog
+from openimc.ui.dialogs.progress_dialog import run_blocking_task_with_progress_then_finalize
 from openimc.data.mcd_loader import AcquisitionInfo
-from openimc.core import qc_analysis
+from openimc.core import _compute_cell_signal_metrics, qc_analysis
 import multiprocessing as mp
 import traceback
 
@@ -105,6 +105,21 @@ def _calculate_snr(signal_mean: float, background_mean: float, background_std: f
     snr = signal_diff / min_std
     
     return snr
+
+
+CELL_SIGNAL_METHOD_OPTIONS = [
+    ("Positive pixels above background", "positive_pixels"),
+    ("Upper quantile of cell intensity", "upper_quantile"),
+    ("All cell pixels (legacy)", "all_cell_mean"),
+]
+
+
+def _cell_signal_method_label(method: Optional[str]) -> str:
+    """Return the UI label for a QC cell signal method identifier."""
+    for label, value in CELL_SIGNAL_METHOD_OPTIONS:
+        if value == method:
+            return label
+    return "Cell signal"
 
 
 # Import worker function from processing module
@@ -185,7 +200,14 @@ def _qc_calculate_pixel_metrics_worker(img: np.ndarray, channel: str) -> Optiona
         return None
 
 
-def _qc_calculate_cell_metrics_worker(img: np.ndarray, channel: str, mask: np.ndarray) -> Optional[Dict[str, Any]]:
+def _qc_calculate_cell_metrics_worker(
+    img: np.ndarray,
+    channel: str,
+    mask: np.ndarray,
+    cell_signal_method: str = "positive_pixels",
+    positive_threshold_sd: float = 2.0,
+    upper_quantile: float = 0.90,
+) -> Optional[Dict[str, Any]]:
     """Calculate cell-level QC metrics using segmentation masks (module-level for multiprocessing).
     
     This is a separate worker function for QC analysis to avoid conflicts.
@@ -206,27 +228,34 @@ def _qc_calculate_cell_metrics_worker(img: np.ndarray, channel: str, mask: np.nd
         if np.sum(cell_mask) == 0 or np.sum(background_mask) == 0:
             return None
         
-        foreground = img_float[cell_mask]
         background = img_float[background_mask]
         
-        # Calculate metrics
-        signal_mean = np.mean(foreground)
-        signal_std = np.std(foreground)
         background_mean = np.mean(background)
         background_std = np.std(background)
         
         # Calculate image range for robust SNR calculation
         img_min = np.min(img_float)
         img_max = np.max(img_float)
+        signal_metrics = _compute_cell_signal_metrics(
+            img_float,
+            mask,
+            float(background_mean),
+            float(background_std),
+            float(img_min),
+            float(img_max),
+            cell_signal_method=cell_signal_method,
+            positive_threshold_sd=positive_threshold_sd,
+            upper_quantile=upper_quantile,
+        )
+        signal_mean = signal_metrics['signal_mean']
+        signal_std = signal_metrics['signal_std']
+        snr = signal_metrics['snr']
         
-        # SNR: (signal_mean - background_mean) / background_std (with robust handling)
-        snr = _calculate_snr(signal_mean, background_mean, background_std, img_min, img_max)
-        
-        # Intensity metrics (cell-level, using raw pixel intensities)
-        mean_intensity = np.mean(foreground)  # Mean intensity in cells
-        median_intensity = np.median(foreground)
-        max_intensity = np.max(foreground)
-        min_intensity = np.min(foreground)
+        # Intensity metrics (raw image intensities for consistency with core.qc_analysis)
+        mean_intensity = np.mean(img_float)
+        median_intensity = np.median(img_float)
+        max_intensity = np.max(img_float)
+        min_intensity = np.min(img_float)
         
         # Coverage: percentage of pixels covered by cells
         coverage_pct = (np.sum(cell_mask) / img_float.size) * 100
@@ -238,10 +267,10 @@ def _qc_calculate_cell_metrics_worker(img: np.ndarray, channel: str, mask: np.nd
         cell_density = num_cells / area_pixels if area_pixels > 0 else 0
         
         # Calculate percentiles for cell intensities
-        p1 = np.percentile(foreground, 1)
-        p25 = np.percentile(foreground, 25)
-        p75 = np.percentile(foreground, 75)
-        p99 = np.percentile(foreground, 99)
+        p1 = np.percentile(img_float[cell_mask], 1)
+        p25 = np.percentile(img_float[cell_mask], 25)
+        p75 = np.percentile(img_float[cell_mask], 75)
+        p99 = np.percentile(img_float[cell_mask], 99)
         
         # Per-cell statistics
         cell_intensities = []
@@ -259,6 +288,13 @@ def _qc_calculate_cell_metrics_worker(img: np.ndarray, channel: str, mask: np.nd
             'signal_std': signal_std,
             'background_mean': background_mean,
             'background_std': background_std,
+            'cell_signal_method': cell_signal_method,
+            'signal_threshold': signal_metrics['signal_threshold'],
+            'signal_quantile': signal_metrics['signal_quantile'],
+            'n_signal_pixels': signal_metrics['n_signal_pixels'],
+            'n_signal_cells': signal_metrics['n_signal_cells'],
+            'signal_fraction': signal_metrics['signal_fraction'],
+            'signal_coverage_pct': signal_metrics['signal_coverage_pct'],
             'mean_intensity': mean_intensity,  # Raw pixel intensity
             'median_intensity': median_intensity,
             'max_intensity': max_intensity,
@@ -297,6 +333,7 @@ class QCAnalysisDialog(QtWidgets.QDialog):
         self.qc_results_aggregated: Optional[pd.DataFrame] = None  # Aggregated results per channel
         self.pixel_level_results: Optional[pd.DataFrame] = None
         self.cell_level_results: Optional[pd.DataFrame] = None
+        self.custom_denoise_settings: Dict[str, Dict[str, dict]] = {}
         
         # Analysis mode
         self.analysis_mode = "pixel"  # "pixel" or "cell"
@@ -354,7 +391,8 @@ class QCAnalysisDialog(QtWidgets.QDialog):
             "from background pixels. SNR is calculated as (signal_mean - background_mean) / background_std. "
             "This works on any image without requiring segmentation.<br>"
             "<b>Cell-level:</b> Uses segmentation masks to separate cell pixels from background pixels. "
-            "SNR is calculated using cell regions as signal and non-cell regions as background. "
+            "You can define signal as positive in-cell pixels above background, the brightest cells by upper quantile, "
+            "or all cell pixels for legacy whole-cell averaging. Non-cell regions remain the background. "
             "Requires segmentation masks to be available."
         )
         explanation_text.setWordWrap(True)
@@ -369,6 +407,7 @@ class QCAnalysisDialog(QtWidgets.QDialog):
         # Add "All Acquisitions" as the first (default) option
         self.acq_combo.insertItem(0, "All Acquisitions", "all")
         self.acq_combo.setCurrentIndex(0)  # Set as default
+        self.acq_combo.currentIndexChanged.connect(self._populate_denoise_channel_list)
         acq_layout.addWidget(self.acq_combo, 1)
         acq_layout.addStretch()
         options_layout.addLayout(acq_layout)
@@ -383,6 +422,170 @@ class QCAnalysisDialog(QtWidgets.QDialog):
         workers_layout.addWidget(self.workers_spin)
         workers_layout.addStretch()
         options_layout.addLayout(workers_layout)
+
+        self.cell_signal_group = QtWidgets.QGroupBox("Cell Signal Definition")
+        cell_signal_layout = QtWidgets.QVBoxLayout(self.cell_signal_group)
+        cell_signal_layout.setSpacing(4)
+        cell_signal_layout.setContentsMargins(8, 8, 8, 8)
+
+        cell_signal_method_layout = QtWidgets.QHBoxLayout()
+        cell_signal_method_layout.addWidget(QtWidgets.QLabel("Signal definition:"))
+        self.cell_signal_method_combo = QtWidgets.QComboBox()
+        for label, value in CELL_SIGNAL_METHOD_OPTIONS:
+            self.cell_signal_method_combo.addItem(label, value)
+        self.cell_signal_method_combo.currentIndexChanged.connect(self._on_cell_signal_method_changed)
+        cell_signal_method_layout.addWidget(self.cell_signal_method_combo, 1)
+        cell_signal_method_layout.addStretch()
+        cell_signal_layout.addLayout(cell_signal_method_layout)
+
+        threshold_layout = QtWidgets.QHBoxLayout()
+        self.positive_threshold_sd_label = QtWidgets.QLabel("Threshold SD:")
+        self.positive_threshold_sd_spin = QtWidgets.QDoubleSpinBox()
+        self.positive_threshold_sd_spin.setRange(0.5, 5.0)
+        self.positive_threshold_sd_spin.setSingleStep(0.5)
+        self.positive_threshold_sd_spin.setDecimals(1)
+        self.positive_threshold_sd_spin.setValue(2.0)
+        threshold_layout.addWidget(self.positive_threshold_sd_label)
+        threshold_layout.addWidget(self.positive_threshold_sd_spin)
+        threshold_layout.addStretch()
+        cell_signal_layout.addLayout(threshold_layout)
+
+        quantile_layout = QtWidgets.QHBoxLayout()
+        self.upper_quantile_label = QtWidgets.QLabel("Upper quantile:")
+        self.upper_quantile_spin = QtWidgets.QDoubleSpinBox()
+        self.upper_quantile_spin.setRange(50.0, 99.9)
+        self.upper_quantile_spin.setSingleStep(1.0)
+        self.upper_quantile_spin.setDecimals(1)
+        self.upper_quantile_spin.setValue(90.0)
+        self.upper_quantile_spin.setSuffix("%")
+        quantile_layout.addWidget(self.upper_quantile_label)
+        quantile_layout.addWidget(self.upper_quantile_spin)
+        quantile_layout.addStretch()
+        cell_signal_layout.addLayout(quantile_layout)
+
+        self.cell_signal_help_label = QtWidgets.QLabel("")
+        self.cell_signal_help_label.setWordWrap(True)
+        self.cell_signal_help_label.setStyleSheet("QLabel { color: #555; font-size: 9pt; }")
+        cell_signal_layout.addWidget(self.cell_signal_help_label)
+        options_layout.addWidget(self.cell_signal_group)
+
+        denoise_group = QtWidgets.QGroupBox("Pre-QC Denoising")
+        denoise_layout = QtWidgets.QVBoxLayout(denoise_group)
+        denoise_layout.setSpacing(4)
+        denoise_layout.setContentsMargins(8, 8, 8, 8)
+
+        denoise_source_layout = QtWidgets.QHBoxLayout()
+        denoise_source_layout.addWidget(QtWidgets.QLabel("Denoising:"))
+        self.denoise_source_combo = QtWidgets.QComboBox()
+        self.denoise_source_combo.addItems(["None", "Viewer", "Custom"])
+        self.denoise_source_combo.currentTextChanged.connect(self._on_denoise_source_changed)
+        denoise_source_layout.addWidget(self.denoise_source_combo)
+        denoise_source_layout.addStretch()
+        denoise_layout.addLayout(denoise_source_layout)
+
+        self.custom_denoise_frame = QtWidgets.QFrame()
+        self.custom_denoise_frame.setFrameStyle(QtWidgets.QFrame.Box)
+        self.custom_denoise_frame.setVisible(False)
+        custom_denoise_layout = QtWidgets.QVBoxLayout(self.custom_denoise_frame)
+        custom_denoise_layout.setSpacing(4)
+        custom_denoise_layout.setContentsMargins(8, 8, 8, 8)
+
+        denoise_channel_row = QtWidgets.QHBoxLayout()
+        denoise_channel_row.addWidget(QtWidgets.QLabel("Channel:"))
+        self.denoise_channel_combo = QtWidgets.QComboBox()
+        self.denoise_channel_combo.currentTextChanged.connect(self._on_denoise_channel_changed)
+        denoise_channel_row.addWidget(self.denoise_channel_combo, 1)
+        custom_denoise_layout.addLayout(denoise_channel_row)
+
+        denoise_controls_layout = QtWidgets.QHBoxLayout()
+
+        hot_frame = QtWidgets.QFrame()
+        hot_layout = QtWidgets.QVBoxLayout(hot_frame)
+        hot_layout.setContentsMargins(0, 0, 0, 0)
+        hot_layout.setSpacing(3)
+        self.hot_pixel_chk = QtWidgets.QCheckBox("Hot pixel")
+        self.hot_pixel_method_combo = QtWidgets.QComboBox()
+        self.hot_pixel_method_combo.addItems(["Median 3x3", ">N SD"])
+        self.hot_pixel_method_combo.currentTextChanged.connect(self._sync_hot_controls_visibility)
+        self.hot_pixel_method_combo.currentTextChanged.connect(self._save_current_denoise_settings)
+        self.hot_pixel_n_spin = QtWidgets.QDoubleSpinBox()
+        self.hot_pixel_n_spin.setRange(0.5, 10.0)
+        self.hot_pixel_n_spin.setDecimals(1)
+        self.hot_pixel_n_spin.setValue(5.0)
+        self.hot_pixel_n_spin.setMaximumWidth(60)
+        self.hot_pixel_chk.toggled.connect(self._save_current_denoise_settings)
+        self.hot_pixel_n_spin.valueChanged.connect(self._save_current_denoise_settings)
+        hot_layout.addWidget(self.hot_pixel_chk)
+        hot_layout.addWidget(self.hot_pixel_method_combo)
+        hot_n_layout = QtWidgets.QHBoxLayout()
+        self.hot_pixel_n_label = QtWidgets.QLabel("N:")
+        hot_n_layout.addWidget(self.hot_pixel_n_label)
+        hot_n_layout.addWidget(self.hot_pixel_n_spin)
+        hot_n_layout.addStretch()
+        hot_layout.addLayout(hot_n_layout)
+        denoise_controls_layout.addWidget(hot_frame)
+
+        speckle_frame = QtWidgets.QFrame()
+        speckle_layout = QtWidgets.QVBoxLayout(speckle_frame)
+        speckle_layout.setContentsMargins(0, 0, 0, 0)
+        speckle_layout.setSpacing(3)
+        self.speckle_chk = QtWidgets.QCheckBox("Speckle")
+        self.speckle_method_combo = QtWidgets.QComboBox()
+        self.speckle_method_combo.addItems(["Gaussian", "NL-means"])
+        self.speckle_method_combo.currentTextChanged.connect(self._save_current_denoise_settings)
+        self.gaussian_sigma_spin = QtWidgets.QDoubleSpinBox()
+        self.gaussian_sigma_spin.setRange(0.1, 5.0)
+        self.gaussian_sigma_spin.setDecimals(2)
+        self.gaussian_sigma_spin.setValue(0.8)
+        self.gaussian_sigma_spin.setMaximumWidth(60)
+        self.speckle_chk.toggled.connect(self._save_current_denoise_settings)
+        self.gaussian_sigma_spin.valueChanged.connect(self._save_current_denoise_settings)
+        speckle_layout.addWidget(self.speckle_chk)
+        speckle_layout.addWidget(self.speckle_method_combo)
+        sigma_layout = QtWidgets.QHBoxLayout()
+        sigma_layout.addWidget(QtWidgets.QLabel("σ:"))
+        sigma_layout.addWidget(self.gaussian_sigma_spin)
+        sigma_layout.addStretch()
+        speckle_layout.addLayout(sigma_layout)
+        denoise_controls_layout.addWidget(speckle_frame)
+
+        bg_frame = QtWidgets.QFrame()
+        bg_layout = QtWidgets.QVBoxLayout(bg_frame)
+        bg_layout.setContentsMargins(0, 0, 0, 0)
+        bg_layout.setSpacing(3)
+        self.bg_subtract_chk = QtWidgets.QCheckBox("Background")
+        self.bg_method_combo = QtWidgets.QComboBox()
+        self.bg_method_combo.addItems(["White top-hat", "Black top-hat", "Rolling ball"])
+        self.bg_method_combo.currentTextChanged.connect(self._save_current_denoise_settings)
+        self.bg_radius_spin = QtWidgets.QSpinBox()
+        self.bg_radius_spin.setRange(1, 100)
+        self.bg_radius_spin.setValue(15)
+        self.bg_radius_spin.setMaximumWidth(60)
+        self.bg_subtract_chk.toggled.connect(self._save_current_denoise_settings)
+        self.bg_radius_spin.valueChanged.connect(self._save_current_denoise_settings)
+        bg_layout.addWidget(self.bg_subtract_chk)
+        bg_layout.addWidget(self.bg_method_combo)
+        radius_layout = QtWidgets.QHBoxLayout()
+        radius_layout.addWidget(QtWidgets.QLabel("R:"))
+        radius_layout.addWidget(self.bg_radius_spin)
+        radius_layout.addStretch()
+        bg_layout.addLayout(radius_layout)
+        denoise_controls_layout.addWidget(bg_frame)
+
+        custom_denoise_layout.addLayout(denoise_controls_layout)
+
+        self.apply_all_channels_btn = QtWidgets.QPushButton("Apply to All Channels")
+        self.apply_all_channels_btn.clicked.connect(self._apply_denoise_to_all_channels)
+        custom_denoise_layout.addWidget(self.apply_all_channels_btn)
+
+        if not _HAVE_SCIKIT_IMAGE:
+            self.custom_denoise_frame.setEnabled(False)
+            custom_denoise_layout.addWidget(
+                QtWidgets.QLabel("scikit-image not available; install to enable custom denoising.")
+            )
+
+        denoise_layout.addWidget(self.custom_denoise_frame)
+        options_layout.addWidget(denoise_group)
         
         # Run button
         run_layout = QtWidgets.QHBoxLayout()
@@ -400,6 +603,12 @@ class QCAnalysisDialog(QtWidgets.QDialog):
         # Summary tab
         summary_tab = QtWidgets.QWidget()
         summary_layout = QtWidgets.QVBoxLayout(summary_tab)
+
+        self.summary_method_label = QtWidgets.QLabel("")
+        self.summary_method_label.setWordWrap(True)
+        self.summary_method_label.setStyleSheet("QLabel { color: #555; font-size: 9pt; padding-bottom: 4px; }")
+        self.summary_method_label.hide()
+        summary_layout.addWidget(self.summary_method_label)
         
         # Summary table
         self.summary_table = QtWidgets.QTableWidget()
@@ -473,6 +682,9 @@ class QCAnalysisDialog(QtWidgets.QDialog):
         
         # Initialize
         self._on_mode_changed()
+        self._populate_denoise_channel_list()
+        self._on_denoise_source_changed()
+        self._update_cell_signal_controls()
         
     def _check_masks_exist(self) -> bool:
         """Check if any segmentation masks exist."""
@@ -493,6 +705,336 @@ class QCAnalysisDialog(QtWidgets.QDialog):
             label = acq.well if acq.well else acq.name
             label += f" [{file_name}]"
             self.acq_combo.addItem(label, acq.id)
+
+    def _populate_denoise_channel_list(self):
+        """Populate the denoise channel combo with channels from the selected acquisition."""
+        if not hasattr(self, 'denoise_channel_combo'):
+            return
+
+        channels = []
+        if self.parent_window and hasattr(self.parent_window, 'acquisitions'):
+            selected_acq_id = self.acq_combo.currentData() if hasattr(self, 'acq_combo') else None
+            target_acq = None
+            if selected_acq_id and selected_acq_id != "all":
+                target_acq = self.parent_window._get_acquisition_info(selected_acq_id)
+            elif self.parent_window.acquisitions:
+                target_acq = self.parent_window.acquisitions[0]
+
+            if target_acq is not None:
+                channels = list(target_acq.channels or [])
+
+        self.denoise_channel_combo.blockSignals(True)
+        self.denoise_channel_combo.clear()
+        for channel in channels:
+            self.denoise_channel_combo.addItem(channel)
+        self.denoise_channel_combo.blockSignals(False)
+        if channels:
+            self.denoise_channel_combo.setCurrentIndex(0)
+            self._load_denoise_settings()
+
+    def _on_denoise_source_changed(self):
+        """Handle changes to the denoise source selection."""
+        if hasattr(self, 'custom_denoise_frame'):
+            self.custom_denoise_frame.setVisible(self.denoise_source_combo.currentText() == "Custom")
+
+    def _on_denoise_channel_changed(self):
+        """Persist current custom settings before switching denoise channels."""
+        self._save_current_denoise_settings()
+        self._load_denoise_settings()
+
+    def _load_denoise_settings(self):
+        """Load saved custom denoise settings for the current channel into the UI."""
+        if not hasattr(self, 'denoise_channel_combo'):
+            return
+        channel = self.denoise_channel_combo.currentText()
+        if not channel:
+            return
+
+        cfg = self.custom_denoise_settings.get(channel, {})
+        hot = cfg.get("hot")
+        speckle = cfg.get("speckle")
+        bg = cfg.get("background")
+
+        controls = [
+            self.hot_pixel_chk,
+            self.hot_pixel_method_combo,
+            self.hot_pixel_n_spin,
+            self.speckle_chk,
+            self.speckle_method_combo,
+            self.gaussian_sigma_spin,
+            self.bg_subtract_chk,
+            self.bg_method_combo,
+            self.bg_radius_spin,
+        ]
+        for control in controls:
+            control.blockSignals(True)
+
+        try:
+            if hot:
+                self.hot_pixel_chk.setChecked(True)
+                self.hot_pixel_method_combo.setCurrentIndex(0 if hot.get("method") == "median3" else 1)
+                self.hot_pixel_n_spin.setValue(float(hot.get("n_sd", 5.0)))
+            else:
+                self.hot_pixel_chk.setChecked(False)
+                self.hot_pixel_method_combo.setCurrentIndex(0)
+                self.hot_pixel_n_spin.setValue(5.0)
+
+            if speckle:
+                self.speckle_chk.setChecked(True)
+                self.speckle_method_combo.setCurrentIndex(0 if speckle.get("method") == "gaussian" else 1)
+                self.gaussian_sigma_spin.setValue(float(speckle.get("sigma", 0.8)))
+            else:
+                self.speckle_chk.setChecked(False)
+                self.speckle_method_combo.setCurrentIndex(0)
+                self.gaussian_sigma_spin.setValue(0.8)
+
+            if bg:
+                self.bg_subtract_chk.setChecked(True)
+                bg_method = bg.get("method")
+                if bg_method == "white_tophat":
+                    self.bg_method_combo.setCurrentIndex(0)
+                elif bg_method == "black_tophat":
+                    self.bg_method_combo.setCurrentIndex(1)
+                else:
+                    self.bg_method_combo.setCurrentIndex(2)
+                self.bg_radius_spin.setValue(int(bg.get("radius", 15)))
+            else:
+                self.bg_subtract_chk.setChecked(False)
+                self.bg_method_combo.setCurrentIndex(0)
+                self.bg_radius_spin.setValue(15)
+        finally:
+            for control in controls:
+                control.blockSignals(False)
+
+        self._sync_hot_controls_visibility()
+
+    def _save_current_denoise_settings(self):
+        """Save the currently displayed denoise settings for the selected channel."""
+        if not hasattr(self, 'denoise_channel_combo'):
+            return
+        channel = self.denoise_channel_combo.currentText()
+        if not channel:
+            return
+
+        cfg = {}
+        if self.hot_pixel_chk.isChecked():
+            cfg["hot"] = {
+                "method": "median3" if self.hot_pixel_method_combo.currentIndex() == 0 else "n_sd_local_median",
+                "n_sd": float(self.hot_pixel_n_spin.value()),
+            }
+        if self.speckle_chk.isChecked():
+            cfg["speckle"] = {
+                "method": "gaussian" if self.speckle_method_combo.currentIndex() == 0 else "nl_means",
+                "sigma": float(self.gaussian_sigma_spin.value()),
+            }
+        if self.bg_subtract_chk.isChecked():
+            bg_idx = self.bg_method_combo.currentIndex()
+            if bg_idx == 0:
+                bg_method = "white_tophat"
+            elif bg_idx == 1:
+                bg_method = "black_tophat"
+            else:
+                bg_method = "rolling_ball"
+            cfg["background"] = {
+                "method": bg_method,
+                "radius": int(self.bg_radius_spin.value()),
+            }
+
+        self.custom_denoise_settings[channel] = cfg
+
+    def _apply_denoise_to_all_channels(self):
+        """Apply the current denoise settings to every available channel."""
+        channels = [self.denoise_channel_combo.itemText(i) for i in range(self.denoise_channel_combo.count())]
+        if not channels:
+            return
+
+        self._save_current_denoise_settings()
+        current_channel = self.denoise_channel_combo.currentText()
+        current_cfg = dict(self.custom_denoise_settings.get(current_channel, {}))
+        for channel in channels:
+            self.custom_denoise_settings[channel] = {
+                key: (dict(value) if isinstance(value, dict) else value)
+                for key, value in current_cfg.items()
+            }
+
+        self.apply_all_channels_btn.setText("✓ Applied to All Channels")
+        self.apply_all_channels_btn.setStyleSheet(
+            "QPushButton { background-color: #d4edda; color: #155724; border: 1px solid #c3e6cb; }"
+        )
+        QtCore.QTimer.singleShot(2000, self._reset_apply_all_button)
+
+    def _reset_apply_all_button(self):
+        """Restore the default appearance of the apply-all button."""
+        self.apply_all_channels_btn.setText("Apply to All Channels")
+        self.apply_all_channels_btn.setStyleSheet("")
+
+    def _sync_hot_controls_visibility(self):
+        """Only show the N threshold control for threshold-based hot-pixel removal."""
+        is_threshold = self.hot_pixel_method_combo.currentIndex() == 1
+        self.hot_pixel_n_spin.setVisible(is_threshold)
+        self.hot_pixel_n_label.setVisible(is_threshold)
+
+    def get_denoise_source(self) -> str:
+        """Return the selected denoising source for QC."""
+        source = self.denoise_source_combo.currentText()
+        if source == "Viewer":
+            return "viewer"
+        if source == "Custom":
+            return "custom"
+        return "none"
+
+    def get_custom_denoise_settings(self):
+        """Return custom per-channel denoise settings."""
+        self._save_current_denoise_settings()
+        return self.custom_denoise_settings
+
+    def _resolve_qc_denoise_settings(self) -> Optional[Dict[str, Dict[str, dict]]]:
+        """Resolve the effective denoise settings used for QC computation."""
+        if not self.parent_window:
+            return None
+
+        denoise_source = self.get_denoise_source()
+        if denoise_source == "viewer":
+            if hasattr(self.parent_window, '_get_relevant_denoise_settings'):
+                try:
+                    return self.parent_window._get_relevant_denoise_settings("viewer")
+                except Exception:
+                    pass
+            return dict(getattr(self.parent_window, 'channel_denoise', {}) or {})
+
+        if denoise_source == "custom":
+            return dict(self.get_custom_denoise_settings() or {})
+
+        return None
+
+    def _on_cell_signal_method_changed(self):
+        """Update cell signal controls when the selected method changes."""
+        self._update_cell_signal_controls()
+
+    def get_cell_signal_method(self) -> str:
+        """Return the selected cell signal method identifier."""
+        if not hasattr(self, 'cell_signal_method_combo'):
+            return "positive_pixels"
+        method = self.cell_signal_method_combo.currentData()
+        return method if isinstance(method, str) and method else "positive_pixels"
+
+    def _get_cell_signal_settings(self) -> Dict[str, Any]:
+        """Return the current cell signal settings in core.qc_analysis format."""
+        return {
+            "cell_signal_method": self.get_cell_signal_method(),
+            "positive_threshold_sd": float(self.positive_threshold_sd_spin.value()),
+            "upper_quantile": float(self.upper_quantile_spin.value()) / 100.0,
+        }
+
+    def _get_current_cache_signature(self) -> str:
+        """Return the QC cache signature for the current analysis settings."""
+        if self.analysis_mode != "cell":
+            return "pixel"
+        settings = self._get_cell_signal_settings()
+        return (
+            f"cell_{settings['cell_signal_method']}"
+            f"_sd{settings['positive_threshold_sd']:.1f}"
+            f"_q{settings['upper_quantile']:.3f}"
+        )
+
+    def _get_qc_cache_key(self) -> Optional[str]:
+        """Return the cache key for the current QC configuration."""
+        if not self.file_set_id:
+            return None
+        return f"{self.file_set_id}_{self._get_current_cache_signature()}"
+
+    def _cache_matches_current_settings(self, cache_data: Dict[str, Any]) -> bool:
+        """Check whether cached QC results match the current signal definition settings."""
+        if not isinstance(cache_data, dict):
+            return False
+        if cache_data.get('analysis_mode') != self.analysis_mode:
+            return False
+        if self.analysis_mode != "cell":
+            return True
+        settings = self._get_cell_signal_settings()
+        cached_method = cache_data.get('cell_signal_method')
+        cached_threshold = cache_data.get('positive_threshold_sd')
+        cached_quantile = cache_data.get('upper_quantile')
+        if cached_method is None or cached_threshold is None or cached_quantile is None:
+            return False
+        return (
+            cached_method == settings['cell_signal_method']
+            and np.isclose(float(cached_threshold), settings['positive_threshold_sd'])
+            and np.isclose(float(cached_quantile), settings['upper_quantile'])
+        )
+
+    def _get_results_cell_signal_method(self) -> Optional[str]:
+        """Return the method used to generate the currently displayed cell-mode results."""
+        if self.analysis_mode != "cell":
+            return None
+        if self.qc_results is not None and 'cell_signal_method' in self.qc_results.columns:
+            methods = [
+                method
+                for method in self.qc_results['cell_signal_method'].dropna().unique().tolist()
+                if isinstance(method, str) and method
+            ]
+            if len(methods) == 1:
+                return methods[0]
+        return self.get_cell_signal_method()
+
+    def _get_qc_method_subtitle(self) -> str:
+        """Return a human-readable subtitle for the current QC signal definition."""
+        method = self._get_results_cell_signal_method()
+        if not method:
+            return ""
+        label = _cell_signal_method_label(method)
+        if method == "positive_pixels":
+            return f"Cell signal: {label} (> background + {self.positive_threshold_sd_spin.value():.1f} robust SD)"
+        if method == "upper_quantile":
+            return f"Cell signal: {label} (top {self.upper_quantile_spin.value():.1f}%)"
+        return f"Cell signal: {label}"
+
+    def _compose_plot_title(self, base_title: str) -> str:
+        """Append the QC cell-signal subtitle to plot titles when relevant."""
+        subtitle = self._get_qc_method_subtitle()
+        return f"{base_title}\n{subtitle}" if subtitle else base_title
+
+    def _get_export_suffix(self) -> str:
+        """Return a concise suffix describing the current cell-signal settings."""
+        method = self._get_results_cell_signal_method()
+        if not method:
+            return ""
+        if method == "positive_pixels":
+            suffix = f"{method}_sd{self.positive_threshold_sd_spin.value():.1f}"
+        elif method == "upper_quantile":
+            suffix = f"{method}_q{self.upper_quantile_spin.value():.1f}"
+        else:
+            suffix = method
+        return suffix.replace('.', 'p')
+
+    def _update_cell_signal_controls(self):
+        """Show the relevant cell signal controls and explanatory text."""
+        is_cell_mode = self.analysis_mode == "cell"
+        self.cell_signal_group.setVisible(is_cell_mode)
+        method = self.get_cell_signal_method()
+        show_threshold = is_cell_mode and method == "positive_pixels"
+        show_quantile = is_cell_mode and method == "upper_quantile"
+        self.positive_threshold_sd_label.setVisible(show_threshold)
+        self.positive_threshold_sd_spin.setVisible(show_threshold)
+        self.upper_quantile_label.setVisible(show_quantile)
+        self.upper_quantile_spin.setVisible(show_quantile)
+        if not is_cell_mode:
+            self.cell_signal_help_label.clear()
+            return
+        if method == "positive_pixels":
+            self.cell_signal_help_label.setText(
+                "Estimate signal from in-cell pixels above background_mean + N times the robust background SD. "
+                "This usually works best for sparse markers with many negative cells."
+            )
+        elif method == "upper_quantile":
+            self.cell_signal_help_label.setText(
+                "Estimate signal from the brightest cells only, using the upper tail of per-cell mean intensities. "
+                "This is robust when signal is confined to a subset of cells."
+            )
+        else:
+            self.cell_signal_help_label.setText(
+                "Use all pixels inside cells as signal. This preserves the legacy behavior but can dilute sparse markers."
+            )
         
     def _on_mode_changed(self):
         """Handle mode change."""
@@ -509,12 +1051,13 @@ class QCAnalysisDialog(QtWidgets.QDialog):
                     "Cell-level analysis requires segmentation masks. Please segment cells first."
                 )
         
+        self._update_cell_signal_controls()
         # Try to restore cached results for the new mode
         self._restore_cached_results()
     
     
     def _run_analysis(self):
-        """Run QC analysis with multiprocessing."""
+        """Run QC analysis with responsive progress handling."""
         if not self.parent_window:
             QtWidgets.QMessageBox.warning(self, "Error", "Parent window not available.")
             return
@@ -576,13 +1119,10 @@ class QCAnalysisDialog(QtWidgets.QDialog):
         
         # Get number of workers
         num_workers = self.workers_spin.value()
-        
-        # Show progress dialog
-        progress_dlg = ProgressDialog("Calculating QC Metrics...", self)
-        progress_dlg.update_progress(0, f"Processing {num_workers} acquisitions in parallel...", "Preparing tasks...")
-        progress_dlg.show()
-        QtWidgets.QApplication.processEvents()
-        
+        denoise_settings = self._resolve_qc_denoise_settings()
+        cell_signal_settings = self._get_cell_signal_settings() if self.analysis_mode == "cell" else None
+        temp_mask_paths = []
+
         try:
             # Prepare tasks for multiprocessing - one task per acquisition
             tasks = []
@@ -650,251 +1190,40 @@ class QCAnalysisDialog(QtWidgets.QDialog):
                     try:
                         import tifffile
                         tifffile.imwrite(mask_path, mask.astype(np.uint32))
+                        temp_mask_paths.append(mask_path)
                     except Exception as e:
                         continue
                 
                 # Create one task per acquisition (all channels)
                 # Pass both unique ID (for results) and original ID (for loader)
-                task = (acq_id, original_acq_id, acq_info.name, channels, self.analysis_mode, mask_path, source_file, loader_type, acq_to_file_map)
+                task = (
+                    acq_id,
+                    original_acq_id,
+                    acq_info.name,
+                    channels,
+                    self.analysis_mode,
+                    mask_path,
+                    source_file,
+                    loader_type,
+                    acq_to_file_map,
+                    denoise_settings,
+                    cell_signal_settings,
+                )
                 tasks.append(task)
             
             if not tasks:
-                progress_dlg.close()
                 QtWidgets.QMessageBox.warning(self, "Error", "No tasks to process.")
                 return
-            
-            # Group tasks by source file path
-            # IMPORTANT: Only group MCD files together. OME-TIFF files should be processed individually
-            # (one file per worker) since each OME-TIFF file is typically a single acquisition.
-            # MCD files need grouping to avoid file locking issues with readimc.
-            from collections import defaultdict
-            file_groups = defaultdict(list)
-            ometiff_tasks = []  # OME-TIFF tasks processed individually
-            
-            for task in tasks:
-                source_file = task[6]  # source_file is at index 6 in the task tuple
-                loader_type = task[7]  # loader_type is at index 7 in the task tuple
-                
-                # Only group MCD files. OME-TIFF files are processed individually
-                if loader_type == "mcd":
-                    file_groups[source_file].append(task)
-                else:
-                    # OME-TIFF: each file gets its own "group" (will be processed individually)
-                    ometiff_tasks.append(task)
-            
-            # Process with multiprocessing
-            results = []
-            total_tasks = len(tasks)
-            num_unique_files = len(file_groups) + len(ometiff_tasks)  # Count MCD groups + OME-TIFF files
-            total_channels = sum(len(acq_info.channels) for acq_info in acquisitions if acq_info.channels)
-            
-            # Use multiprocessing for true parallelization
-            # Use spawn method to ensure isolation from other multiprocessing operations
-            if num_workers > 1 and total_tasks > 1:
-                ctx = mp.get_context('spawn')  # Use spawn to avoid conflicts with feature extraction
-                
-                # Process each file sequentially, but all acquisitions from each file in parallel
-                file_num = 0
-                completed_acquisitions = 0
-                channels_processed = 0
-                worker_timeout = 300  # 5 minutes per worker
-                
-                try:
-                    for source_file, file_tasks in file_groups.items():
-                        file_num += 1
-                        file_basename = os.path.basename(source_file) if os.path.isfile(source_file) else os.path.basename(os.path.dirname(source_file))
-                        
-                        if progress_dlg.is_cancelled():
-                            break
-                        
-                        # Update progress for file start
-                        progress_dlg.update_progress(
-                            int((completed_acquisitions / total_tasks) * 100),
-                            f"File {file_num}/{num_unique_files}: {file_basename}",
-                            f"Processing {len(file_tasks)} acquisitions from this file..."
-                        )
-                        QtWidgets.QApplication.processEvents()
-                        
-                        with ctx.Pool(processes=min(num_workers, len(file_tasks))) as pool:
-                            # Submit all acquisitions from this file
-                            futures = []
-                            for task in file_tasks:
-                                future = pool.apply_async(_qc_process_acquisition_worker, (task,))
-                                futures.append(future)
-                            
-                            # Collect results as they complete
-                            completed_for_file = 0
-                            for acq_idx, future in enumerate(futures, 1):
-                                if progress_dlg.is_cancelled():
-                                    pool.terminate()
-                                    pool.join()
-                                    break
-                                
-                                try:
-                                    acquisition_results = future.get(timeout=worker_timeout)
-                                    if acquisition_results:
-                                        results.extend(acquisition_results)
-                                        channels_processed += len(acquisition_results)
-                                    completed_for_file += 1
-                                    completed_acquisitions += 1
-                                    
-                                    # Update progress
-                                    progress = int((completed_acquisitions / total_tasks) * 100)
-                                    progress_dlg.update_progress(
-                                        progress,
-                                        f"File {file_num}/{num_unique_files}: {file_basename}",
-                                        f"Processed {completed_for_file}/{len(file_tasks)} acquisitions from this file ({completed_acquisitions}/{total_tasks} total, {channels_processed} channels)"
-                                    )
-                                    QtWidgets.QApplication.processEvents()
-                                except mp.TimeoutError:
-                                    print(f"[QC] [ERROR] QC analysis timed out for acquisition from {file_basename} after {worker_timeout}s")
-                                    completed_for_file += 1
-                                    completed_acquisitions += 1
-                                    progress = int((completed_acquisitions / total_tasks) * 100)
-                                    progress_dlg.update_progress(
-                                        progress,
-                                        f"File {file_num}/{num_unique_files}: {file_basename}",
-                                        f"Processed {completed_for_file}/{len(file_tasks)} acquisitions from this file..."
-                                    )
-                                    QtWidgets.QApplication.processEvents()
-                                except Exception as e:
-                                    # Handle errors
-                                    import traceback
-                                    traceback.print_exc()
-                                    print(f"[QC] [ERROR] QC analysis failed for acquisition from {file_basename}: {e}")
-                                    completed_for_file += 1
-                                    completed_acquisitions += 1
-                                    progress = int((completed_acquisitions / total_tasks) * 100)
-                                    progress_dlg.update_progress(
-                                        progress,
-                                        f"File {file_num}/{num_unique_files}: {file_basename}",
-                                        f"Processed {completed_for_file}/{len(file_tasks)} acquisitions from this file..."
-                                    )
-                                    QtWidgets.QApplication.processEvents()
-                        
-                        print(f"[QC] Completed MCD file {file_basename}: {completed_for_file}/{len(file_tasks)} acquisitions")
-                    
-                    # Process OME-TIFF files: each file individually (one file = one worker)
-                    # OME-TIFF files don't need grouping since each file is typically a single acquisition
-                    # and there are no file locking issues with OME-TIFF loaders
-                    if ometiff_tasks:
-                        print(f"[QC] Processing {len(ometiff_tasks)} OME-TIFF files individually")
-                        with ctx.Pool(processes=min(num_workers, len(ometiff_tasks))) as pool:
-                            futures = []
-                            for task in ometiff_tasks:
-                                future = pool.apply_async(_qc_process_acquisition_worker, (task,))
-                                futures.append(future)
-                            
-                            # Collect results as they complete
-                            completed_ometiff = 0
-                            mcd_acquisitions_processed = completed_acquisitions
-                            
-                            for acq_idx, future in enumerate(futures, 1):
-                                if progress_dlg.is_cancelled():
-                                    pool.terminate()
-                                    pool.join()
-                                    break
-                                
-                                try:
-                                    acquisition_results = future.get(timeout=worker_timeout)
-                                    if acquisition_results:
-                                        results.extend(acquisition_results)
-                                        channels_processed += len(acquisition_results)
-                                    completed_ometiff += 1
-                                    completed_acquisitions += 1
-                                    
-                                    # Update progress
-                                    progress = int((completed_acquisitions / total_tasks) * 100)
-                                    progress_dlg.update_progress(
-                                        progress,
-                                        f"Processing OME-TIFF files...",
-                                        f"Processed {completed_ometiff}/{len(ometiff_tasks)} OME-TIFF files ({completed_acquisitions}/{total_tasks} total, {channels_processed} channels)"
-                                    )
-                                    QtWidgets.QApplication.processEvents()
-                                except mp.TimeoutError:
-                                    print(f"[QC] [ERROR] QC analysis timed out for OME-TIFF acquisition after {worker_timeout}s")
-                                    completed_ometiff += 1
-                                    completed_acquisitions += 1
-                                    progress = int((completed_acquisitions / total_tasks) * 100)
-                                    progress_dlg.update_progress(
-                                        progress,
-                                        f"Processing OME-TIFF files...",
-                                        f"Processed {completed_ometiff}/{len(ometiff_tasks)} OME-TIFF files..."
-                                    )
-                                    QtWidgets.QApplication.processEvents()
-                                except Exception as e:
-                                    import traceback
-                                    traceback.print_exc()
-                                    print(f"[QC] [ERROR] QC analysis failed for OME-TIFF acquisition: {e}")
-                                    completed_ometiff += 1
-                                    completed_acquisitions += 1
-                                    progress = int((completed_acquisitions / total_tasks) * 100)
-                                    progress_dlg.update_progress(
-                                        progress,
-                                        f"Processing OME-TIFF files...",
-                                        f"Processed {completed_ometiff}/{len(ometiff_tasks)} OME-TIFF files..."
-                                    )
-                                    QtWidgets.QApplication.processEvents()
-                        
-                        print(f"[QC] Completed {completed_ometiff}/{len(ometiff_tasks)} OME-TIFF files")
-                
-                except Exception as mp_error:
-                    print(f"[QC] Multiprocessing failed, falling back to sequential processing: {mp_error}")
-                    import traceback
-                    traceback.print_exc()
-                    progress_dlg.update_progress(0, "Multiprocessing failed, using sequential processing", "Processing acquisitions one by one")
-                    
-                    # Fallback to sequential processing
-                    for i, task in enumerate(tasks):
-                        if progress_dlg.is_cancelled():
-                            break
-                        
-                        try:
-                            acquisition_results = _qc_process_acquisition_worker(task)
-                            if acquisition_results:
-                                results.extend(acquisition_results)
-                                channels_processed += len(acquisition_results)
-                            
-                            # Update progress
-                            progress = int(((i + 1) / total_tasks) * 100)
-                            progress_dlg.update_progress(
-                                progress,
-                                "Processing acquisitions...",
-                                f"Processed {i+1}/{total_tasks} acquisitions ({channels_processed} channels)"
-                            )
-                            QtWidgets.QApplication.processEvents()
-                        except Exception as e:
-                            print(f"[QC] [ERROR] Sequential QC analysis failed: {e}")
-                            import traceback
-                            traceback.print_exc()
-            else:
-                # Single-threaded processing
-                channels_processed = 0
-                for i, task in enumerate(tasks):
-                    if progress_dlg.is_cancelled():
-                        break
-                    
-                    acquisition_results = _qc_process_acquisition_worker(task)
-                    if acquisition_results:
-                        results.extend(acquisition_results)
-                        channels_processed += len(acquisition_results)
-                    
-                    # Update progress
-                    progress = int(((i + 1) / total_tasks) * 100)
-                    progress_dlg.update_progress(
-                        progress,
-                        "Processing acquisitions...",
-                        f"Processed {i+1}/{total_tasks} acquisitions ({channels_processed} channels)"
-                    )
-                    QtWidgets.QApplication.processEvents()
-            
-            # Create DataFrame
-            if results:
+
+            def _compute_results():
+                return self._execute_qc_tasks(tasks, num_workers)
+
+            def _finalize_results(results, _progress):
+                if not results:
+                    QtWidgets.QMessageBox.warning(self, "Error", "No results generated. Check console for errors.")
+                    return
+
                 self.qc_results = pd.DataFrame(results)
-                
-                # Map column names from core.py format to dialog format
-                # core.py uses: intensity_mean, intensity_std, intensity_median, intensity_min, intensity_max, coverage
-                # dialog expects: mean_intensity, std_intensity, median_intensity, min_intensity, max_intensity, coverage_pct
                 column_mapping = {
                     'intensity_mean': 'mean_intensity',
                     'intensity_std': 'std_intensity',
@@ -903,74 +1232,56 @@ class QCAnalysisDialog(QtWidgets.QDialog):
                     'intensity_max': 'max_intensity',
                     'coverage': 'coverage_pct'
                 }
-                # Only rename columns that exist
                 existing_mappings = {k: v for k, v in column_mapping.items() if k in self.qc_results.columns}
                 if existing_mappings:
                     self.qc_results = self.qc_results.rename(columns=existing_mappings)
-                
-                # Convert coverage from fraction (0.0-1.0) to percentage (0-100)
-                if 'coverage_pct' in self.qc_results.columns:
-                    # Check if values are already in percentage range (> 1.0) or fraction range (<= 1.0)
+
+                if 'coverage_pct' in self.qc_results.columns and not self.qc_results['coverage_pct'].empty:
                     max_coverage = self.qc_results['coverage_pct'].max()
                     if max_coverage <= 1.0:
-                        # Convert from fraction to percentage
                         self.qc_results['coverage_pct'] = self.qc_results['coverage_pct'] * 100.0
-                    else:
-                        pass
-                
-                
-                # Aggregate results per channel across all ROIs
+
                 self._aggregate_results_by_channel()
-                if self.qc_results_aggregated is not None:
-                    pass
-                
-                # Cache results for persistence
                 self._save_results_to_cache()
-                
-                # Update UI
                 self._update_summary_table()
                 self._update_plots()
                 self.export_summary_btn.setEnabled(True)
                 self.snr_intensity_save_btn.setEnabled(True)
                 self.coverage_save_btn.setEnabled(True)
                 self.distribution_save_btn.setEnabled(True)
-                
-                # Log QC analysis (signal to noise ratio analysis)
+
                 logger = get_logger()
-                # Collect unique source files
                 source_files = set()
-                for acq_id, source_file in acq_to_file_map.items():
-                    if source_file:
-                        if source_file.endswith('.mcd') or source_file.endswith('.mcdx'):
-                            # For MCD files, use the file basename
-                            source_files.add(os.path.basename(source_file))
-                        else:
-                            # For OME-TIFF, use the folder name (directory containing the file)
-                            if os.path.isdir(source_file):
-                                # source_file is already a folder
-                                folder_path = source_file
-                            else:
-                                # source_file is a file, get its directory
-                                folder_path = os.path.dirname(source_file) if os.path.dirname(source_file) else source_file
-                            source_files.add(os.path.basename(folder_path))
-                
+                for _, source_file in acq_to_file_map.items():
+                    if not source_file:
+                        continue
+                    if source_file.endswith('.mcd') or source_file.endswith('.mcdx'):
+                        source_files.add(os.path.basename(source_file))
+                    else:
+                        folder_path = source_file if os.path.isdir(source_file) else (os.path.dirname(source_file) or source_file)
+                        source_files.add(os.path.basename(folder_path))
+
                 source_file_str = None
                 if source_files:
-                    if len(source_files) == 1:
-                        source_file_str = list(source_files)[0]
+                    sorted_files = sorted(source_files)
+                    if len(sorted_files) == 1:
+                        source_file_str = sorted_files[0]
+                    elif len(sorted_files) <= 3:
+                        source_file_str = ", ".join(sorted_files)
                     else:
-                        sorted_files = sorted(source_files)
-                        if len(sorted_files) <= 3:
-                            source_file_str = ", ".join(sorted_files)
-                        else:
-                            source_file_str = ", ".join(sorted_files[:3]) + f" and {len(sorted_files) - 3} more"
-                
+                        source_file_str = ", ".join(sorted_files[:3]) + f" and {len(sorted_files) - 3} more"
+
                 params = {
                     "analysis_mode": self.analysis_mode,
                     "n_acquisitions": len(acquisitions),
-                    "n_channels": len(results)
+                    "n_channels": len(results),
+                    "denoise_source": self.get_denoise_source(),
                 }
-                
+                if denoise_settings:
+                    params["denoise_settings"] = denoise_settings
+                if cell_signal_settings:
+                    params.update(cell_signal_settings)
+
                 logger._write_entry(
                     entry_type="qc_analysis",
                     operation="signal_to_noise_ratio",
@@ -979,19 +1290,97 @@ class QCAnalysisDialog(QtWidgets.QDialog):
                     notes=f"QC analysis (SNR) completed: {len(results)} channels across {len(acquisitions)} acquisitions",
                     source_file=source_file_str
                 )
-                
-                progress_dlg.update_progress(100, "Analysis complete!", f"QC metrics calculated for {len(results)} channels across {len(acquisitions)} acquisitions.")
-                QtWidgets.QApplication.processEvents()
-                QtCore.QTimer.singleShot(500, progress_dlg.close)
-            else:
-                progress_dlg.close()
-                QtWidgets.QMessageBox.warning(self, "Error", "No results generated. Check console for errors.")
-                
+
+            run_blocking_task_with_progress_then_finalize(
+                parent=self,
+                window_title="Calculating QC Metrics",
+                initial_message="Calculating QC metrics",
+                detail_text="Processing acquisitions and channels in the background.",
+                task=_compute_results,
+                finalize=_finalize_results,
+                finishing_message="Rendering QC results",
+                finishing_detail_text="Updating tables and plots.",
+            )
         except Exception as e:
-            progress_dlg.close()
             QtWidgets.QMessageBox.critical(self, "Error", f"Error during analysis: {str(e)}")
             import traceback
             traceback.print_exc()
+        finally:
+            for mask_path in temp_mask_paths:
+                if mask_path and os.path.exists(mask_path):
+                    try:
+                        os.remove(mask_path)
+                    except Exception:
+                        pass
+
+    def _execute_qc_tasks(self, tasks, num_workers: int):
+        """Execute QC worker tasks without blocking the UI thread."""
+        from collections import defaultdict
+
+        file_groups = defaultdict(list)
+        ometiff_tasks = []
+        for task in tasks:
+            source_file = task[6]
+            loader_type = task[7]
+            if loader_type == "mcd":
+                file_groups[source_file].append(task)
+            else:
+                ometiff_tasks.append(task)
+
+        results = []
+        total_tasks = len(tasks)
+        worker_timeout = 300
+        n_workers = max(1, min(int(num_workers), total_tasks))
+
+        if n_workers > 1 and total_tasks > 1:
+            ctx = mp.get_context('spawn')
+            try:
+                for _, file_tasks in file_groups.items():
+                    with ctx.Pool(processes=min(n_workers, len(file_tasks))) as pool:
+                        futures = [pool.apply_async(_qc_process_acquisition_worker, (task,)) for task in file_tasks]
+                        for future in futures:
+                            try:
+                                acquisition_results = future.get(timeout=worker_timeout)
+                                if acquisition_results:
+                                    results.extend(acquisition_results)
+                            except mp.TimeoutError:
+                                print(f"[QC] [ERROR] QC analysis timed out after {worker_timeout}s")
+                            except Exception as exc:
+                                print(f"[QC] [ERROR] QC analysis failed: {exc}")
+
+                if ometiff_tasks:
+                    with ctx.Pool(processes=min(n_workers, len(ometiff_tasks))) as pool:
+                        futures = [pool.apply_async(_qc_process_acquisition_worker, (task,)) for task in ometiff_tasks]
+                        for future in futures:
+                            try:
+                                acquisition_results = future.get(timeout=worker_timeout)
+                                if acquisition_results:
+                                    results.extend(acquisition_results)
+                            except mp.TimeoutError:
+                                print(f"[QC] [ERROR] QC analysis timed out after {worker_timeout}s")
+                            except Exception as exc:
+                                print(f"[QC] [ERROR] QC analysis failed: {exc}")
+            except Exception as mp_error:
+                print(f"[QC] Multiprocessing failed, falling back to sequential processing: {mp_error}")
+                traceback.print_exc()
+                results = []
+                for task in tasks:
+                    try:
+                        acquisition_results = _qc_process_acquisition_worker(task)
+                        if acquisition_results:
+                            results.extend(acquisition_results)
+                    except Exception as exc:
+                        print(f"[QC] [ERROR] Sequential QC analysis failed: {exc}")
+        else:
+            for task in tasks:
+                try:
+                    acquisition_results = _qc_process_acquisition_worker(task)
+                    if acquisition_results:
+                        results.extend(acquisition_results)
+                except Exception as exc:
+                    print(f"[QC] [ERROR] Sequential QC analysis failed: {exc}")
+
+        return results
     
     def _calculate_pixel_metrics(self, img: np.ndarray, channel: str) -> Optional[Dict[str, Any]]:
         """Calculate pixel-level QC metrics using Otsu threshold."""
@@ -1087,27 +1476,33 @@ class QCAnalysisDialog(QtWidgets.QDialog):
             if np.sum(cell_mask) == 0 or np.sum(background_mask) == 0:
                 return None
             
-            foreground = img_float[cell_mask]
             background = img_float[background_mask]
             
-            # Calculate metrics
-            signal_mean = np.mean(foreground)
-            signal_std = np.std(foreground)
             background_mean = np.mean(background)
             background_std = np.std(background)
             
             # Calculate image range for robust SNR calculation
             img_min = np.min(img_float)
             img_max = np.max(img_float)
+            signal_settings = self._get_cell_signal_settings()
+            signal_metrics = _compute_cell_signal_metrics(
+                img_float,
+                mask,
+                float(background_mean),
+                float(background_std),
+                float(img_min),
+                float(img_max),
+                **signal_settings,
+            )
+            signal_mean = signal_metrics['signal_mean']
+            signal_std = signal_metrics['signal_std']
+            snr = signal_metrics['snr']
             
-            # SNR: (signal_mean - background_mean) / background_std (with robust handling)
-            snr = _calculate_snr(signal_mean, background_mean, background_std, img_min, img_max)
-            
-            # Intensity metrics (cell-level)
-            mean_intensity = np.mean(foreground)  # Mean intensity in cells
-            median_intensity = np.median(foreground)
-            max_intensity = np.max(foreground)
-            min_intensity = np.min(foreground)
+            # Intensity metrics (raw image intensities for consistency with core.qc_analysis)
+            mean_intensity = np.mean(img_float)
+            median_intensity = np.median(img_float)
+            max_intensity = np.max(img_float)
+            min_intensity = np.min(img_float)
             
             # Coverage: percentage of pixels covered by cells
             coverage_pct = (np.sum(cell_mask) / img_float.size) * 100
@@ -1121,10 +1516,10 @@ class QCAnalysisDialog(QtWidgets.QDialog):
             cell_density = num_cells / area_pixels if area_pixels > 0 else 0
             
             # Calculate percentiles for cell intensities
-            p1 = np.percentile(foreground, 1)
-            p25 = np.percentile(foreground, 25)
-            p75 = np.percentile(foreground, 75)
-            p99 = np.percentile(foreground, 99)
+            p1 = np.percentile(img_float[cell_mask], 1)
+            p25 = np.percentile(img_float[cell_mask], 25)
+            p75 = np.percentile(img_float[cell_mask], 75)
+            p99 = np.percentile(img_float[cell_mask], 99)
             
             # Per-cell statistics
             cell_intensities = []
@@ -1142,6 +1537,13 @@ class QCAnalysisDialog(QtWidgets.QDialog):
                 'signal_std': signal_std,
                 'background_mean': background_mean,
                 'background_std': background_std,
+                'cell_signal_method': signal_settings['cell_signal_method'],
+                'signal_threshold': signal_metrics['signal_threshold'],
+                'signal_quantile': signal_metrics['signal_quantile'],
+                'n_signal_pixels': signal_metrics['n_signal_pixels'],
+                'n_signal_cells': signal_metrics['n_signal_cells'],
+                'signal_fraction': signal_metrics['signal_fraction'],
+                'signal_coverage_pct': signal_metrics['signal_coverage_pct'],
                 'mean_intensity': mean_intensity,
                 'median_intensity': median_intensity,
                 'max_intensity': max_intensity,
@@ -1176,14 +1578,23 @@ class QCAnalysisDialog(QtWidgets.QDialog):
             'mean_intensity': 'mean',
             'coverage_pct': 'mean',
             'signal_mean': 'mean',
+            'signal_std': 'mean',
             'background_mean': 'mean',
+            'background_std': 'mean',
             'median_intensity': 'mean',
             'max_intensity': 'mean',
             'min_intensity': 'mean',
             'p1': 'mean',
             'p25': 'mean',
             'p75': 'mean',
-            'p99': 'mean'
+            'p99': 'mean',
+            'signal_threshold': 'mean',
+            'signal_quantile': 'mean',
+            'n_signal_pixels': 'mean',
+            'n_signal_cells': 'mean',
+            'signal_fraction': 'mean',
+            'signal_coverage_pct': 'mean',
+            'cell_signal_method': 'first',
         }
         
         # Add cell-specific metrics if available
@@ -1212,12 +1623,17 @@ class QCAnalysisDialog(QtWidgets.QDialog):
         if not hasattr(self.parent_window, 'qc_results_cache'):
             self.parent_window.qc_results_cache = {}
         
-        # Store results with both analysis mode and file set ID as key
-        cache_key = f"{self.file_set_id}_{self.analysis_mode}"
+        cache_key = self._get_qc_cache_key()
+        if not cache_key:
+            return
+        signal_settings = self._get_cell_signal_settings()
         self.parent_window.qc_results_cache[cache_key] = {
             'qc_results': self.qc_results.copy() if self.qc_results is not None else None,
             'qc_results_aggregated': self.qc_results_aggregated.copy() if self.qc_results_aggregated is not None else None,
-            'analysis_mode': self.analysis_mode
+            'analysis_mode': self.analysis_mode,
+            'cell_signal_method': signal_settings['cell_signal_method'],
+            'positive_threshold_sd': signal_settings['positive_threshold_sd'],
+            'upper_quantile': signal_settings['upper_quantile'],
         }
     
     def _restore_cached_results(self):
@@ -1228,18 +1644,18 @@ class QCAnalysisDialog(QtWidgets.QDialog):
         if not hasattr(self.parent_window, 'qc_results_cache'):
             return
         
-        # Try to restore results for current analysis mode
+        # Try to restore results for the current QC configuration
         cached = None
-        if self.file_set_id:
-            # First try exact match with current file_set_id
-            cache_key = f"{self.file_set_id}_{self.analysis_mode}"
+        cache_key = self._get_qc_cache_key()
+        if cache_key:
             cached = self.parent_window.qc_results_cache.get(cache_key)
         
-        # If no exact match, try to find any cache entry with results for current analysis mode
+        # If no exact match, try to find any cache entry that matches the current settings
         if not cached or cached.get('qc_results') is None:
             for cache_key, cache_data in self.parent_window.qc_results_cache.items():
                 if (isinstance(cache_data, dict) and 
-                    cache_data.get('analysis_mode') == self.analysis_mode and
+                    (not self.file_set_id or str(cache_key).startswith(f"{self.file_set_id}_")) and
+                    self._cache_matches_current_settings(cache_data) and
                     cache_data.get('qc_results') is not None):
                     cached = cache_data
                     break
@@ -1270,14 +1686,55 @@ class QCAnalysisDialog(QtWidgets.QDialog):
                     self.acq_combo.setCurrentIndex(index)
             if "num_workers" in ui_state and hasattr(self, 'workers_spin'):
                 self.workers_spin.setValue(ui_state["num_workers"])
+            if "denoise_source" in ui_state and hasattr(self, 'denoise_source_combo'):
+                index = self.denoise_source_combo.findText(ui_state["denoise_source"])
+                if index >= 0:
+                    self.denoise_source_combo.setCurrentIndex(index)
+            if "custom_denoise_settings" in ui_state:
+                self.custom_denoise_settings = dict(ui_state["custom_denoise_settings"] or {})
+                self._populate_denoise_channel_list()
+                self._load_denoise_settings()
+            if "cell_signal_method" in ui_state and hasattr(self, 'cell_signal_method_combo'):
+                index = self.cell_signal_method_combo.findData(ui_state["cell_signal_method"])
+                if index >= 0:
+                    self.cell_signal_method_combo.setCurrentIndex(index)
+            if "positive_threshold_sd" in ui_state and hasattr(self, 'positive_threshold_sd_spin'):
+                self.positive_threshold_sd_spin.setValue(float(ui_state["positive_threshold_sd"]))
+            if "upper_quantile_percent" in ui_state and hasattr(self, 'upper_quantile_spin'):
+                self.upper_quantile_spin.setValue(float(ui_state["upper_quantile_percent"]))
+            self._update_cell_signal_controls()
     
     def _update_summary_table(self):
         """Update the summary table with aggregated results."""
         if self.qc_results_aggregated is None or self.qc_results_aggregated.empty:
             return
         
+        methods = set()
+        if 'cell_signal_method' in self.qc_results_aggregated.columns:
+            methods = {
+                str(method)
+                for method in self.qc_results_aggregated['cell_signal_method'].dropna().tolist()
+                if str(method)
+            }
+
+        summary_subtitle = self._get_qc_method_subtitle()
+        if summary_subtitle:
+            self.summary_method_label.setText(summary_subtitle)
+            self.summary_method_label.show()
+        else:
+            self.summary_method_label.hide()
+
+        coverage_col = 'coverage_pct'
+        if (
+            self.analysis_mode == "cell"
+            and methods
+            and methods != {'all_cell_mean'}
+            and 'signal_coverage_pct' in self.qc_results_aggregated.columns
+        ):
+            coverage_col = 'signal_coverage_pct'
+
         # Select relevant columns for display
-        display_cols = ['channel', 'n_rois', 'snr', 'mean_intensity', 'coverage_pct']
+        display_cols = ['channel', 'n_rois', 'snr', 'mean_intensity', coverage_col]
         if 'cell_density' in self.qc_results_aggregated.columns:
             display_cols.append('cell_density')
         
@@ -1320,7 +1777,7 @@ class QCAnalysisDialog(QtWidgets.QDialog):
         self._plot_distributions()
     
     def _plot_snr_vs_intensity(self):
-        """Plot SNR vs mean intensity with log scales on both axes (using aggregated values)."""
+        """Plot SNR vs mean intensity using a truthful SNR axis for the observed range."""
         if self.qc_results_aggregated is None or self.qc_results_aggregated.empty:
             return
         
@@ -1333,14 +1790,14 @@ class QCAnalysisDialog(QtWidgets.QDialog):
         snr_values = self.qc_results_aggregated['snr'].values
         channels = self.qc_results_aggregated['channel'].values
         
-        # Filter out zero or negative values for log scale
-        valid_mask = (intensities > 0) & (snr_values > 0)
+        # Mean intensities must stay positive for the log-scaled x-axis.
+        valid_mask = np.isfinite(intensities) & np.isfinite(snr_values) & (intensities > 0)
         intensities = intensities[valid_mask]
         snr_values = snr_values[valid_mask]
         channels = channels[valid_mask]
         
         if len(intensities) == 0:
-            ax.text(0.5, 0.5, 'No valid data points for log scale', 
+            ax.text(0.5, 0.5, 'No valid data points to plot', 
                    ha='center', va='center', transform=ax.transAxes)
             fig.tight_layout()
             self.snr_intensity_canvas.draw()
@@ -1365,14 +1822,20 @@ class QCAnalysisDialog(QtWidgets.QDialog):
         
         # Set log scale on both axes
         ax.set_xscale('log')
-        ax.set_yscale('log')
+        if np.any(snr_values <= 0):
+            ax.set_yscale('symlog', linthresh=1.0)
+            ax.axhline(y=0.0, color='lightgray', linestyle=':', linewidth=1, alpha=0.6)
+            y_axis_label = 'SNR (Signal-to-Noise Ratio, symlog scale, averaged across ROIs)'
+        else:
+            ax.set_yscale('log')
+            y_axis_label = 'SNR (Signal-to-Noise Ratio, log scale, averaged across ROIs)'
         
         # Add dotted horizontal line at 10^0 = 1.0
         ax.axhline(y=1.0, color='gray', linestyle='--', linewidth=1, alpha=0.5)
         
         ax.set_xlabel('Mean Intensity (log scale, averaged across ROIs)', fontsize=10)
-        ax.set_ylabel('SNR (Signal-to-Noise Ratio, log scale, averaged across ROIs)', fontsize=10)
-        ax.set_title('SNR vs Mean Intensity by Channel (Mean across all ROIs)', fontsize=12, fontweight='bold')
+        ax.set_ylabel(y_axis_label, fontsize=10)
+        ax.set_title(self._compose_plot_title('SNR vs Mean Intensity by Channel (Mean across all ROIs)'), fontsize=12, fontweight='bold')
         ax.grid(False)  # Remove gridlines
         
         fig.tight_layout()
@@ -1405,7 +1868,7 @@ class QCAnalysisDialog(QtWidgets.QDialog):
         ax1.set_xticks(range(len(channels)))
         ax1.set_xticklabels(channels, rotation=45, ha='right', fontsize=8)
         ax1.set_ylabel('% Coverage (mean across ROIs)', fontsize=10)
-        ax1.set_title('Coverage by Channel (Mean across all ROIs)', fontsize=12, fontweight='bold')
+        ax1.set_title(self._compose_plot_title('Coverage by Channel (Mean across all ROIs)'), fontsize=12, fontweight='bold')
         ax1.grid(True, alpha=0.3, axis='y')
         
         # Add mean line
@@ -1419,7 +1882,7 @@ class QCAnalysisDialog(QtWidgets.QDialog):
             ax2.set_xticks(range(len(channels)))
             ax2.set_xticklabels(channels, rotation=45, ha='right', fontsize=8)
             ax2.set_ylabel('Cell Density (cells/pixel², mean across ROIs)', fontsize=10)
-            ax2.set_title('Cell Density by Channel (Mean across all ROIs)', fontsize=12, fontweight='bold')
+            ax2.set_title(self._compose_plot_title('Cell Density by Channel (Mean across all ROIs)'), fontsize=12, fontweight='bold')
             ax2.grid(True, alpha=0.3, axis='y')
             
             # Add mean line
@@ -1466,7 +1929,7 @@ class QCAnalysisDialog(QtWidgets.QDialog):
         for channel in channels:
             channel_data = self.qc_results[self.qc_results['channel'] == channel]
             # Filter valid values
-            valid_snr = channel_data['snr'][channel_data['snr'] > 0].values
+            valid_snr = channel_data['snr'][np.isfinite(channel_data['snr'])].values
             valid_intensity = channel_data['mean_intensity'][channel_data['mean_intensity'] > 0].values
             valid_coverage = channel_data['coverage_pct'].values
             
@@ -1478,9 +1941,16 @@ class QCAnalysisDialog(QtWidgets.QDialog):
         bp1 = ax1.boxplot(snr_data, labels=channels, patch_artist=True)
         for patch in bp1['boxes']:
             patch.set_facecolor('lightblue')
-        ax1.set_yscale('log')
-        ax1.set_ylabel('SNR (log scale)', fontsize=10)
-        ax1.set_title('SNR Distribution across ROIs', fontsize=11, fontweight='bold')
+        snr_values = np.concatenate([np.asarray(values, dtype=float) for values in snr_data]) if snr_data else np.array([])
+        if snr_values.size > 0 and np.any(snr_values <= 0):
+            ax1.set_yscale('symlog', linthresh=1.0)
+            ax1.axhline(y=0.0, color='lightgray', linestyle=':', linewidth=1, alpha=0.6)
+            snr_ylabel = 'SNR (symlog scale)'
+        else:
+            ax1.set_yscale('log')
+            snr_ylabel = 'SNR (log scale)'
+        ax1.set_ylabel(snr_ylabel, fontsize=10)
+        ax1.set_title(self._compose_plot_title('SNR Distribution across ROIs'), fontsize=11, fontweight='bold')
         ax1.tick_params(axis='x', rotation=90, labelsize=xlabel_fontsize)  # Fully vertical text
         ax1.grid(True, alpha=0.3, axis='y')
         
@@ -1490,7 +1960,7 @@ class QCAnalysisDialog(QtWidgets.QDialog):
             patch.set_facecolor('lightgreen')
         ax2.set_yscale('log')
         ax2.set_ylabel('Mean Intensity (log scale)', fontsize=10)
-        ax2.set_title('Intensity Distribution across ROIs', fontsize=11, fontweight='bold')
+        ax2.set_title(self._compose_plot_title('Intensity Distribution across ROIs'), fontsize=11, fontweight='bold')
         ax2.tick_params(axis='x', rotation=90, labelsize=xlabel_fontsize)  # Fully vertical text
         ax2.grid(True, alpha=0.3, axis='y')
         
@@ -1499,7 +1969,7 @@ class QCAnalysisDialog(QtWidgets.QDialog):
         for patch in bp3['boxes']:
             patch.set_facecolor('lightcoral')
         ax3.set_ylabel('% Coverage', fontsize=10)
-        ax3.set_title('Coverage Distribution across ROIs', fontsize=11, fontweight='bold')
+        ax3.set_title(self._compose_plot_title('Coverage Distribution across ROIs'), fontsize=11, fontweight='bold')
         ax3.tick_params(axis='x', rotation=90, labelsize=xlabel_fontsize)  # Fully vertical text
         ax3.grid(True, alpha=0.3, axis='y')
         
@@ -1514,7 +1984,7 @@ class QCAnalysisDialog(QtWidgets.QDialog):
         filename, _ = QtWidgets.QFileDialog.getSaveFileName(
             self,
             "Export QC Results",
-            "qc_results.csv",
+            f"qc_results_{self._get_export_suffix()}.csv" if self._get_export_suffix() else "qc_results.csv",
             "CSV Files (*.csv);;All Files (*)"
         )
         
@@ -1529,16 +1999,20 @@ class QCAnalysisDialog(QtWidgets.QDialog):
     def _save_distribution_plot(self):
         """Save distribution plot."""
         fig = self.distribution_canvas.figure
-        save_figure_with_options(fig, "QC_Distributions", self)
+        suffix = self._get_export_suffix()
+        filename = f"QC_Distributions_{suffix}" if suffix else "QC_Distributions"
+        save_figure_with_options(fig, filename, self)
     
     def _save_snr_intensity_plot(self):
         """Save SNR vs Intensity plot."""
         fig = self.snr_intensity_canvas.figure
-        save_figure_with_options(fig, "SNR_vs_Intensity", self)
+        suffix = self._get_export_suffix()
+        filename = f"SNR_vs_Intensity_{suffix}" if suffix else "SNR_vs_Intensity"
+        save_figure_with_options(fig, filename, self)
     
     def _save_coverage_plot(self):
         """Save coverage plot."""
         fig = self.coverage_canvas.figure
-        save_figure_with_options(fig, "Coverage_Density", self)
-
-
+        suffix = self._get_export_suffix()
+        filename = f"Coverage_Density_{suffix}" if suffix else "Coverage_Density"
+        save_figure_with_options(fig, filename, self)

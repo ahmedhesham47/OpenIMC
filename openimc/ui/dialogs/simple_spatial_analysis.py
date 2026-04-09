@@ -39,13 +39,31 @@ import networkx as nx
 from matplotlib.backends.backend_qt5agg import FigureCanvasQTAgg as FigureCanvas
 from matplotlib.figure import Figure
 from matplotlib.gridspec import GridSpec
-from matplotlib.collections import PathCollection
+from matplotlib.collections import LineCollection, PathCollection
 import matplotlib.pyplot as plt
+from matplotlib import colors as mcolors
 import random
 from collections import defaultdict
 from openimc.utils.logger import get_logger
+from openimc.ui.cluster_utils import (
+    canonicalize_cluster_id,
+    format_default_cluster_label,
+    get_cluster_display_name,
+    is_cluster_column,
+    normalize_cluster_annotation_map,
+    sort_cluster_values,
+)
+from openimc.ui.figure_layout import dense_heatmap_style, fit_canvas_and_draw
+from openimc.ui.utils import benjamini_hochberg_adjust
 from openimc.ui.dialogs.figure_save_dialog import save_figure_with_options
-from openimc.ui.dialogs.progress_dialog import run_blocking_task_with_progress
+from openimc.ui.dialogs.progress_dialog import (
+    run_blocking_task_with_progress,
+    run_blocking_task_with_progress_then_finalize,
+)
+from openimc.ui.dialogs.label_customization_dialogs import (
+    edit_cluster_annotation_map,
+    edit_feature_label_map,
+)
 from openimc.core import spatial_enrichment, spatial_distance_distribution, build_spatial_graph
 from openimc.ui.dialogs.spatial_analysis import (
     SourceFileFilterDialog,
@@ -372,6 +390,7 @@ class SimpleSpatialAnalysisDialog(QtWidgets.QDialog):
         self.cluster_summary_df: Optional[pd.DataFrame] = None
         self.enrichment_df: Optional[pd.DataFrame] = None
         self.distance_df: Optional[pd.DataFrame] = None
+        self.community_results_by_roi: Dict[str, pd.DataFrame] = {}
         self.rng_seed: int = 42
         
         self.spatial_viz_cache: Dict[str, Any] = {}
@@ -382,13 +401,196 @@ class SimpleSpatialAnalysisDialog(QtWidgets.QDialog):
         self.community_analysis_run = False
         
         self.cluster_annotation_map = {}
+        self.feature_label_map = {}
         self.selected_source_files = set()
         self.available_source_files = set()
+        self._spatial_viz_layout_rect = [0.0, 0.0, 0.95, 1.0]
 
         self._create_ui()
+        self._plot_resize_in_progress = False
+        self._plot_resize_timer = QtCore.QTimer(self)
+        self._plot_resize_timer.setSingleShot(True)
+        self._plot_resize_timer.timeout.connect(self._refresh_current_plot_after_resize)
+        if hasattr(self, 'tabs'):
+            self.tabs.currentChanged.connect(self._queue_plot_resize_refresh)
         
         if hasattr(self, 'source_file_status_label'):
             self._update_source_file_status_label()
+
+    def _fit_canvas(self, canvas, *, rect=None, pad: float = 0.9):
+        """Fit the supplied canvas to the live tab geometry and redraw it."""
+        if canvas is None or canvas.width() < 10 or canvas.height() < 10:
+            return
+        fit_canvas_and_draw(canvas, rect=rect, pad=pad, allow_text_compaction=True)
+
+    def _finalize_canvas_render(self, canvas, *, rect=None, pad: float = 0.95):
+        """Force an immediate draw plus a queued second fit after layout settles."""
+        if canvas is None:
+            return
+        try:
+            canvas.show()
+            canvas.updateGeometry()
+            canvas.update()
+            canvas.repaint()
+        except Exception:
+            pass
+
+        self._fit_canvas(canvas, rect=rect, pad=pad)
+
+        app = QtWidgets.QApplication.instance()
+        if app is not None:
+            app.processEvents(QtCore.QEventLoop.AllEvents, 20)
+
+        def _second_pass():
+            if canvas is None or not canvas.figure.axes:
+                return
+            self._fit_canvas(canvas, rect=rect, pad=pad)
+
+        QtCore.QTimer.singleShot(0, _second_pass)
+
+    def _current_plot_canvas_layout(self):
+        """Return the active canvas and layout reservation for the current tab."""
+        if not hasattr(self, 'tabs'):
+            return None
+        current_tab = self.tabs.currentWidget()
+        if current_tab is getattr(self, 'enrichment_tab', None) and self.enrichment_canvas.figure.axes:
+            return self.enrichment_canvas, None, 0.95
+        if current_tab is getattr(self, 'distance_tab', None) and self.distance_canvas.figure.axes:
+            return self.distance_canvas, None, 0.95
+        if current_tab is getattr(self, 'spatial_viz_tab', None) and self.spatial_viz_canvas.figure.axes:
+            rect = self._calculate_spatial_viz_layout_rect()
+            return self.spatial_viz_canvas, rect, 0.95
+        if current_tab is getattr(self, 'community_tab', None) and self.community_canvas.figure.axes:
+            return self.community_canvas, None, 0.95
+        return None
+
+    def _measure_spatial_viz_artist_bbox(self, artist):
+        """Measure an artist in display coordinates using the live spatial canvas renderer."""
+        if artist is None or not hasattr(self, 'spatial_viz_canvas'):
+            return None
+        canvas = self.spatial_viz_canvas
+        figure = getattr(canvas, 'figure', None)
+        if figure is None or getattr(figure, 'canvas', None) is None:
+            return None
+        try:
+            figure.canvas.draw()
+            renderer = figure.canvas.get_renderer()
+            return artist.get_window_extent(renderer=renderer)
+        except Exception:
+            return None
+
+    def _spatial_viz_legend_kwargs(self):
+        """Return compact defaults for the external categorical legend."""
+        return {
+            'loc': 'center left',
+            'bbox_to_anchor': (1.01, 0.5),
+            'frameon': True,
+            'fancybox': True,
+            'shadow': False,
+            'fontsize': 8,
+            'borderaxespad': 0.0,
+            'borderpad': 0.35,
+            'labelspacing': 0.35,
+            'handletextpad': 0.35,
+            'columnspacing': 0.75,
+            'markerscale': 0.95,
+        }
+
+    def _choose_spatial_viz_legend_columns(self, ax, legend_handles, legend_kwargs=None):
+        """Prefer the narrowest legend that still fits within the canvas height."""
+        if not legend_handles:
+            return 1
+        if legend_kwargs is None:
+            legend_kwargs = self._spatial_viz_legend_kwargs()
+
+        figure = self.spatial_viz_canvas.figure
+        best_ncol = 1
+        best_height_fraction = float('inf')
+        target_height_fraction = 0.78
+        max_cols = min(4, len(legend_handles))
+
+        for ncol in range(1, max_cols + 1):
+            legend = ax.legend(handles=legend_handles, ncol=ncol, **legend_kwargs)
+            bbox = self._measure_spatial_viz_artist_bbox(legend)
+            try:
+                legend.remove()
+            except Exception:
+                pass
+
+            if bbox is None:
+                continue
+
+            height_fraction = bbox.height / max(1.0, float(figure.bbox.height))
+            if height_fraction < best_height_fraction:
+                best_height_fraction = height_fraction
+                best_ncol = ncol
+            if height_fraction <= target_height_fraction:
+                return ncol
+
+        return best_ncol
+
+    def _calculate_spatial_viz_layout_rect(self, ax=None, *, base_right: float = 0.95):
+        """Reserve only the right-side width actually needed by the spatial legend/colorbar."""
+        if not hasattr(self, 'spatial_viz_canvas'):
+            return None
+        figure = self.spatial_viz_canvas.figure
+        if not figure.axes:
+            return self._spatial_viz_layout_rect
+
+        rect = [0.0, 0.0, float(base_right), 1.0]
+        if ax is None:
+            ax = figure.axes[0]
+
+        legend = ax.get_legend()
+        if legend is not None:
+            bbox = self._measure_spatial_viz_artist_bbox(legend)
+            if bbox is not None:
+                reserve_fraction = (bbox.width / max(1.0, float(figure.bbox.width))) + 0.02
+                reserve_fraction = min(0.36, max(0.12, reserve_fraction))
+                rect[2] = max(0.60, min(rect[2], 1.0 - reserve_fraction))
+                return rect
+            return [0.0, 0.0, 0.82, 1.0]
+
+        if len(figure.axes) > 1:
+            rect[2] = min(rect[2], 0.88)
+
+        return rect
+
+    def _queue_plot_resize_refresh(self, *_args):
+        """Debounce plot reflow while the dialog is being resized or tabs switch."""
+        if self._plot_resize_in_progress or not self.isVisible():
+            return
+        if self._current_plot_canvas_layout() is None:
+            return
+        self._plot_resize_timer.start(140)
+
+    def _refresh_current_plot_after_resize(self):
+        """Refit the currently visible plot to the latest canvas size."""
+        if self._plot_resize_in_progress:
+            return
+        layout = self._current_plot_canvas_layout()
+        if layout is None:
+            return
+        canvas, rect, pad = layout
+        try:
+            self._plot_resize_in_progress = True
+            self._fit_canvas(canvas, rect=rect, pad=pad)
+        finally:
+            self._plot_resize_in_progress = False
+
+    def resizeEvent(self, event):
+        """Keep the active spatial plot fitted to the dialog canvas."""
+        super().resizeEvent(event)
+        if event is None:
+            return
+        try:
+            old_size = event.oldSize()
+            new_size = event.size()
+            if old_size.isValid() and new_size == old_size:
+                return
+        except Exception:
+            pass
+        self._queue_plot_resize_refresh()
     
     def _get_roi_column(self):
         """Get the appropriate ROI column name."""
@@ -647,12 +849,18 @@ class SimpleSpatialAnalysisDialog(QtWidgets.QDialog):
         layout.addWidget(params_group)
 
         action_row = QtWidgets.QHBoxLayout()
-        self.export_btn = QtWidgets.QPushButton("Export Results…")
+        self.export_btn = QtWidgets.QPushButton("Export All Results…")
         self.export_btn.setEnabled(False)
         self.export_graph_btn = QtWidgets.QPushButton("Export Graph…")
         self.export_graph_btn.setEnabled(False)
         action_row.addWidget(self.export_btn)
         action_row.addWidget(self.export_graph_btn)
+        self.cluster_labels_btn = QtWidgets.QPushButton("Customize Cluster Names…")
+        self.cluster_labels_btn.setToolTip("Set custom display names for spatial-analysis cluster labels.")
+        action_row.addWidget(self.cluster_labels_btn)
+        self.feature_labels_btn = QtWidgets.QPushButton("Customize Feature Labels…")
+        self.feature_labels_btn.setToolTip("Set custom display names for features used in spatial analysis.")
+        action_row.addWidget(self.feature_labels_btn)
         action_row.addStretch(1)
         
         # Advanced analysis button
@@ -661,6 +869,28 @@ class SimpleSpatialAnalysisDialog(QtWidgets.QDialog):
             "Open Advanced Spatial Analysis using Squidpy for more sophisticated spatial analysis methods, "
             "including neighborhood enrichment, co-occurrence analysis, spatial autocorrelation, and Ripley functions. "
             "Requires squidpy to be installed."
+        )
+        self.advanced_analysis_btn.setStyleSheet(
+            """
+            QPushButton {
+                font-weight: 700;
+                padding: 8px 14px;
+                border: 1px solid #2d6a4f;
+                border-radius: 6px;
+                color: #123524;
+                background: qlineargradient(
+                    x1: 0, y1: 0, x2: 1, y2: 1,
+                    stop: 0 #e9f7ef,
+                    stop: 1 #cfead8
+                );
+            }
+            QPushButton:hover {
+                background: #d8f1e0;
+            }
+            QPushButton:pressed {
+                background: #c4e3cf;
+            }
+            """
         )
         action_row.addWidget(self.advanced_analysis_btn)
         layout.addLayout(action_row)
@@ -690,8 +920,11 @@ class SimpleSpatialAnalysisDialog(QtWidgets.QDialog):
         self.enrichment_run_btn = QtWidgets.QPushButton("Run Enrichment Analysis")
         self.enrichment_save_btn = QtWidgets.QPushButton("Save Plot")
         self.enrichment_save_btn.setEnabled(False)
+        self.enrichment_export_btn = QtWidgets.QPushButton("Export Results…")
+        self.enrichment_export_btn.setEnabled(False)
         enrichment_params.addWidget(self.enrichment_run_btn)
         enrichment_params.addWidget(self.enrichment_save_btn)
+        enrichment_params.addWidget(self.enrichment_export_btn)
         enrichment_params.addStretch()
         enrichment_layout.addLayout(enrichment_params)
         
@@ -728,8 +961,11 @@ class SimpleSpatialAnalysisDialog(QtWidgets.QDialog):
         self.distance_run_btn = QtWidgets.QPushButton("Run Distance Analysis")
         self.distance_save_btn = QtWidgets.QPushButton("Save Plot")
         self.distance_save_btn.setEnabled(False)
+        self.distance_export_btn = QtWidgets.QPushButton("Export Results…")
+        self.distance_export_btn.setEnabled(False)
         distance_btn_layout.addWidget(self.distance_run_btn)
         distance_btn_layout.addWidget(self.distance_save_btn)
+        distance_btn_layout.addWidget(self.distance_export_btn)
         distance_btn_layout.addStretch()
         distance_layout.addLayout(distance_btn_layout)
         
@@ -796,7 +1032,10 @@ class SimpleSpatialAnalysisDialog(QtWidgets.QDialog):
         self.spatial_color_combo = QtWidgets.QComboBox()
         self.spatial_color_combo.setEditable(True)
         self.spatial_color_combo.setInsertPolicy(QtWidgets.QComboBox.NoInsert)
-        self.spatial_color_combo.completer().setCompletionMode(QtWidgets.QCompleter.PopupCompletion)
+        if self.spatial_color_combo.completer() is not None:
+            self.spatial_color_combo.completer().setCompletionMode(QtWidgets.QCompleter.PopupCompletion)
+            self.spatial_color_combo.completer().setCaseSensitivity(QtCore.Qt.CaseInsensitive)
+            self.spatial_color_combo.completer().setFilterMode(QtCore.Qt.MatchContains)
         self.spatial_color_combo.setToolTip("Search and select feature for color encoding")
         spatial_viz_controls.addWidget(self.spatial_color_combo)
         
@@ -847,8 +1086,11 @@ class SimpleSpatialAnalysisDialog(QtWidgets.QDialog):
         self.community_run_btn = QtWidgets.QPushButton("Run Community Analysis")
         self.community_save_btn = QtWidgets.QPushButton("Save Plot")
         self.community_save_btn.setEnabled(False)
+        self.community_export_btn = QtWidgets.QPushButton("Export Results…")
+        self.community_export_btn.setEnabled(False)
         community_controls.addWidget(self.community_run_btn)
         community_controls.addWidget(self.community_save_btn)
+        community_controls.addWidget(self.community_export_btn)
         community_controls.addStretch()
         community_layout.addLayout(community_controls)
         
@@ -875,6 +1117,8 @@ class SimpleSpatialAnalysisDialog(QtWidgets.QDialog):
         self.distance_run_btn.clicked.connect(self._run_distance_analysis)
         self.enrichment_save_btn.clicked.connect(self._save_enrichment_plot)
         self.distance_save_btn.clicked.connect(self._save_distance_plot)
+        self.enrichment_export_btn.clicked.connect(self._export_enrichment_results)
+        self.distance_export_btn.clicked.connect(self._export_distance_results)
         self.spatial_viz_run_btn.clicked.connect(self._run_spatial_visualization)
         self.spatial_viz_save_btn.clicked.connect(self._save_spatial_viz_plot)
         self.spatial_color_combo.currentTextChanged.connect(self._on_spatial_viz_option_changed)
@@ -882,8 +1126,11 @@ class SimpleSpatialAnalysisDialog(QtWidgets.QDialog):
         self.spatial_show_edges_check.toggled.connect(self._on_spatial_viz_option_changed)
         self.community_run_btn.clicked.connect(self._run_community_analysis)
         self.community_save_btn.clicked.connect(self._save_community_plot)
+        self.community_export_btn.clicked.connect(self._export_community_results)
         self.export_btn.clicked.connect(self._export_results)
         self.export_graph_btn.clicked.connect(self._export_graph)
+        self.cluster_labels_btn.clicked.connect(self._open_cluster_labels_dialog)
+        self.feature_labels_btn.clicked.connect(self._open_feature_labels_dialog)
         self.advanced_analysis_btn.clicked.connect(self._open_advanced_analysis)
         
         self._update_tab_states()
@@ -939,17 +1186,38 @@ class SimpleSpatialAnalysisDialog(QtWidgets.QDialog):
         self.distance_save_btn.setEnabled(self.distance_analysis_run)
         self.spatial_viz_save_btn.setEnabled(self.spatial_viz_run)
         self.community_save_btn.setEnabled(self.community_analysis_run)
+        self.enrichment_export_btn.setEnabled(self.enrichment_analysis_run)
+        self.distance_export_btn.setEnabled(self.distance_analysis_run)
+        self.community_export_btn.setEnabled(bool(self.community_results_by_roi))
+        self.export_btn.setEnabled(
+            self.enrichment_analysis_run
+            or self.distance_analysis_run
+            or bool(self.community_results_by_roi)
+        )
 
         self.export_graph_btn.setEnabled(graph_built)
 
+    def _sorted_cluster_ids(self, clusters) -> List[Any]:
+        """Return cluster ids in numeric cluster-id order."""
+        return sort_cluster_values(clusters, annotation_map=self.cluster_annotation_map, canonical=False)
+
+    def _get_cluster_color_map(self, clusters) -> Dict[Any, Any]:
+        """Return a stable cluster-to-color mapping for categorical plots."""
+        ordered_clusters = self._sorted_cluster_ids(clusters)
+        palette = _get_vivid_colors(len(ordered_clusters))
+        return {
+            cluster: palette[idx]
+            for idx, cluster in enumerate(ordered_clusters)
+        }
+
     def _load_cluster_annotations(self):
-        """Load cluster annotations from parent dialog if available."""
+        """Load cluster and feature display names from the clustering dialog if available."""
         try:
-            parent = self.parent()
-            if parent is not None and hasattr(parent, 'cluster_annotation_map'):
-                self.cluster_annotation_map = parent.cluster_annotation_map.copy()
-            elif parent is not None and hasattr(parent, '_get_cluster_display_name'):
-                pass
+            label_source = self._get_label_source_dialog()
+            if label_source is not None and hasattr(label_source, 'cluster_annotation_map'):
+                self.cluster_annotation_map = normalize_cluster_annotation_map(label_source.cluster_annotation_map or {})
+            if label_source is not None and hasattr(label_source, 'feature_label_map'):
+                self.feature_label_map = dict(label_source.feature_label_map or {})
             
             if self.feature_dataframe is not None and 'cluster_phenotype' in self.feature_dataframe.columns:
                 phenotype_map = {}
@@ -961,47 +1229,199 @@ class SimpleSpatialAnalysisDialog(QtWidgets.QDialog):
                             (self.feature_dataframe['cluster_phenotype'] != '')
                         ]
                         if not phenotype_rows.empty:
-                            phenotype_map[cluster_id] = phenotype_rows['cluster_phenotype'].iloc[0]
+                            phenotype_map[canonicalize_cluster_id(cluster_id)] = phenotype_rows['cluster_phenotype'].iloc[0]
                 
                 if phenotype_map:
-                    self.cluster_annotation_map.update(phenotype_map)
-                    
-        except Exception as e:
+                    self.cluster_annotation_map.update(normalize_cluster_annotation_map(phenotype_map))
+            
+            self._apply_cluster_annotations_to_dataframes()
+        except Exception:
             pass
+
+    def _get_label_source_dialog(self):
+        """Return the best available dialog or parent object for shared label maps."""
+        parent = self.parent()
+        if parent is None:
+            return None
+        if hasattr(parent, 'clustering_dialog') and parent.clustering_dialog is not None:
+            return parent.clustering_dialog
+        return parent
+
+    def _apply_cluster_annotations_to_dataframes(self):
+        """Mirror the current cluster display names into cluster_phenotype columns when present."""
+        for dataframe_attr in ('feature_dataframe', 'original_feature_dataframe', 'batch_corrected_dataframe'):
+            df = getattr(self, dataframe_attr, None)
+            if df is None or 'cluster' not in df.columns:
+                continue
+            phenotype_series = df['cluster'].map(
+                lambda cluster_id: self._get_cluster_display_name(cluster_id)
+            )
+            df.loc[:, 'cluster_phenotype'] = phenotype_series
+
+    def _format_default_cluster_name(self, cluster_id) -> str:
+        """Return the default display label for an unannotated cluster id."""
+        return format_default_cluster_label(cluster_id)
+
+    def _get_feature_display_name(self, feature_name: str) -> str:
+        """Return the custom display name for a feature when available."""
+        return self.feature_label_map.get(feature_name, feature_name)
+
+    def _get_feature_name_from_display(self, label: str) -> str:
+        """Resolve a display label back to its underlying feature name when possible."""
+        if not label:
+            return label
+        for feature_name, display_name in self.feature_label_map.items():
+            if display_name == label:
+                return feature_name
+        return label
+
+    def _get_spatial_feature_columns(self) -> List[str]:
+        """Return numeric mean-intensity feature columns for spatial coloring."""
+        if self.feature_dataframe is None or self.feature_dataframe.empty:
+            return []
+        exclude = {
+            'cell_id',
+            'centroid_x',
+            'centroid_y',
+            'cluster',
+            'cluster_id',
+            'cluster_phenotype',
+            'acquisition_id',
+        }
+        numeric_cols = self.feature_dataframe.select_dtypes(include=[np.number]).columns
+        return [
+            column
+            for column in numeric_cols
+            if column not in exclude and str(column).endswith('_mean')
+        ]
+
+    def _get_selected_spatial_color_option(self) -> str:
+        """Return the actual selected column for the spatial color selector."""
+        if not hasattr(self, 'spatial_color_combo'):
+            return 'cluster'
+        current_index = self.spatial_color_combo.currentIndex()
+        if current_index >= 0:
+            actual_value = self.spatial_color_combo.itemData(current_index)
+            if actual_value:
+                return actual_value
+        current_text = self.spatial_color_combo.currentText().strip()
+        cluster_display_map = {
+            'Cluster': 'cluster',
+            'Cluster ID': 'cluster_id',
+            'Cluster phenotype': 'cluster_phenotype',
+        }
+        if current_text in cluster_display_map:
+            return cluster_display_map[current_text]
+        return self._get_feature_name_from_display(current_text)
+
+    def _get_color_option_display_name(self, color_option: str) -> str:
+        """Return a readable label for the selected spatial color option."""
+        if color_option == 'cluster':
+            return 'Cluster'
+        if color_option == 'cluster_id':
+            return 'Cluster ID'
+        if color_option == 'cluster_phenotype':
+            return 'Cluster phenotype'
+        return self._get_feature_display_name(color_option)
+
+    def _is_continuous_spatial_color_option(self, color_option: str, roi_df: Optional[pd.DataFrame]) -> bool:
+        """Return True when a spatial color option should use a scalar colormap."""
+        if roi_df is None or roi_df.empty or color_option not in roi_df.columns:
+            return False
+        if is_cluster_column(color_option):
+            return False
+        return bool(pd.api.types.is_numeric_dtype(roi_df[color_option]))
+
+    def _sync_label_maps_to_parent(self):
+        """Push cluster and feature display names back to the clustering dialog when possible."""
+        label_source = self._get_label_source_dialog()
+        if label_source is None:
+            return
+        if hasattr(label_source, 'cluster_annotation_map'):
+            label_source.cluster_annotation_map = normalize_cluster_annotation_map(self.cluster_annotation_map)
+            if hasattr(label_source, '_apply_cluster_annotations'):
+                try:
+                    label_source._apply_cluster_annotations()
+                except Exception:
+                    pass
+        if hasattr(label_source, 'feature_label_map'):
+            label_source.feature_label_map = dict(self.feature_label_map)
+
+    def _refresh_label_dependent_views(self):
+        """Refresh controls and plots that depend on cluster or feature display names."""
+        if hasattr(self, '_populate_spatial_color_options'):
+            self._populate_spatial_color_options()
+        if hasattr(self, '_populate_exclude_clusters_list'):
+            self._populate_exclude_clusters_list()
+        if self.enrichment_analysis_run:
+            self._update_enrichment_plot()
+        if self.distance_df is not None and not self.distance_df.empty:
+            self._populate_distance_cluster_list()
+
+        if self.spatial_viz_run and hasattr(self, 'roi_combo'):
+            roi_id = self.roi_combo.currentData()
+            if roi_id in self.spatial_viz_cache:
+                self._render_spatial_visualization(roi_id, self.spatial_viz_cache[roi_id])
+
+    def _open_cluster_labels_dialog(self):
+        """Open a dialog to customize cluster display names for spatial plots."""
+        filtered_df = self._get_filtered_dataframe()
+        if filtered_df is None or filtered_df.empty or 'cluster' not in filtered_df.columns:
+            QtWidgets.QMessageBox.warning(self, "No Clusters", "No cluster assignments are available to relabel.")
+            return
+        cluster_ids = sort_cluster_values(filtered_df['cluster'].dropna().unique(), annotation_map=self.cluster_annotation_map, canonical=True)
+        updated_map = edit_cluster_annotation_map(self, cluster_ids, self.cluster_annotation_map)
+        if updated_map is None:
+            return
+        self.cluster_annotation_map = normalize_cluster_annotation_map(updated_map)
+        self._apply_cluster_annotations_to_dataframes()
+        self._sync_label_maps_to_parent()
+        self._refresh_label_dependent_views()
+        QtWidgets.QMessageBox.information(self, "Labels Applied", "Cluster names have been updated for spatial analysis.")
+
+    def _open_feature_labels_dialog(self):
+        """Open a dialog to customize feature display names for spatial plots."""
+        feature_columns = self._get_spatial_feature_columns()
+        if not feature_columns:
+            QtWidgets.QMessageBox.warning(self, "No Features", "No numeric features are available to relabel.")
+            return
+        updated_map = edit_feature_label_map(self, feature_columns, self.feature_label_map)
+        if updated_map is None:
+            return
+        self.feature_label_map = updated_map
+        self._sync_label_maps_to_parent()
+        self._refresh_label_dependent_views()
+        QtWidgets.QMessageBox.information(self, "Labels Applied", "Feature labels have been updated for spatial analysis.")
 
     def _get_cluster_display_name(self, cluster_id):
         """Return display label for a cluster id, using annotation if available."""
-        # Handle NaN values
-        if pd.isna(cluster_id):
-            return "Unknown Cluster"
-        
         try:
             parent = self.parent()
             if parent is not None and hasattr(parent, '_get_cluster_display_name'):
                 return parent._get_cluster_display_name(cluster_id)
         except Exception:
             pass
-        
-        if isinstance(self.cluster_annotation_map, dict) and cluster_id in self.cluster_annotation_map and self.cluster_annotation_map[cluster_id]:
-            name = self.cluster_annotation_map[cluster_id]
-            return name.replace('_', ' ')
-        
-        try:
-            return f"Cluster {int(cluster_id)}"
-        except (ValueError, TypeError):
-            return f"Cluster {cluster_id}"
+
+        return get_cluster_display_name(cluster_id, annotation_map=self.cluster_annotation_map)
 
     def _check_annotation_updates(self):
-        """Periodically check for cluster annotation updates from parent."""
+        """Periodically pull shared label maps from the clustering dialog."""
         try:
-            parent = self.parent()
-            if parent is not None and hasattr(parent, 'cluster_annotation_map'):
-                new_map = parent.cluster_annotation_map
-                if new_map != self.cluster_annotation_map:
-                    self.cluster_annotation_map = new_map.copy()
-                    # Update plots if they're already generated
-                    if self.enrichment_analysis_run:
-                        self._update_enrichment_plot()
+            label_source = self._get_label_source_dialog()
+            maps_changed = False
+            if label_source is not None and hasattr(label_source, 'cluster_annotation_map'):
+                new_cluster_map = normalize_cluster_annotation_map(label_source.cluster_annotation_map or {})
+                if new_cluster_map != self.cluster_annotation_map:
+                    self.cluster_annotation_map = new_cluster_map
+                    maps_changed = True
+            if label_source is not None and hasattr(label_source, 'feature_label_map'):
+                new_feature_map = dict(label_source.feature_label_map or {})
+                if new_feature_map != self.feature_label_map:
+                    self.feature_label_map = new_feature_map
+                    maps_changed = True
+            if maps_changed:
+                self._apply_cluster_annotations_to_dataframes()
+                self._refresh_label_dependent_views()
         except Exception:
             pass
 
@@ -1202,31 +1622,64 @@ class SimpleSpatialAnalysisDialog(QtWidgets.QDialog):
     
     def _run_enrichment_analysis(self):
         """Run pairwise enrichment analysis."""
-        
         if not self._validate_data():
             return
-            
+
         if self.edge_df is None or self.edge_df.empty:
             QtWidgets.QMessageBox.warning(self, "No Graph", "Please build the spatial graph first using the 'Build Graph' button.")
             return
-        
+
+        cluster_col = self._get_active_cluster_column()
+        if cluster_col is None:
+            QtWidgets.QMessageBox.warning(
+                self,
+                "No Cluster Column",
+                "No cluster column found. Please ensure your data has a 'cluster', 'cluster_phenotype', or 'cluster_id' column."
+            )
+            return
+
         try:
             n_perm = int(self.n_perm_spin.value())
-            self._compute_pairwise_enrichment(n_perm=n_perm)
-            
-            self.enrichment_analysis_run = True
-            
-            
-            # Log enrichment analysis
-            logger = get_logger()
             filtered_df = self._get_filtered_dataframe()
             roi_col = self._get_roi_column()
+            seed = self.seed_spinbox.value()
+            n_workers = int(self.workers_spin.value())
+
+            def _enrichment_task():
+                return self._compute_pairwise_enrichment(
+                    n_perm=n_perm,
+                    filtered_df=filtered_df,
+                    cluster_col=cluster_col,
+                    roi_col=roi_col,
+                    seed=seed,
+                    n_workers=n_workers,
+                )
+
+            def _finalize_enrichment(results_df, _progress):
+                self.enrichment_df = results_df if results_df is not None else pd.DataFrame()
+                self.enrichment_analysis_run = bool(
+                    self.enrichment_df is not None and not self.enrichment_df.empty
+                )
+                self._update_tab_states()
+                self._update_enrichment_plot()
+
+            run_blocking_task_with_progress_then_finalize(
+                parent=self,
+                window_title="Enrichment Analysis",
+                initial_message="Computing enrichment analysis",
+                detail_text="Running permutation-based enrichment across ROIs.",
+                task=_enrichment_task,
+                finalize=_finalize_enrichment,
+                finishing_message="Rendering enrichment plot",
+                finishing_detail_text="Drawing the fitted heatmap in the current tab.",
+            )
+
+            logger = get_logger()
             acquisitions = list(filtered_df[roi_col].unique()) if roi_col in filtered_df.columns else []
             params = {
                 "n_permutations": n_perm,
                 "seed": self.seed_spinbox.value()
             }
-            # Get source file names from dataframe
             source_file = self._get_source_files_for_logging()
             logger.log_spatial_analysis(
                 analysis_type="pairwise_enrichment",
@@ -1236,11 +1689,6 @@ class SimpleSpatialAnalysisDialog(QtWidgets.QDialog):
                 source_file=source_file
             )
             
-            QtWidgets.QMessageBox.information(self, "Enrichment Analysis", "Enrichment analysis completed successfully.")
-            
-            # Update visualization
-            self._update_enrichment_plot()
-            
         except Exception as e:
             import traceback
             traceback.print_exc()
@@ -1248,26 +1696,58 @@ class SimpleSpatialAnalysisDialog(QtWidgets.QDialog):
     
     def _run_distance_analysis(self):
         """Run distance distribution analysis."""
-        
         if not self._validate_data():
             return
-            
+
         if self.edge_df is None or self.edge_df.empty:
             QtWidgets.QMessageBox.warning(self, "No Graph", "Please build the spatial graph first using the 'Build Graph' button.")
             return
-            
+
+        cluster_col = self._get_active_cluster_column()
+        if cluster_col is None:
+            QtWidgets.QMessageBox.warning(
+                self,
+                "No Cluster Column",
+                "No cluster column found. Please ensure your data has a 'cluster', 'cluster_phenotype', or 'cluster_id' column."
+            )
+            return
+
         try:
-            self._compute_distance_distributions()
-            
-            self.distance_analysis_run = True
-            
-            
-            # Log distance analysis
-            logger = get_logger()
             filtered_df = self._get_filtered_dataframe()
             roi_col = self._get_roi_column()
+            pixel_size_um = self._get_default_pixel_size_um(filtered_df, roi_col)
+            n_workers = int(self.distance_workers_spin.value()) if hasattr(self, 'distance_workers_spin') else None
+
+            def _distance_task():
+                return self._compute_distance_distributions(
+                    filtered_df=filtered_df,
+                    cluster_col=cluster_col,
+                    roi_col=roi_col,
+                    pixel_size_um=pixel_size_um,
+                    n_workers=n_workers,
+                )
+
+            def _finalize_distance(results_df, _progress):
+                self.distance_df = results_df if results_df is not None else pd.DataFrame()
+                self.distance_analysis_run = bool(
+                    self.distance_df is not None and not self.distance_df.empty
+                )
+                self._update_tab_states()
+                self._populate_distance_cluster_list()
+
+            run_blocking_task_with_progress_then_finalize(
+                parent=self,
+                window_title="Distance Distribution Analysis",
+                initial_message="Computing distance distributions",
+                detail_text="Calculating nearest-neighbor distances across ROIs.",
+                task=_distance_task,
+                finalize=_finalize_distance,
+                finishing_message="Rendering distance plot",
+                finishing_detail_text="Drawing the fitted cluster-distance distributions.",
+            )
+
+            logger = get_logger()
             acquisitions = list(filtered_df[roi_col].unique()) if roi_col in filtered_df.columns else []
-            # Get source file names from dataframe
             source_file = self._get_source_files_for_logging()
             logger.log_spatial_analysis(
                 analysis_type="distance_distribution",
@@ -1277,109 +1757,23 @@ class SimpleSpatialAnalysisDialog(QtWidgets.QDialog):
                 source_file=source_file
             )
             
-            QtWidgets.QMessageBox.information(self, "Distance Analysis", "Distance analysis completed successfully.")
-            
-            # Populate cluster list and update visualization
-            self._populate_distance_cluster_list()
-            
         except Exception as e:
             import traceback
             traceback.print_exc()
             QtWidgets.QMessageBox.critical(self, "Distance Analysis Error", f"Error: {str(e)}")
     
-    def _compute_pairwise_enrichment(self, n_perm=100):
-        """Compute pairwise interaction enrichment analysis using core function."""
-        if self.edge_df is None or self.edge_df.empty:
-            return
-            
-        # Use detected cluster column (already validated in _run_analysis)
-        cluster_col = None
-        for col in ['cluster', 'cluster_phenotype', 'cluster_id']:
-            if col in self.feature_dataframe.columns:
-                cluster_col = col
-                break
-        
-        if cluster_col is None:
-            QtWidgets.QMessageBox.warning(
-                self, 
-                "No Cluster Column", 
-                "No cluster column found. Please ensure your data has a 'cluster', 'cluster_phenotype', or 'cluster_id' column."
-            )
-            return
-        
-        # Get filtered dataframe (respects source file filter)
-        filtered_df = self._get_filtered_dataframe()
-        
-        # Get ROI column
-        roi_col = self._get_roi_column()
-        seed = self.seed_spinbox.value()
-        
-        try:
-            # Get number of workers from UI
-            n_workers = int(self.workers_spin.value())
-
-            def _enrichment_task():
-                return spatial_enrichment(
-                    features_df=filtered_df,
-                    edges_df=self.edge_df,
-                    cluster_column=cluster_col,
-                    n_permutations=n_perm,
-                    seed=seed,
-                    roi_column=roi_col,
-                    output_path=None,
-                    n_workers=n_workers,
-                )
-
-            self.enrichment_df = run_blocking_task_with_progress(
-                parent=self,
-                window_title="Enrichment Analysis",
-                initial_message="Computing enrichment analysis",
-                detail_text="Running permutation-based enrichment across ROIs.",
-                task=_enrichment_task,
-            )
-        except Exception as e:
-            QtWidgets.QMessageBox.critical(
-                self,
-                "Enrichment Analysis Error",
-                f"Error computing enrichment: {str(e)}"
-            )
-            import traceback
-            traceback.print_exc()
-            self.enrichment_df = pd.DataFrame()
-    
-    def _compute_distance_distributions(self):
-        """Compute distance distribution analysis using core function."""
+    def _get_active_cluster_column(self) -> Optional[str]:
+        """Return the preferred cluster-label column for spatial analysis."""
         if self.feature_dataframe is None or self.feature_dataframe.empty:
-            return
-        
-        if self.edge_df is None or self.edge_df.empty:
-            return
-            
-        # Use detected cluster column (already validated in _run_analysis)
-        cluster_col = None
+            return None
         for col in ['cluster', 'cluster_phenotype', 'cluster_id']:
             if col in self.feature_dataframe.columns:
-                cluster_col = col
-                break
-        
-        if cluster_col is None:
-            QtWidgets.QMessageBox.warning(
-                self, 
-                "No Cluster Column", 
-                "No cluster column found. Please ensure your data has a 'cluster', 'cluster_phenotype', or 'cluster_id' column."
-            )
-            return
-        
-        # Get pixel size for distance conversion
+                return col
+        return None
+
+    def _get_default_pixel_size_um(self, filtered_df: pd.DataFrame, roi_col: str) -> float:
+        """Return the first available pixel size for the filtered dataset."""
         parent = self.parent() if hasattr(self, 'parent') else None
-        
-        # Get filtered dataframe (respects source file filter)
-        filtered_df = self._get_filtered_dataframe()
-        
-        # Get ROI column
-        roi_col = self._get_roi_column()
-        
-        # Get pixel size (use first ROI's pixel size as default, default to 1.0 um if not available)
         pixel_size_um = 1.0
         if roi_col and roi_col in filtered_df.columns:
             first_roi = filtered_df[roi_col].iloc[0] if len(filtered_df) > 0 else None
@@ -1388,42 +1782,87 @@ class SimpleSpatialAnalysisDialog(QtWidgets.QDialog):
                     pixel_size = parent._get_pixel_size_um(first_roi)
                     if pixel_size is not None:
                         pixel_size_um = float(pixel_size)
-                    # If None, keep default 1.0
                 except Exception:
-                    # Default to 1.0 um if pixel size cannot be retrieved (e.g., MCD file not loaded)
                     pixel_size_um = 1.0
-        
-        # Get number of workers from UI
-        n_workers = int(self.distance_workers_spin.value()) if hasattr(self, 'distance_workers_spin') else None
-        
-        try:
-            def _distance_task():
-                return spatial_distance_distribution(
-                    features_df=filtered_df,
-                    edges_df=self.edge_df,
-                    cluster_column=cluster_col,
-                    roi_column=roi_col,
-                    output_path=None,
-                    pixel_size_um=pixel_size_um,
-                    n_workers=n_workers,
-                )
+        return pixel_size_um
 
-            self.distance_df = run_blocking_task_with_progress(
-                parent=self,
-                window_title="Distance Distribution Analysis",
-                initial_message="Computing distance distributions",
-                detail_text="Calculating nearest-neighbor distances across ROIs.",
-                task=_distance_task,
-            )
-        except Exception as e:
-            QtWidgets.QMessageBox.critical(
-                self,
-                "Distance Distribution Error",
-                f"Error computing distance distributions: {str(e)}"
-            )
-            import traceback
-            traceback.print_exc()
-            self.distance_df = pd.DataFrame()
+    def _compute_pairwise_enrichment(
+        self,
+        *,
+        n_perm=100,
+        filtered_df: Optional[pd.DataFrame] = None,
+        cluster_col: Optional[str] = None,
+        roi_col: Optional[str] = None,
+        seed: Optional[int] = None,
+        n_workers: Optional[int] = None,
+    ) -> pd.DataFrame:
+        """Compute pairwise interaction enrichment analysis using the core function."""
+        if self.edge_df is None or self.edge_df.empty:
+            return pd.DataFrame()
+
+        if cluster_col is None:
+            cluster_col = self._get_active_cluster_column()
+        if cluster_col is None:
+            raise ValueError("No cluster column found for enrichment analysis.")
+
+        if filtered_df is None:
+            filtered_df = self._get_filtered_dataframe()
+        if roi_col is None:
+            roi_col = self._get_roi_column()
+        if seed is None:
+            seed = self.seed_spinbox.value()
+        if n_workers is None:
+            n_workers = int(self.workers_spin.value())
+
+        return spatial_enrichment(
+            features_df=filtered_df,
+            edges_df=self.edge_df,
+            cluster_column=cluster_col,
+            n_permutations=n_perm,
+            seed=seed,
+            roi_column=roi_col,
+            output_path=None,
+            n_workers=n_workers,
+        )
+
+    def _compute_distance_distributions(
+        self,
+        *,
+        filtered_df: Optional[pd.DataFrame] = None,
+        cluster_col: Optional[str] = None,
+        roi_col: Optional[str] = None,
+        pixel_size_um: Optional[float] = None,
+        n_workers: Optional[int] = None,
+    ) -> pd.DataFrame:
+        """Compute distance distribution analysis using the core function."""
+        if self.feature_dataframe is None or self.feature_dataframe.empty:
+            return pd.DataFrame()
+        if self.edge_df is None or self.edge_df.empty:
+            return pd.DataFrame()
+
+        if cluster_col is None:
+            cluster_col = self._get_active_cluster_column()
+        if cluster_col is None:
+            raise ValueError("No cluster column found for distance analysis.")
+
+        if filtered_df is None:
+            filtered_df = self._get_filtered_dataframe()
+        if roi_col is None:
+            roi_col = self._get_roi_column()
+        if pixel_size_um is None:
+            pixel_size_um = self._get_default_pixel_size_um(filtered_df, roi_col)
+        if n_workers is None and hasattr(self, 'distance_workers_spin'):
+            n_workers = int(self.distance_workers_spin.value())
+
+        return spatial_distance_distribution(
+            features_df=filtered_df,
+            edges_df=self.edge_df,
+            cluster_column=cluster_col,
+            roi_column=roi_col,
+            output_path=None,
+            pixel_size_um=pixel_size_um,
+            n_workers=n_workers,
+        )
     
     def _populate_roi_combo(self):
         """Populate ROI combo box."""
@@ -1436,19 +1875,27 @@ class SimpleSpatialAnalysisDialog(QtWidgets.QDialog):
     
     def _populate_spatial_color_options(self):
         """Populate spatial color combo box with available features."""
+        current_actual = self._get_selected_spatial_color_option()
+        self.spatial_color_combo.blockSignals(True)
         self.spatial_color_combo.clear()
         filtered_df = self._get_filtered_dataframe()
         
         # Add cluster columns
         for col in ['cluster', 'cluster_phenotype', 'cluster_id']:
             if col in filtered_df.columns:
-                self.spatial_color_combo.addItem(col)
+                self.spatial_color_combo.addItem(self._get_color_option_display_name(col), col)
         
         # Add numeric feature columns
-        numeric_cols = filtered_df.select_dtypes(include=[np.number]).columns
-        for col in numeric_cols:
-            if col not in ['cell_id', 'centroid_x', 'centroid_y']:
-                self.spatial_color_combo.addItem(col)
+        for col in self._get_spatial_feature_columns():
+            if col in filtered_df.columns:
+                self.spatial_color_combo.addItem(self._get_feature_display_name(col), col)
+
+        if current_actual:
+            for idx in range(self.spatial_color_combo.count()):
+                if self.spatial_color_combo.itemData(idx) == current_actual:
+                    self.spatial_color_combo.setCurrentIndex(idx)
+                    break
+        self.spatial_color_combo.blockSignals(False)
     
     def _populate_community_roi_combo(self):
         """Populate community ROI combo box."""
@@ -1471,7 +1918,11 @@ class SimpleSpatialAnalysisDialog(QtWidgets.QDialog):
                 break
         
         if cluster_col:
-            unique_clusters = sorted(filtered_df[cluster_col].dropna().unique())
+            unique_clusters = sort_cluster_values(
+                filtered_df[cluster_col].dropna().unique(),
+                annotation_map=self.cluster_annotation_map,
+                canonical=False,
+            )
             for cluster_id in unique_clusters:
                 display_name = self._get_cluster_display_name(cluster_id)
                 item = QtWidgets.QListWidgetItem(display_name)
@@ -1486,7 +1937,7 @@ class SimpleSpatialAnalysisDialog(QtWidgets.QDialog):
             return
 
         try:
-            color_option = self.spatial_color_combo.currentText() if hasattr(self, 'spatial_color_combo') else 'cluster'
+            color_option = self._get_selected_spatial_color_option()
             show_edges = (
                 hasattr(self, 'spatial_show_edges_check')
                 and self.spatial_show_edges_check.isChecked()
@@ -1502,24 +1953,32 @@ class SimpleSpatialAnalysisDialog(QtWidgets.QDialog):
                         pixel_size_um = float(pixel_size)
             except Exception:
                 pixel_size_um = 1.0
-            cache_data = run_blocking_task_with_progress(
-                parent=self,
-                window_title="Spatial Visualization",
-                initial_message="Preparing spatial visualization",
-                detail_text="Collecting ROI coordinates and overlay data.",
-                task=lambda: self._build_spatial_visualization_cache_data(
+            def _prepare_visualization():
+                return self._build_spatial_visualization_cache_data(
                     selected_roi,
                     filtered_df=filtered_df,
                     roi_col=roi_col,
                     pixel_size_um=pixel_size_um,
                     color_option=color_option,
                     show_edges=show_edges,
-                ),
+                )
+
+            def _finalize_visualization(cache_data, _progress):
+                self.spatial_viz_cache[selected_roi] = cache_data
+                self._render_spatial_visualization(selected_roi, cache_data)
+                self.spatial_viz_run = True
+                self._update_tab_states()
+
+            run_blocking_task_with_progress_then_finalize(
+                parent=self,
+                window_title="Spatial Visualization",
+                initial_message="Preparing spatial visualization",
+                detail_text="Collecting ROI coordinates and overlay data.",
+                task=_prepare_visualization,
+                finalize=_finalize_visualization,
+                finishing_message="Rendering spatial visualization",
+                finishing_detail_text="Drawing cells and graph edges on the canvas.",
             )
-            self.spatial_viz_cache[selected_roi] = cache_data
-            self._render_spatial_visualization(selected_roi, cache_data)
-            self.spatial_viz_run = True
-            self._update_tab_states()
         except Exception as e:
             import traceback
             traceback.print_exc()
@@ -1565,7 +2024,7 @@ class SimpleSpatialAnalysisDialog(QtWidgets.QDialog):
             
         # Get color option
         if color_option is None:
-            color_option = self.spatial_color_combo.currentText() if hasattr(self, 'spatial_color_combo') else 'cluster'
+            color_option = self._get_selected_spatial_color_option()
         
         # Get pixel size (default to 1.0 um if not available, e.g., MCD file not loaded)
         if pixel_size_um is None:
@@ -1583,8 +2042,39 @@ class SimpleSpatialAnalysisDialog(QtWidgets.QDialog):
         coords_um = roi_df[["centroid_x", "centroid_y"]].to_numpy() * pixel_size_um
         
         # Get color values
+        color_kind = 'categorical'
+        color_labels = {}
         if color_option in roi_df.columns:
-            color_values = roi_df[color_option].values
+            if self._is_continuous_spatial_color_option(color_option, roi_df):
+                color_kind = 'continuous'
+                color_values = pd.to_numeric(roi_df[color_option], errors='coerce').to_numpy(dtype=float)
+            else:
+                raw_values = roi_df[color_option].values
+                if is_cluster_column(color_option):
+                    raw_values = roi_df['cluster'].values if 'cluster' in roi_df.columns else raw_values
+                    color_values = np.asarray(
+                        [
+                            (
+                                canonical_value
+                                if canonical_value is not None
+                                else '__missing__'
+                            )
+                            for value in raw_values
+                            for canonical_value in [canonicalize_cluster_id(value, annotation_map=self.cluster_annotation_map)]
+                        ],
+                        dtype=object,
+                    )
+                    for cluster_value in sort_cluster_values(
+                        color_values,
+                        annotation_map=self.cluster_annotation_map,
+                        canonical=True,
+                    ):
+                        color_labels[cluster_value] = self._get_cluster_display_name(cluster_value)
+                else:
+                    color_values = pd.Series(raw_values, dtype='object').where(
+                        pd.Series(raw_values, dtype='object').notna(),
+                        '__missing__',
+                    ).to_numpy(dtype=object)
         else:
             color_values = None
         
@@ -1596,20 +2086,41 @@ class SimpleSpatialAnalysisDialog(QtWidgets.QDialog):
         if show_edges and self.edge_df is not None and not self.edge_df.empty:
             roi_edges = self.edge_df[self.edge_df['roi_id'] == str(roi_id)]
             if not roi_edges.empty:
-                # Map cell IDs to coordinates
-                cell_to_coord = dict(zip(roi_df['cell_id'], coords_um))
-                edges_um = []
-                for _, edge in roi_edges.iterrows():
-                    cell_a = int(edge['cell_id_A'])
-                    cell_b = int(edge['cell_id_B'])
-                    if cell_a in cell_to_coord and cell_b in cell_to_coord:
-                        edges_um.append((cell_to_coord[cell_a], cell_to_coord[cell_b]))
+                coord_df = pd.DataFrame(
+                    {
+                        'cell_id': roi_df['cell_id'].astype(int).values,
+                        'x_um': coords_um[:, 0],
+                        'y_um': coords_um[:, 1],
+                    }
+                )
+                edge_coords = (
+                    roi_edges[['cell_id_A', 'cell_id_B']]
+                    .astype(int)
+                    .merge(
+                        coord_df.rename(
+                            columns={'cell_id': 'cell_id_A', 'x_um': 'x_a', 'y_um': 'y_a'}
+                        ),
+                        on='cell_id_A',
+                        how='inner',
+                    )
+                    .merge(
+                        coord_df.rename(
+                            columns={'cell_id': 'cell_id_B', 'x_um': 'x_b', 'y_um': 'y_b'}
+                        ),
+                        on='cell_id_B',
+                        how='inner',
+                    )
+                )
+                if not edge_coords.empty:
+                    edges_um = edge_coords[['x_a', 'y_a', 'x_b', 'y_b']].to_numpy(dtype=float).reshape(-1, 2, 2)
         
         # Cache the data
         cache_data = {
             'coords_um': coords_um,
             'color_values': color_values,
             'color_option': color_option,
+            'color_kind': color_kind,
+            'color_labels': color_labels,
             'edges_um': edges_um,
             'roi_df': roi_df
         }
@@ -1623,15 +2134,23 @@ class SimpleSpatialAnalysisDialog(QtWidgets.QDialog):
         coords_um = cache_data['coords_um']
         color_values = cache_data['color_values']
         color_option = cache_data['color_option']
+        color_kind = cache_data.get('color_kind', 'categorical')
+        color_labels = cache_data.get('color_labels', {})
         edges_um = cache_data.get('edges_um')
         
         # Plot edges first (if available AND checkbox is enabled)
         show_edges = (hasattr(self, 'spatial_show_edges_check') and 
                      self.spatial_show_edges_check.isChecked())
-        if edges_um and show_edges:
-            for edge_start, edge_end in edges_um:
-                ax.plot([edge_start[0], edge_end[0]], [edge_start[1], edge_end[1]], 
-                       'gray', alpha=0.3, linewidth=0.5, zorder=1)
+        if edges_um is not None and len(edges_um) > 0 and show_edges:
+            ax.add_collection(
+                LineCollection(
+                    edges_um,
+                    colors='gray',
+                    alpha=0.3,
+                    linewidths=0.5,
+                    zorder=1,
+                )
+            )
         
         # Get point size multiplier
         point_size = (self.spatial_point_size_spin.value() 
@@ -1639,48 +2158,113 @@ class SimpleSpatialAnalysisDialog(QtWidgets.QDialog):
         
         # Plot cells
         legend_handles = []
+        rect = [0.0, 0.0, 0.95, 1.0]
         if color_values is not None:
-            # Color by cluster/feature
-            unique_values = np.unique(color_values)
-            n_values = len(unique_values)
-            colors = _get_vivid_colors(n_values)
-            value_to_color = {val: colors[i] for i, val in enumerate(unique_values)}
-            
-            # Check if coloring by cluster to create legend with cluster names
-            is_cluster_coloring = color_option in ['cluster', 'cluster_id', 'cluster_phenotype']
-            
-            for i, coord in enumerate(coords_um):
-                value = color_values[i]
-                color = value_to_color.get(value, 'gray')
-                ax.scatter(coord[0], coord[1], c=[color], s=20*point_size, alpha=0.7, zorder=2)
-            
-            # Create legend if coloring by cluster
-            if is_cluster_coloring:
-                for val in sorted(unique_values):
-                    color = value_to_color.get(val, 'gray')
-                    label = self._get_cluster_display_name(val)
-                    legend_handles.append(plt.Line2D([0], [0], marker='o', color='w', 
-                                                     markerfacecolor=color, markersize=8, 
-                                                     label=label, alpha=0.7))
+            if color_kind == 'continuous':
+                numeric_values = np.asarray(color_values, dtype=float)
+                valid_mask = np.isfinite(numeric_values)
+                if np.any(valid_mask):
+                    vmin = float(np.nanmin(numeric_values[valid_mask]))
+                    vmax = float(np.nanmax(numeric_values[valid_mask]))
+                    if np.isclose(vmin, vmax):
+                        vmax = vmin + 1e-6
+                    scatter = ax.scatter(
+                        coords_um[valid_mask, 0],
+                        coords_um[valid_mask, 1],
+                        c=numeric_values[valid_mask],
+                        cmap='viridis',
+                        norm=mcolors.Normalize(vmin=vmin, vmax=vmax),
+                        s=20 * point_size,
+                        alpha=0.8,
+                        zorder=2,
+                        edgecolors='none',
+                    )
+                    if np.any(~valid_mask):
+                        ax.scatter(
+                            coords_um[~valid_mask, 0],
+                            coords_um[~valid_mask, 1],
+                            c='lightgray',
+                            s=20 * point_size,
+                            alpha=0.5,
+                            zorder=2,
+                            edgecolors='none',
+                        )
+                    colorbar = self.spatial_viz_canvas.figure.colorbar(
+                        scatter,
+                        ax=ax,
+                        fraction=0.046,
+                        pad=0.03,
+                    )
+                    colorbar.set_label(self._get_color_option_display_name(color_option))
+                    rect = [0.0, 0.0, 0.88, 1.0]
+                else:
+                    ax.scatter(coords_um[:, 0], coords_um[:, 1], c='lightgray', s=20 * point_size, alpha=0.6, zorder=2)
+            else:
+                color_series = pd.Series(color_values, dtype='object')
+                prepared_values = color_series.where(color_series.notna(), '__missing__').to_numpy(dtype=object)
+                if is_cluster_column(color_option):
+                    unique_values = sort_cluster_values(
+                        prepared_values,
+                        annotation_map=self.cluster_annotation_map,
+                        canonical=True,
+                    )
+                else:
+                    unique_values = sorted(pd.unique(prepared_values), key=lambda value: str(value))
+                colors = _get_vivid_colors(len(unique_values))
+                value_to_color = {val: colors[i] for i, val in enumerate(unique_values)}
+
+                for value in unique_values:
+                    mask = prepared_values == value
+                    color = value_to_color.get(value, 'gray')
+                    ax.scatter(
+                        coords_um[mask, 0],
+                        coords_um[mask, 1],
+                        c=[color],
+                        s=20 * point_size,
+                        alpha=0.7,
+                        zorder=2,
+                        edgecolors='none',
+                    )
+
+                if is_cluster_column(color_option):
+                    for value in unique_values:
+                        color = value_to_color.get(value, 'gray')
+                        label = color_labels.get(value)
+                        if not label:
+                            label = 'Unassigned' if value == '__missing__' else self._get_cluster_display_name(value)
+                        legend_handles.append(
+                            plt.Line2D(
+                                [0],
+                                [0],
+                                marker='o',
+                                color='w',
+                                markerfacecolor=color,
+                                markersize=7,
+                                label=label,
+                                alpha=0.7,
+                            )
+                        )
         else:
             # Default color
             ax.scatter(coords_um[:, 0], coords_um[:, 1], c='blue', s=20*point_size, alpha=0.7, zorder=2)
         
         ax.set_xlabel('X (µm)')
         ax.set_ylabel('Y (µm)')
-        ax.set_title(f'Spatial Visualization: ROI {roi_id} (colored by {color_option})')
+        color_label = self._get_color_option_display_name(color_option)
+        ax.set_title(f'Spatial Visualization: ROI {roi_id} (colored by {color_label})')
         ax.set_aspect('equal')
         ax.invert_yaxis()  # Set y=0 at the top (image coordinates)
         ax.grid(True, alpha=0.3)
         
         # Add legend if we have cluster coloring
         if legend_handles:
-            ncol = 1 if len(legend_handles) <= 10 else 2
-            ax.legend(handles=legend_handles, loc='center left', bbox_to_anchor=(1.05, 0.5), 
-                     frameon=True, fancybox=True, shadow=True, ncol=ncol)
-        
-        self.spatial_viz_canvas.figure.tight_layout(rect=[0, 0, 0.85, 1])  # Leave space for legend
-        self.spatial_viz_canvas.draw()
+            legend_kwargs = self._spatial_viz_legend_kwargs()
+            ncol = self._choose_spatial_viz_legend_columns(ax, legend_handles, legend_kwargs=legend_kwargs)
+            ax.legend(handles=legend_handles, ncol=ncol, **legend_kwargs)
+            rect = self._calculate_spatial_viz_layout_rect(ax=ax, base_right=rect[2])
+
+        self._spatial_viz_layout_rect = rect
+        self._finalize_canvas_render(self.spatial_viz_canvas, rect=rect, pad=0.95)
     
     def _run_community_analysis(self):
         """Run community detection analysis on spatial graph."""
@@ -1731,21 +2315,28 @@ class SimpleSpatialAnalysisDialog(QtWidgets.QDialog):
                 communities = g.community_multilevel()
                 return communities.membership, cell_id_to_idx
 
-            community_labels, cell_id_to_idx = run_blocking_task_with_progress(
+            def _finalize_community(result, _progress):
+                community_labels, cell_id_to_idx = result
+                community_df = roi_df.copy()
+                community_df['community'] = [community_labels[cell_id_to_idx[int(cid)]] for cid in community_df['cell_id']]
+                community_sizes = community_df['community'].value_counts()
+                community_df['community_size'] = community_df['community'].map(community_sizes).astype(int)
+                self.community_results_by_roi[str(selected_roi)] = community_df.copy()
+                self._update_community_plot(selected_roi, community_df, community_labels)
+                self.community_analysis_run = True
+                self._update_tab_states()
+
+            community_labels, _ = run_blocking_task_with_progress_then_finalize(
                 parent=self,
                 window_title="Community Analysis",
                 initial_message="Running community detection",
                 detail_text="Building graph partitions for the selected ROI.",
                 task=_community_task,
+                finalize=_finalize_community,
+                finishing_message="Rendering community plot",
+                finishing_detail_text="Coloring cells by detected spatial community.",
             )
-            
-            # Store results
-            roi_df['community'] = [community_labels[cell_id_to_idx[int(cid)]] for cid in roi_df['cell_id']]
-            
-            # Update visualization
-            self._update_community_plot(selected_roi, roi_df, community_labels)
-            
-            self.community_analysis_run = True
+
             QtWidgets.QMessageBox.information(self, "Community Analysis", 
                 f"Detected {len(set(community_labels))} communities in ROI {selected_roi}.")
             
@@ -1778,12 +2369,21 @@ class SimpleSpatialAnalysisDialog(QtWidgets.QDialog):
         # Color by community
         n_communities = len(set(community_labels))
         colors = _get_vivid_colors(n_communities)
-        community_colors = {comm: colors[i] for i, comm in enumerate(set(community_labels))}
-        
-        for i, coord in enumerate(coords_um):
-            comm = community_labels[i]
+        unique_communities = sorted(set(community_labels))
+        community_colors = {comm: colors[i] for i, comm in enumerate(unique_communities)}
+        community_labels_array = np.asarray(community_labels)
+
+        for comm in unique_communities:
+            mask = community_labels_array == comm
             color = community_colors.get(comm, 'gray')
-            ax.scatter(coord[0], coord[1], c=[color], s=20, alpha=0.7)
+            ax.scatter(
+                coords_um[mask, 0],
+                coords_um[mask, 1],
+                c=[color],
+                s=20,
+                alpha=0.7,
+                edgecolors='none',
+            )
         
         ax.set_xlabel('X (µm)')
         ax.set_ylabel('Y (µm)')
@@ -1792,8 +2392,7 @@ class SimpleSpatialAnalysisDialog(QtWidgets.QDialog):
         ax.invert_yaxis()  # Set y=0 at the top (image coordinates)
         ax.grid(True, alpha=0.3)
         
-        self.community_canvas.figure.tight_layout()
-        self.community_canvas.draw()
+        self._fit_canvas(self.community_canvas, pad=0.95)
     
     def _save_enrichment_plot(self):
         """Save the enrichment plot."""
@@ -1814,12 +2413,187 @@ class SimpleSpatialAnalysisDialog(QtWidgets.QDialog):
         """Save the community plot."""
         if save_figure_with_options(self.community_canvas.figure, "spatial_communities.png", self):
             QtWidgets.QMessageBox.information(self, "Success", "Plot saved successfully")
-    
+
+    def _prepare_enrichment_export_df(self) -> pd.DataFrame:
+        """Return pairwise enrichment results with adjusted p-values and labels."""
+        if self.enrichment_df is None or self.enrichment_df.empty:
+            return pd.DataFrame()
+
+        export_df = self.enrichment_df.copy()
+        if 'p_value' in export_df.columns and 'p_value_adjusted' not in export_df.columns:
+            export_df['p_value_adjusted'] = np.nan
+            if 'roi_id' in export_df.columns:
+                for _, roi_index in export_df.groupby('roi_id', sort=False).groups.items():
+                    roi_pvals = export_df.loc[roi_index, 'p_value'].to_numpy(dtype=float, copy=False)
+                    export_df.loc[roi_index, 'p_value_adjusted'] = benjamini_hochberg_adjust(roi_pvals)
+            else:
+                export_df['p_value_adjusted'] = benjamini_hochberg_adjust(
+                    export_df['p_value'].to_numpy(dtype=float, copy=False)
+                )
+
+        if 'cluster_A' in export_df.columns:
+            export_df['cluster_A_label'] = export_df['cluster_A'].map(self._get_cluster_display_name)
+        if 'cluster_B' in export_df.columns:
+            export_df['cluster_B_label'] = export_df['cluster_B'].map(self._get_cluster_display_name)
+
+        sort_columns = [column for column in ['roi_id', 'cluster_A', 'cluster_B'] if column in export_df.columns]
+        if sort_columns:
+            export_df = export_df.sort_values(sort_columns).reset_index(drop=True)
+        return export_df
+
+    def _prepare_distance_export_df(self) -> pd.DataFrame:
+        """Return distance results annotated with cluster display labels."""
+        if self.distance_df is None or self.distance_df.empty:
+            return pd.DataFrame()
+
+        export_df = self.distance_df.copy()
+        if 'cell_A_cluster' in export_df.columns:
+            export_df['cell_A_cluster_label'] = export_df['cell_A_cluster'].map(self._get_cluster_display_name)
+        if 'nearest_B_cluster' in export_df.columns:
+            export_df['nearest_B_cluster_label'] = export_df['nearest_B_cluster'].map(self._get_cluster_display_name)
+
+        sort_columns = [
+            column for column in ['roi_id', 'cell_A_cluster', 'cell_A_id', 'nearest_B_cluster']
+            if column in export_df.columns
+        ]
+        if sort_columns:
+            export_df = export_df.sort_values(sort_columns).reset_index(drop=True)
+        return export_df
+
+    def _prepare_community_export_df(self, roi_id=None, *, all_rois: bool = False) -> pd.DataFrame:
+        """Return community assignments for the selected ROI or all analyzed ROIs."""
+        if not self.community_results_by_roi:
+            return pd.DataFrame()
+
+        if all_rois:
+            export_df = pd.concat(self.community_results_by_roi.values(), ignore_index=True, sort=False)
+        else:
+            if roi_id is None:
+                roi_id = self.community_roi_combo.currentData() if hasattr(self, 'community_roi_combo') else None
+            export_df = self.community_results_by_roi.get(str(roi_id), pd.DataFrame()).copy()
+
+        if export_df.empty:
+            return export_df
+
+        if 'cluster' in export_df.columns:
+            export_df['cluster_label'] = export_df['cluster'].map(self._get_cluster_display_name)
+        roi_col = self._get_roi_column()
+        if roi_col in export_df.columns and 'roi_id' not in export_df.columns:
+            export_df['roi_id'] = export_df[roi_col].astype(str)
+
+        preferred_columns = [
+            'roi_id',
+            'cell_id',
+            'cluster',
+            'cluster_label',
+            'community',
+            'community_size',
+            'centroid_x',
+            'centroid_y',
+        ]
+        remaining_columns = [column for column in export_df.columns if column not in preferred_columns]
+        ordered_columns = [column for column in preferred_columns if column in export_df.columns] + remaining_columns
+        export_df = export_df.loc[:, ordered_columns]
+
+        sort_columns = [column for column in ['roi_id', 'community', 'cell_id'] if column in export_df.columns]
+        if sort_columns:
+            export_df = export_df.sort_values(sort_columns).reset_index(drop=True)
+        return export_df
+
+    def _export_dataframe_to_csv(
+        self,
+        dataframe: pd.DataFrame,
+        *,
+        title: str,
+        default_filename: str,
+        success_message: str,
+    ) -> bool:
+        """Export a dataframe to a user-selected CSV file."""
+        if dataframe is None or dataframe.empty:
+            return False
+
+        file_path, _ = QtWidgets.QFileDialog.getSaveFileName(
+            self,
+            title,
+            default_filename,
+            "CSV Files (*.csv)"
+        )
+        if not file_path:
+            return False
+
+        try:
+            dataframe.to_csv(file_path, index=False)
+            QtWidgets.QMessageBox.information(self, "Export Complete", f"{success_message}\n{file_path}")
+            return True
+        except Exception as e:
+            import traceback
+            traceback.print_exc()
+            QtWidgets.QMessageBox.critical(self, "Export Error", f"Failed to export results: {str(e)}")
+            return False
+
+    def _export_enrichment_results(self):
+        """Export pairwise enrichment results to CSV."""
+        export_df = self._prepare_enrichment_export_df()
+        if export_df.empty:
+            QtWidgets.QMessageBox.warning(self, "No Results", "No pairwise enrichment results are available to export.")
+            return
+        self._export_dataframe_to_csv(
+            export_df,
+            title="Export Pairwise Enrichment Results",
+            default_filename="pairwise_enrichment.csv",
+            success_message="Pairwise enrichment results exported to:",
+        )
+
+    def _export_distance_results(self):
+        """Export distance-distribution results to CSV."""
+        export_df = self._prepare_distance_export_df()
+        if export_df.empty:
+            QtWidgets.QMessageBox.warning(self, "No Results", "No distance-distribution results are available to export.")
+            return
+        self._export_dataframe_to_csv(
+            export_df,
+            title="Export Distance Distribution Results",
+            default_filename="distance_distributions.csv",
+            success_message="Distance-distribution results exported to:",
+        )
+
+    def _export_community_results(self):
+        """Export community assignments for the selected ROI to CSV."""
+        selected_roi = self.community_roi_combo.currentData() if hasattr(self, 'community_roi_combo') else None
+        export_df = self._prepare_community_export_df(selected_roi)
+        if export_df.empty:
+            if selected_roi is not None:
+                message = f"No spatial community results are available for ROI {selected_roi}. Please run the analysis first."
+            else:
+                message = "No spatial community results are available to export. Please run the analysis first."
+            QtWidgets.QMessageBox.warning(self, "No Results", message)
+            return
+        filename_suffix = str(selected_roi) if selected_roi is not None else "all_rois"
+        self._export_dataframe_to_csv(
+            export_df,
+            title="Export Spatial Community Results",
+            default_filename=f"spatial_communities_{filename_suffix}.csv",
+            success_message="Spatial community assignments exported to:",
+        )
+
     def _export_results(self):
         """Export analysis results to CSV files."""
         from PyQt5.QtWidgets import QFileDialog
-        
-        if not any([self.enrichment_df is not None, self.distance_df is not None]):
+
+        export_payloads = []
+        enrichment_export_df = self._prepare_enrichment_export_df()
+        if not enrichment_export_df.empty:
+            export_payloads.append(("pairwise_enrichment.csv", enrichment_export_df))
+
+        distance_export_df = self._prepare_distance_export_df()
+        if not distance_export_df.empty:
+            export_payloads.append(("distance_distributions.csv", distance_export_df))
+
+        community_export_df = self._prepare_community_export_df(all_rois=True)
+        if not community_export_df.empty:
+            export_payloads.append(("spatial_communities.csv", community_export_df))
+
+        if not export_payloads:
             QtWidgets.QMessageBox.warning(self, "No Results", "No analysis results to export. Please run analyses first.")
             return
         
@@ -1829,15 +2603,9 @@ class SimpleSpatialAnalysisDialog(QtWidgets.QDialog):
             return
         
         try:
-            # Export enrichment results
-            if self.enrichment_df is not None and not self.enrichment_df.empty:
-                file_path = os.path.join(export_dir, "pairwise_enrichment.csv")
-                self.enrichment_df.to_csv(file_path, index=False)
-            
-            # Export distance distributions
-            if self.distance_df is not None and not self.distance_df.empty:
-                file_path = os.path.join(export_dir, "distance_distributions.csv")
-                self.distance_df.to_csv(file_path, index=False)
+            for filename, export_df in export_payloads:
+                file_path = os.path.join(export_dir, filename)
+                export_df.to_csv(file_path, index=False)
             
             QtWidgets.QMessageBox.information(self, "Export Complete", 
                 f"Results exported to:\n{export_dir}")
@@ -1926,182 +2694,311 @@ class SimpleSpatialAnalysisDialog(QtWidgets.QDialog):
     
     def _update_enrichment_plot(self):
         """Update enrichment plot with pairwise enrichment data."""
-        if self.enrichment_df is None or self.enrichment_df.empty:
-            return
-            
         self.enrichment_canvas.figure.clear()
         ax = self.enrichment_canvas.figure.add_subplot(111)
-        
+
+        if self.enrichment_df is None or self.enrichment_df.empty:
+            ax.axis('off')
+            ax.text(
+                0.5,
+                0.5,
+                'Run pairwise enrichment to display the cluster-cluster heatmap.',
+                ha='center',
+                va='center',
+                transform=ax.transAxes,
+                fontsize=12,
+            )
+            self._finalize_canvas_render(self.enrichment_canvas, pad=0.95)
+            return
+
         # Aggregate across ROIs if multiple
         if 'roi_id' in self.enrichment_df.columns:
-            # Average z-scores across ROIs
-            enrichment_agg = self.enrichment_df.groupby(['cluster_A', 'cluster_B']).agg({
-                'z_score': 'mean',
-                'p_value': lambda x: np.mean(x < 0.05)  # Fraction significant
-            }).reset_index()
+            enrichment_agg = (
+                self.enrichment_df
+                .groupby(['cluster_A', 'cluster_B'], as_index=False)
+                .agg({'z_score': 'mean', 'p_value': 'mean'})
+            )
         else:
             enrichment_agg = self.enrichment_df.copy()
-        
-        # Get unique clusters
+
         all_clusters = set(enrichment_agg['cluster_A'].unique()) | set(enrichment_agg['cluster_B'].unique())
-        unique_clusters = sorted(all_clusters)
+        unique_clusters = self._sorted_cluster_ids(all_clusters)
         n_clusters = len(unique_clusters)
-        
+
         if n_clusters == 0:
+            ax.axis('off')
+            ax.text(
+                0.5,
+                0.5,
+                'No enrichment results are available for the current selection.',
+                ha='center',
+                va='center',
+                transform=ax.transAxes,
+                fontsize=12,
+            )
+            self._finalize_canvas_render(self.enrichment_canvas, pad=0.95)
             return
-            
-        # Create heatmap matrix
-        heatmap_data = np.zeros((n_clusters, n_clusters))
-        pvalue_data = np.ones((n_clusters, n_clusters))
-        
-        for _, row in enrichment_agg.iterrows():
-            cluster_a = row['cluster_A']
-            cluster_b = row['cluster_B']
-            
-            i = unique_clusters.index(cluster_a)
-            j = unique_clusters.index(cluster_b)
-            
-            heatmap_data[i, j] = row['z_score']
-            if 'p_value' in row:
-                pvalue_data[i, j] = row['p_value']
-        
-        # Create symmetric matrix (average both directions)
-        heatmap_data = (heatmap_data + heatmap_data.T) / 2
-        pvalue_data = np.minimum(pvalue_data, pvalue_data.T)
-        
-        # Create heatmap
-        vmax = np.max(np.abs(heatmap_data)) if np.max(np.abs(heatmap_data)) > 0 else 1
-        # Use TwoSlopeNorm to center colormap at 0 for diverging data
-        try:
+
+        cluster_lookup = {cluster: idx for idx, cluster in enumerate(unique_clusters)}
+        heatmap_data = np.zeros((n_clusters, n_clusters), dtype=float)
+        pvalue_data = np.ones((n_clusters, n_clusters), dtype=float)
+
+        for row in enrichment_agg.itertuples(index=False):
+            i = cluster_lookup[row.cluster_A]
+            j = cluster_lookup[row.cluster_B]
+            heatmap_data[i, j] = float(row.z_score)
+            heatmap_data[j, i] = float(row.z_score)
+            p_value = float(getattr(row, 'p_value', 1.0))
+            pvalue_data[i, j] = p_value
+            pvalue_data[j, i] = p_value
+
+        cluster_labels = [self._get_cluster_display_name(c) for c in unique_clusters]
+        style = dense_heatmap_style(
+            n_rows=n_clusters,
+            n_cols=n_clusters,
+            row_labels=cluster_labels,
+            col_labels=cluster_labels,
+            base_tick_fontsize=10.0,
+            base_annotation_fontsize=9.0,
+            allow_annotations=True,
+        )
+
+        vmax = float(np.max(np.abs(heatmap_data))) if np.max(np.abs(heatmap_data)) > 0 else 1.0
+        annotation_data = False
+        if style['show_annotations']:
+            annotation_data = np.empty_like(heatmap_data, dtype=object)
+            for row_idx in range(n_clusters):
+                for col_idx in range(n_clusters):
+                    sig_marker = '*' if pvalue_data[row_idx, col_idx] < 0.05 else ''
+                    annotation_data[row_idx, col_idx] = f"{heatmap_data[row_idx, col_idx]:.1f}{sig_marker}"
+
+        heatmap_df = pd.DataFrame(heatmap_data, index=cluster_labels, columns=cluster_labels)
+        if _HAVE_SEABORN_LOCAL:
+            sns.heatmap(
+                heatmap_df,
+                cmap='RdBu_r',
+                center=0,
+                vmin=-vmax,
+                vmax=vmax,
+                square=style['square_cells'],
+                linewidths=style['linewidths'],
+                cbar_kws={
+                    'label': 'Z-Score',
+                    'shrink': style['colorbar_shrink'],
+                    'fraction': style['colorbar_fraction'],
+                    'pad': style['colorbar_pad'],
+                },
+                ax=ax,
+                annot=annotation_data if style['show_annotations'] else False,
+                fmt='',
+                annot_kws={
+                    'size': style['annotation_fontsize'],
+                    'weight': 'normal',
+                    'color': 'black',
+                },
+                xticklabels=True,
+                yticklabels=True,
+            )
+        else:
             from matplotlib.colors import TwoSlopeNorm
+
             norm = TwoSlopeNorm(vmin=-vmax, vcenter=0, vmax=vmax)
             im = ax.imshow(heatmap_data, cmap='RdBu_r', aspect='auto', norm=norm)
-        except ImportError:
-            # Fallback for older matplotlib versions
-            im = ax.imshow(heatmap_data, cmap='RdBu_r', aspect='auto', vmin=-vmax, vmax=vmax)
-        
-        # Set ticks and labels
-        ax.set_xticks(np.arange(n_clusters))
-        ax.set_yticks(np.arange(n_clusters))
-        ax.set_xticklabels([self._get_cluster_display_name(c) for c in unique_clusters], rotation=45, ha='right')
-        ax.set_yticklabels([self._get_cluster_display_name(c) for c in unique_clusters])
-        
-        # Add colorbar
-        self.enrichment_canvas.figure.colorbar(im, ax=ax, label='Z-Score')
-        
-        # Add text annotations with significance markers
-        for i in range(n_clusters):
-            for j in range(n_clusters):
-                z_score = heatmap_data[i, j]
-                p_val = pvalue_data[i, j]
-                sig_marker = '*' if p_val < 0.05 else ''
-                text = ax.text(j, i, f'{z_score:.2f}{sig_marker}',
-                             ha="center", va="center", 
-                             color="white" if abs(z_score) > vmax/2 else "black",
-                             fontweight='bold' if p_val < 0.05 else 'normal')
-        
-        ax.set_title("Pairwise Enrichment: Z-Scores (Positive = Enriched, Negative = Depleted)")
-        ax.set_xlabel("Cluster B")
-        ax.set_ylabel("Cluster A")
-        
-        self.enrichment_canvas.figure.tight_layout()
-        self.enrichment_canvas.draw()
+            self.enrichment_canvas.figure.colorbar(
+                im,
+                ax=ax,
+                fraction=style['colorbar_fraction'],
+                pad=style['colorbar_pad'],
+                shrink=style['colorbar_shrink'],
+            )
+            ax.set_xticks(np.arange(n_clusters))
+            ax.set_yticks(np.arange(n_clusters))
+            ax.set_xticklabels(cluster_labels)
+            ax.set_yticklabels(cluster_labels)
+            if style['show_annotations']:
+                for row_idx in range(n_clusters):
+                    for col_idx in range(n_clusters):
+                        ax.text(
+                            col_idx,
+                            row_idx,
+                            annotation_data[row_idx, col_idx],
+                            ha='center',
+                            va='center',
+                            fontsize=style['annotation_fontsize'],
+                        )
+
+        ax.set_xticklabels(
+            ax.get_xticklabels(),
+            rotation=style['x_rotation'],
+            ha='right',
+            fontsize=style['tick_fontsize'],
+        )
+        ax.set_yticklabels(ax.get_yticklabels(), rotation=0, fontsize=style['tick_fontsize'])
+        ax.set_title(
+            "Pairwise Enrichment: Z-Scores (Positive = Enriched, Negative = Depleted)",
+            fontsize=style['title_fontsize'],
+            pad=10,
+        )
+        ax.set_xlabel("Cluster B", fontsize=style['axis_fontsize'])
+        ax.set_ylabel("Cluster A", fontsize=style['axis_fontsize'])
+        ax.tick_params(axis='both', labelsize=style['tick_fontsize'])
+
+        colorbar = ax.collections[0].colorbar if ax.collections else None
+        if colorbar is not None:
+            colorbar.ax.tick_params(labelsize=style['colorbar_fontsize'])
+            colorbar.set_label('Z-Score', fontsize=style['axis_fontsize'])
+
+        self._finalize_canvas_render(self.enrichment_canvas, pad=0.95)
     
     def _update_distance_plot(self):
         """Update distance plot with distance distribution data."""
-        if self.distance_df is None or self.distance_df.empty:
-            return
-            
         self.distance_canvas.figure.clear()
-        ax = self.distance_canvas.figure.add_subplot(111)
-        
-        # Get selected clusters
+        fig = self.distance_canvas.figure
+
+        if self.distance_df is None or self.distance_df.empty:
+            ax = fig.add_subplot(111)
+            ax.axis('off')
+            ax.text(
+                0.5,
+                0.5,
+                'Run distance analysis to display fitted nearest-neighbor distributions.',
+                ha='center',
+                va='center',
+                transform=ax.transAxes,
+                fontsize=12,
+            )
+            self._finalize_canvas_render(self.distance_canvas, pad=0.95)
+            return
+
         selected_clusters = self._get_selected_distance_clusters()
-        
-        # Check if self-pairs should be shown
         show_self_pairs = (hasattr(self, 'distance_show_self_pairs_check') and 
                            self.distance_show_self_pairs_check.isChecked())
-        
-        # If no clusters are selected, show message
+
         if not selected_clusters:
+            ax = fig.add_subplot(111)
             ax.text(0.5, 0.5, 'No clusters selected.\nPlease select clusters to view distance distributions.', 
                    ha='center', va='center', transform=ax.transAxes, fontsize=12)
-            self.distance_canvas.figure.tight_layout()
-            self.distance_canvas.draw()
+            ax.axis('off')
+            self._finalize_canvas_render(self.distance_canvas, pad=0.95)
             return
-        
-        # Get unique cluster pairs, filtering out NaN values
-        unique_pairs = self.distance_df[['cell_A_cluster', 'nearest_B_cluster']].drop_duplicates()
-        unique_pairs = unique_pairs[
-            unique_pairs['cell_A_cluster'].notna() & 
-            unique_pairs['nearest_B_cluster'].notna()
-        ]
-        
-        # Filter pairs based on selected clusters (show pairs FROM selected clusters TO any cluster)
-        # This shows distances originating from the selected clusters
-        unique_pairs = unique_pairs[
-            unique_pairs['cell_A_cluster'].isin(selected_clusters)
-        ]
-        
-        # Optionally filter out self-pairs (A→A)
+
+        plot_df = self.distance_df[
+            self.distance_df['cell_A_cluster'].isin(selected_clusters)
+        ].copy()
+
         if not show_self_pairs:
-            unique_pairs = unique_pairs[
-                unique_pairs['cell_A_cluster'] != unique_pairs['nearest_B_cluster']
+            plot_df = plot_df[
+                plot_df['cell_A_cluster'] != plot_df['nearest_B_cluster']
             ]
-        
-        # Create box plot for each pair
-        plot_data = []
-        plot_labels = []
-        
-        for _, pair_row in unique_pairs.iterrows():
-            cluster_a = pair_row['cell_A_cluster']
-            cluster_b = pair_row['nearest_B_cluster']
-            
-            pair_data = self.distance_df[
-                (self.distance_df['cell_A_cluster'] == cluster_a) &
-                (self.distance_df['nearest_B_cluster'] == cluster_b)
-            ]['nearest_B_dist_um'].values
-            
-            if len(pair_data) > 0:
-                plot_data.append(pair_data)
-                # Format label: show "A → nearest A" for self-pairs, "A → nearest B" for cross-pairs
-                if cluster_a == cluster_b:
-                    plot_labels.append(f"{self._get_cluster_display_name(cluster_a)} → nearest {self._get_cluster_display_name(cluster_b)} (self)")
-                else:
-                    plot_labels.append(f"{self._get_cluster_display_name(cluster_a)} → nearest {self._get_cluster_display_name(cluster_b)}")
-        
-        if not plot_data:
-            ax.text(0.5, 0.5, 'No data to display for selected clusters.', 
+
+        if plot_df.empty:
+            ax = fig.add_subplot(111)
+            ax.text(0.5, 0.5, 'No distance data to display for the selected clusters.', 
                    ha='center', va='center', transform=ax.transAxes, fontsize=12)
-            self.distance_canvas.figure.tight_layout()
-            self.distance_canvas.draw()
+            ax.axis('off')
+            self._finalize_canvas_render(self.distance_canvas, pad=0.95)
             return
-            
-        # Create box plot
-        bp = ax.boxplot(plot_data, labels=plot_labels, patch_artist=True)
-        
-        # Color boxes
-        colors = _get_vivid_colors(len(plot_data))
-        for patch, color in zip(bp['boxes'], colors):
-            patch.set_facecolor(color)
-            patch.set_alpha(0.7)
-        
-        ax.set_ylabel('Distance to Nearest Neighbor (µm)')
-        title = 'Distance to Nearest Neighbor: FROM Selected Cluster(s)'
-        if selected_clusters:
-            cluster_names = [self._get_cluster_display_name(c) for c in selected_clusters]
-            if len(cluster_names) <= 3:
-                title += f'\nFrom: {", ".join(cluster_names)}'
-            else:
-                title += f'\nFrom: {len(selected_clusters)} clusters'
-        if not show_self_pairs:
-            title += ' (self-distances hidden)'
-        ax.set_title(title)
-        ax.tick_params(axis='x', rotation=45)
-        ax.grid(True, alpha=0.3, axis='y')
-        
-        self.distance_canvas.figure.tight_layout()
-        self.distance_canvas.draw()
+
+        source_clusters = [
+            cluster for cluster in self._sorted_cluster_ids(selected_clusters)
+            if cluster in set(plot_df['cell_A_cluster'].dropna().unique())
+        ]
+        all_clusters = set(plot_df['cell_A_cluster'].dropna().unique()) | set(plot_df['nearest_B_cluster'].dropna().unique())
+        color_map = self._get_cluster_color_map(all_clusters)
+
+        n_sources = len(source_clusters)
+        n_cols = 1 if n_sources == 1 else 2
+        n_rows = int(np.ceil(n_sources / n_cols))
+        axes = fig.subplots(n_rows, n_cols, squeeze=False, sharex=True)
+        all_axes = axes.flatten()
+        global_max = float(plot_df['nearest_B_dist_um'].max()) if not plot_df.empty else 1.0
+        global_max = max(global_max, 1.0)
+
+        for axis in all_axes:
+            axis.set_visible(False)
+
+        for plot_idx, source_cluster in enumerate(source_clusters):
+            axis = all_axes[plot_idx]
+            axis.set_visible(True)
+            source_df = plot_df[plot_df['cell_A_cluster'] == source_cluster]
+            target_clusters = self._sorted_cluster_ids(source_df['nearest_B_cluster'].unique())
+            target_labels = [self._get_cluster_display_name(cluster) for cluster in target_clusters]
+            style = dense_heatmap_style(
+                n_rows=max(1, len(target_labels)),
+                n_cols=1,
+                row_labels=target_labels,
+                col_labels=[self._get_cluster_display_name(source_cluster)],
+                base_tick_fontsize=10.0,
+                allow_annotations=False,
+            )
+
+            box_data = []
+            box_colors = []
+            y_labels = []
+            for target_cluster in target_clusters:
+                distances = source_df.loc[
+                    source_df['nearest_B_cluster'] == target_cluster,
+                    'nearest_B_dist_um',
+                ].to_numpy(dtype=float, copy=False)
+                if distances.size == 0:
+                    continue
+                box_data.append(distances)
+                box_colors.append(color_map.get(target_cluster, '#808080'))
+                y_labels.append(self._get_cluster_display_name(target_cluster))
+
+            if not box_data:
+                axis.text(
+                    0.5,
+                    0.5,
+                    'No data for this source cluster.',
+                    ha='center',
+                    va='center',
+                    transform=axis.transAxes,
+                    fontsize=style['tick_fontsize'] + 1.0,
+                )
+                axis.set_axis_off()
+                continue
+
+            boxplot = axis.boxplot(
+                box_data,
+                orientation='horizontal',
+                patch_artist=True,
+                tick_labels=y_labels,
+                widths=0.64,
+                showfliers=False,
+                medianprops={'color': '#1f2933', 'linewidth': 1.4},
+                whiskerprops={'color': '#6b7280', 'linewidth': 1.0},
+                capprops={'color': '#6b7280', 'linewidth': 1.0},
+                boxprops={'linewidth': 1.0, 'edgecolor': '#6b7280'},
+            )
+
+            for patch, color in zip(boxplot['boxes'], box_colors):
+                patch.set_facecolor(color)
+                patch.set_alpha(0.74)
+                patch.set_edgecolor(color)
+
+            axis.set_xlim(0, global_max * 1.05)
+            axis.grid(True, alpha=0.25, axis='x')
+            axis.set_title(
+                f"From {self._get_cluster_display_name(source_cluster)}",
+                fontsize=style['title_fontsize'],
+                pad=8,
+            )
+            axis.tick_params(axis='x', labelsize=style['tick_fontsize'])
+            axis.tick_params(axis='y', labelsize=style['tick_fontsize'])
+            if plot_idx % n_cols == 0:
+                axis.set_ylabel('Target Cluster', fontsize=style['axis_fontsize'])
+            if plot_idx // n_cols == n_rows - 1:
+                axis.set_xlabel('Distance to Nearest Cell (µm)', fontsize=style['axis_fontsize'])
+
+        hidden_suffix = " (self-distances hidden)" if not show_self_pairs else ""
+        fig.suptitle(
+            f"Distance Distributions by Source Cluster{hidden_suffix}",
+            fontsize=11,
+            y=0.98,
+        )
+
+        self._finalize_canvas_render(self.distance_canvas, pad=0.95)
     
     def _get_selected_distance_clusters(self):
         """Get list of selected cluster IDs from the distance cluster list."""
@@ -2129,6 +3026,10 @@ class SimpleSpatialAnalysisDialog(QtWidgets.QDialog):
     def _populate_distance_cluster_list(self):
         """Populate the distance cluster list with available clusters."""
         if self.distance_df is None or self.distance_df.empty:
+            self.distance_cluster_list.clear()
+            self.distance_select_all_btn.setEnabled(False)
+            self.distance_deselect_all_btn.setEnabled(False)
+            self._update_distance_plot()
             return
         
         # Get all unique clusters from both cell_A_cluster and nearest_B_cluster
@@ -2136,7 +3037,7 @@ class SimpleSpatialAnalysisDialog(QtWidgets.QDialog):
         clusters_a = [c for c in self.distance_df['cell_A_cluster'].unique() if pd.notna(c)]
         clusters_b = [c for c in self.distance_df['nearest_B_cluster'].unique() if pd.notna(c)]
         all_clusters = set(clusters_a) | set(clusters_b)
-        all_clusters = sorted(all_clusters)
+        all_clusters = self._sorted_cluster_ids(all_clusters)
         
         self.distance_cluster_list.blockSignals(True)
         self.distance_cluster_list.clear()
@@ -2168,6 +3069,7 @@ class SimpleSpatialAnalysisDialog(QtWidgets.QDialog):
         self.cluster_summary_df = None
         self.enrichment_df = None
         self.distance_df = None
+        self.community_results_by_roi = {}
         self.spatial_viz_cache = {}
         
         # Reset analysis flags
@@ -2219,9 +3121,12 @@ class SimpleSpatialAnalysisDialog(QtWidgets.QDialog):
                 self.batch_corrected_dataframe = None
                 self.feature_dataframe = self.original_feature_dataframe.copy()
         
-        # Update cluster annotation map if available
-        if hasattr(parent, 'cluster_annotation_map'):
-            self.cluster_annotation_map = parent.cluster_annotation_map.copy()
+        label_source = self._get_label_source_dialog()
+        if label_source is not None and hasattr(label_source, 'cluster_annotation_map'):
+            self.cluster_annotation_map = dict(label_source.cluster_annotation_map or {})
+        if label_source is not None and hasattr(label_source, 'feature_label_map'):
+            self.feature_label_map = dict(label_source.feature_label_map or {})
+        self._apply_cluster_annotations_to_dataframes()
         
         # Refresh ROI combo boxes and other UI elements that depend on dataframe
         self._populate_roi_combo()

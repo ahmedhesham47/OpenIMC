@@ -174,6 +174,12 @@ from openimc.ui.dialogs.batch_correction_dialog import BatchCorrectionDialog
 from openimc.ui.dialogs.ometiff_format_dialog import OMETIFFFormatDialog
 from openimc.ui.dialogs.deconvolution_dialog import DeconvolutionDialog
 from openimc.ui.dialogs.pixel_correlation_dialog import PixelCorrelationDialog, ConditionROIWidget
+from openimc.ui.cluster_utils import (
+    canonicalize_cluster_id,
+    get_cluster_display_name,
+    normalize_cluster_annotation_map,
+    sort_cluster_values,
+)
 from openimc.core import deconvolution
 from openimc.utils.logger import get_logger
 from openimc.ui.mask_manager import DynamicMaskManager
@@ -7518,7 +7524,48 @@ class MainWindow(QtWidgets.QMainWindow):
                 if (self.segmentation_overlay_mode_combo.currentText() == "Cluster" and not has_cluster):
                     self.segmentation_overlay_mode_combo.setCurrentText("Mask")
                     self.segmentation_overlay_mode = "Mask"
-    
+
+    def _get_cluster_annotation_map(self) -> Dict[Any, str]:
+        """Return the best available cluster annotation map for display/legend labels."""
+        if hasattr(self, 'clustering_dialog') and self.clustering_dialog is not None:
+            return normalize_cluster_annotation_map(
+                getattr(self.clustering_dialog, 'cluster_annotation_map', {}) or {}
+            )
+
+        saved_state = getattr(self, '_saved_clustering_state', {}) or {}
+        return normalize_cluster_annotation_map(saved_state.get('cluster_annotation_map', {}) or {})
+
+    def _get_cluster_display_name(self, cluster_id):
+        """Return the current display name for a cluster id."""
+        return get_cluster_display_name(cluster_id, annotation_map=self._get_cluster_annotation_map())
+
+    def _ensure_cluster_overlay_palette(self, acq_id: str, unique_clusters) -> None:
+        """Ensure cluster overlay colors and labels are initialized for an acquisition."""
+        ordered_clusters = sort_cluster_values(
+            unique_clusters,
+            annotation_map=self._get_cluster_annotation_map(),
+            canonical=True,
+        )
+        if not ordered_clusters:
+            return
+
+        if (
+            acq_id not in self.cluster_colors
+            or set(self.cluster_colors[acq_id].keys()) != set(ordered_clusters)
+        ):
+            import matplotlib.cm as cm
+
+            cmap = cm.get_cmap('tab20' if len(ordered_clusters) <= 20 else 'tab20c')
+            self.cluster_colors[acq_id] = {
+                cluster: np.array(cmap(idx % cmap.N)[:3])
+                for idx, cluster in enumerate(ordered_clusters)
+            }
+
+        self.cluster_color_map[acq_id] = {
+            cluster: self._get_cluster_display_name(cluster)
+            for cluster in ordered_clusters
+        }
+
     def _get_cluster_assignments(self, acq_id: str) -> Optional[Dict[int, Union[int, str]]]:
         """Get cluster assignments for cells in the current acquisition by matching centroids.
         
@@ -7527,6 +7574,8 @@ class MainWindow(QtWidgets.QMainWindow):
         Returns:
             Dictionary mapping mask cell label (cell_id) to cluster_id/cluster_phenotype, or None if no cluster data available.
         """
+        annotation_map = self._get_cluster_annotation_map()
+
         if self.feature_dataframe is None or self.feature_dataframe.empty:
             return None
         
@@ -7637,7 +7686,8 @@ class MainWindow(QtWidgets.QMainWindow):
                         if pd.isna(cluster_val):
                             cluster_map[mask_label] = 'Unassigned'
                         else:
-                            cluster_map[mask_label] = cluster_val
+                            canonical_cluster = canonicalize_cluster_id(cluster_val, annotation_map=annotation_map)
+                            cluster_map[mask_label] = canonical_cluster if canonical_cluster is not None else 'Unassigned'
                     else:
                         # No close match found
                         cluster_map[mask_label] = 'Unassigned'
@@ -7652,7 +7702,8 @@ class MainWindow(QtWidgets.QMainWindow):
                     if pd.isna(cluster_val):
                         cell_to_cluster[cell_id] = 'Unassigned'
                     else:
-                        cell_to_cluster[cell_id] = cluster_val
+                        canonical_cluster = canonicalize_cluster_id(cluster_val, annotation_map=annotation_map)
+                        cell_to_cluster[cell_id] = canonical_cluster if canonical_cluster is not None else 'Unassigned'
                 
                 # Map mask labels (which are cell_ids) to clusters
                 for mask_label in mask_centroids.keys():
@@ -7693,34 +7744,12 @@ class MainWindow(QtWidgets.QMainWindow):
                     overlay[cell_mask, :] = colors[i]
             else:
                 # Get unique clusters and generate colors
-                unique_clusters = sorted(set(cluster_map.values()))
-                
-                # Initialize cluster colors if not already set
-                if self.current_acq_id not in self.cluster_colors:
-                    # Use a colormap to generate distinct colors
-                    import matplotlib.cm as cm
-                    import matplotlib.colors as mcolors
-                    
-                    # Use tab20 colormap for up to 20 clusters, otherwise use a larger colormap
-                    if len(unique_clusters) <= 20:
-                        cmap = cm.get_cmap('tab20')
-                    else:
-                        cmap = cm.get_cmap('tab20c')  # Has more colors
-                    
-                    cluster_colors_dict = {}
-                    cluster_color_map_dict = {}
-                    
-                    for idx, cluster in enumerate(unique_clusters):
-                        # Get color from colormap
-                        color = cmap(idx % cmap.N)
-                        # Convert to RGB (0-1 range)
-                        cluster_colors_dict[cluster] = np.array(color[:3])
-                        # Store display name
-                        cluster_color_map_dict[cluster] = str(cluster)
-                    
-                    self.cluster_colors[self.current_acq_id] = cluster_colors_dict
-                    self.cluster_color_map[self.current_acq_id] = cluster_color_map_dict
-                
+                unique_clusters = sort_cluster_values(
+                    set(cluster_map.values()),
+                    annotation_map=self._get_cluster_annotation_map(),
+                    canonical=True,
+                )
+                self._ensure_cluster_overlay_palette(self.current_acq_id, unique_clusters)
                 cluster_colors = self.cluster_colors[self.current_acq_id]
                 
                 # Color each cell by its cluster
@@ -7818,34 +7847,12 @@ class MainWindow(QtWidgets.QMainWindow):
         overlay = np.zeros((*mask.shape, 3), dtype=np.float32)
         
         # Get unique clusters and generate colors
-        unique_clusters = sorted(set(cluster_map.values()))
-        
-        # Initialize cluster colors if not already set
-        if self.current_acq_id not in self.cluster_colors:
-            # Use a colormap to generate distinct colors
-            import matplotlib.cm as cm
-            import matplotlib.colors as mcolors
-            
-            # Use tab20 colormap for up to 20 clusters, otherwise use a larger colormap
-            if len(unique_clusters) <= 20:
-                cmap = cm.get_cmap('tab20')
-            else:
-                cmap = cm.get_cmap('tab20c')  # Has more colors
-            
-            cluster_colors_dict = {}
-            cluster_color_map_dict = {}
-            
-            for idx, cluster in enumerate(unique_clusters):
-                # Get color from colormap
-                color = cmap(idx % cmap.N)
-                # Convert to RGB (0-1 range)
-                cluster_colors_dict[cluster] = np.array(color[:3])
-                # Store display name
-                cluster_color_map_dict[cluster] = str(cluster)
-            
-            self.cluster_colors[self.current_acq_id] = cluster_colors_dict
-            self.cluster_color_map[self.current_acq_id] = cluster_color_map_dict
-        
+        unique_clusters = sort_cluster_values(
+            set(cluster_map.values()),
+            annotation_map=self._get_cluster_annotation_map(),
+            canonical=True,
+        )
+        self._ensure_cluster_overlay_palette(self.current_acq_id, unique_clusters)
         cluster_colors = self.cluster_colors[self.current_acq_id]
         
         # Color each cell by its cluster
@@ -7909,7 +7916,11 @@ class MainWindow(QtWidgets.QMainWindow):
         legend_elements = []
         
         # Sort clusters for consistent legend order
-        sorted_clusters = sorted(cluster_color_map.keys(), key=lambda x: (isinstance(x, str), str(x)))
+        sorted_clusters = sort_cluster_values(
+            cluster_color_map.keys(),
+            annotation_map=self._get_cluster_annotation_map(),
+            canonical=True,
+        )
         
         for cluster in sorted_clusters:
             color = cluster_colors.get(cluster, [0.5, 0.5, 0.5])
@@ -10588,6 +10599,16 @@ class MainWindow(QtWidgets.QMainWindow):
                 qc_ui_state["selected_acquisition"] = dlg.acq_combo.currentText()
             if hasattr(dlg, 'workers_spin'):
                 qc_ui_state["num_workers"] = dlg.workers_spin.value()
+            if hasattr(dlg, 'denoise_source_combo'):
+                qc_ui_state["denoise_source"] = dlg.denoise_source_combo.currentText()
+            if hasattr(dlg, 'custom_denoise_settings') and dlg.custom_denoise_settings:
+                qc_ui_state["custom_denoise_settings"] = dlg.custom_denoise_settings
+            if hasattr(dlg, 'get_cell_signal_method'):
+                qc_ui_state["cell_signal_method"] = dlg.get_cell_signal_method()
+            if hasattr(dlg, 'positive_threshold_sd_spin'):
+                qc_ui_state["positive_threshold_sd"] = dlg.positive_threshold_sd_spin.value()
+            if hasattr(dlg, 'upper_quantile_spin'):
+                qc_ui_state["upper_quantile_percent"] = dlg.upper_quantile_spin.value()
             if qc_ui_state:
                 if "qc_analysis" not in analysis_state:
                     analysis_state["qc_analysis"] = {}
@@ -10698,6 +10719,15 @@ class MainWindow(QtWidgets.QMainWindow):
         
         if hasattr(dlg, 'cluster_map_cell_size'):
             state["cluster_map_cell_size"] = dlg.cluster_map_cell_size
+
+        if hasattr(dlg, 'cluster_map_colorbar_width'):
+            state["cluster_map_colorbar_width"] = dlg.cluster_map_colorbar_width
+
+        if hasattr(dlg, 'cluster_map_colorbar_position'):
+            state["cluster_map_colorbar_position"] = dlg.cluster_map_colorbar_position
+
+        if hasattr(dlg, 'cluster_map_colorbar_orientation'):
+            state["cluster_map_colorbar_orientation"] = dlg.cluster_map_colorbar_orientation
         
         # Collect heatmap scaling method
         if hasattr(dlg, 'heatmap_scaling_combo'):
@@ -10871,6 +10901,8 @@ class MainWindow(QtWidgets.QMainWindow):
         # Common state for both Simple and Advanced
         if hasattr(dlg, 'cluster_annotation_map') and dlg.cluster_annotation_map:
             state["cluster_annotation_map"] = dlg.cluster_annotation_map
+        if hasattr(dlg, 'feature_label_map') and dlg.feature_label_map:
+            state["feature_label_map"] = dlg.feature_label_map
         
         # Simple Spatial Analysis specific state
         if dialog_type == "simple":
@@ -11232,6 +11264,28 @@ class MainWindow(QtWidgets.QMainWindow):
             # Restore number of workers
             if "num_workers" in ui_state and hasattr(dialog, 'workers_spin'):
                 dialog.workers_spin.setValue(ui_state["num_workers"])
+
+            if "denoise_source" in ui_state and hasattr(dialog, 'denoise_source_combo'):
+                index = dialog.denoise_source_combo.findText(ui_state["denoise_source"])
+                if index >= 0:
+                    dialog.denoise_source_combo.setCurrentIndex(index)
+
+            if "custom_denoise_settings" in ui_state and hasattr(dialog, 'custom_denoise_settings'):
+                dialog.custom_denoise_settings = dict(ui_state["custom_denoise_settings"] or {})
+                if hasattr(dialog, '_populate_denoise_channel_list'):
+                    dialog._populate_denoise_channel_list()
+                if hasattr(dialog, '_load_denoise_settings'):
+                    dialog._load_denoise_settings()
+            if "cell_signal_method" in ui_state and hasattr(dialog, 'cell_signal_method_combo'):
+                index = dialog.cell_signal_method_combo.findData(ui_state["cell_signal_method"])
+                if index >= 0:
+                    dialog.cell_signal_method_combo.setCurrentIndex(index)
+            if "positive_threshold_sd" in ui_state and hasattr(dialog, 'positive_threshold_sd_spin'):
+                dialog.positive_threshold_sd_spin.setValue(float(ui_state["positive_threshold_sd"]))
+            if "upper_quantile_percent" in ui_state and hasattr(dialog, 'upper_quantile_spin'):
+                dialog.upper_quantile_spin.setValue(float(ui_state["upper_quantile_percent"]))
+            if hasattr(dialog, '_update_cell_signal_controls'):
+                dialog._update_cell_signal_controls()
             
             # Refresh QC results display if results are cached
             if hasattr(dialog, 'qc_results_aggregated') and dialog.qc_results_aggregated is not None:
@@ -11664,6 +11718,14 @@ class MainWindow(QtWidgets.QMainWindow):
             if "cluster_annotation_map" in state and state["cluster_annotation_map"]:
                 if hasattr(dialog, 'cluster_annotation_map'):
                     dialog.cluster_annotation_map = state["cluster_annotation_map"]
+            if "feature_label_map" in state and state["feature_label_map"]:
+                if hasattr(dialog, 'feature_label_map'):
+                    dialog.feature_label_map = state["feature_label_map"]
+            if hasattr(dialog, '_apply_cluster_annotations_to_dataframes'):
+                try:
+                    dialog._apply_cluster_annotations_to_dataframes()
+                except Exception:
+                    pass
             
             # Restore filter settings (excluded cells, area filters, etc.)
             if "filter_settings" in state and state["filter_settings"] is not None:
@@ -11718,6 +11780,18 @@ class MainWindow(QtWidgets.QMainWindow):
             if "cluster_map_cell_size" in state:
                 if hasattr(dialog, 'cluster_map_cell_size'):
                     dialog.cluster_map_cell_size = state["cluster_map_cell_size"]
+
+            if "cluster_map_colorbar_width" in state:
+                if hasattr(dialog, 'cluster_map_colorbar_width'):
+                    dialog.cluster_map_colorbar_width = state["cluster_map_colorbar_width"]
+
+            if "cluster_map_colorbar_position" in state:
+                if hasattr(dialog, 'cluster_map_colorbar_position'):
+                    dialog.cluster_map_colorbar_position = state["cluster_map_colorbar_position"]
+
+            if "cluster_map_colorbar_orientation" in state:
+                if hasattr(dialog, 'cluster_map_colorbar_orientation'):
+                    dialog.cluster_map_colorbar_orientation = state["cluster_map_colorbar_orientation"]
             
             # Restore heatmap scaling
             if "heatmap_scaling" in state:

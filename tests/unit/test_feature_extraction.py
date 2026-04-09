@@ -251,6 +251,88 @@ class TestFeatureExtraction:
         # Should return empty dataframe or handle gracefully
         assert isinstance(result, pd.DataFrame)
 
+    def test_extract_features_reports_touching_cells_and_exact_channel_statistics(self):
+        """Feature extraction should preserve exact per-cell stats for simple synthetic data."""
+        mask = np.zeros((6, 5), dtype=np.uint32)
+        mask[0:2, :] = 1
+        mask[2:5, 1:4] = 2
+
+        marker = np.zeros((6, 5), dtype=np.float32)
+        marker[0:2, :] = np.array(
+            [
+                [0.0, 0.0, 0.0, 0.0, 10.0],
+                [10.0, 10.0, 10.0, 10.0, 10.0],
+            ],
+            dtype=np.float32,
+        )
+        marker[2:5, 1:4] = 3.0
+        img_stack_hwc = marker[..., np.newaxis]
+
+        selected_features = {
+            'touches_edge': True,
+            'mean': True,
+            'median': True,
+            'std': True,
+            'mad': True,
+            'p10': True,
+            'p90': True,
+            'integrated': True,
+            'frac_pos': True,
+        }
+        acq_info = {
+            'channels': ['Marker1'],
+            'well': 'A1',
+        }
+
+        result = extract_features_for_acquisition(
+            acq_id='test_1',
+            mask=mask,
+            selected_features=selected_features,
+            acq_info=acq_info,
+            acq_label='Test',
+            img_stack=img_stack_hwc,
+            arcsinh_enabled=False,
+            cofactor=10.0,
+            denoise_source='None',
+            custom_denoise_settings=None,
+            spillover_config=None,
+            source_file='synthetic.ome.tif',
+            excluded_channels=None,
+        ).sort_values('cell_id').reset_index(drop=True)
+
+        assert result['cell_id'].tolist() == [1, 2]
+        assert result['touches_edge'].tolist() == [True, False]
+
+        cell1_pixels = np.array([0.0, 0.0, 0.0, 0.0, 10.0, 10.0, 10.0, 10.0, 10.0, 10.0])
+        cell2_pixels = np.full(9, 3.0)
+        expected_by_cell = {
+            1: {
+                'mean': float(np.mean(cell1_pixels)),
+                'median': float(np.median(cell1_pixels)),
+                'std': float(np.std(cell1_pixels)),
+                'mad': float(np.median(np.abs(cell1_pixels - np.median(cell1_pixels)))),
+                'p10': float(np.percentile(cell1_pixels, 10)),
+                'p90': float(np.percentile(cell1_pixels, 90)),
+                'integrated': float(np.sum(cell1_pixels)),
+                'frac_pos': float(np.count_nonzero(cell1_pixels > 0) / cell1_pixels.size),
+            },
+            2: {
+                'mean': float(np.mean(cell2_pixels)),
+                'median': float(np.median(cell2_pixels)),
+                'std': float(np.std(cell2_pixels)),
+                'mad': float(np.median(np.abs(cell2_pixels - np.median(cell2_pixels)))),
+                'p10': float(np.percentile(cell2_pixels, 10)),
+                'p90': float(np.percentile(cell2_pixels, 90)),
+                'integrated': float(np.sum(cell2_pixels)),
+                'frac_pos': float(np.count_nonzero(cell2_pixels > 0) / cell2_pixels.size),
+            },
+        }
+
+        for cell_id, expected in expected_by_cell.items():
+            row = result.loc[result['cell_id'] == cell_id].iloc[0]
+            for suffix, expected_value in expected.items():
+                assert np.isclose(row[f'Marker1_{suffix}'], expected_value)
+
     def test_drop_excluded_channel_columns_removes_schema_columns(self):
         """Excluded channels should not remain as columns (including all-NaN columns)."""
         df = pd.DataFrame(

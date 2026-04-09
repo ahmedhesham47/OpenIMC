@@ -1008,6 +1008,9 @@ def qc_analysis_command(args):
             - channels: Optional comma-separated list of channels to analyze
             - mask: Optional path to mask file for cell-level analysis
             - mode: Analysis mode ('pixel' or 'cell')
+            - cell_signal_method: Cell-mode signal selection method
+            - positive_threshold_sd: Robust-SD threshold multiplier for positive-pixel mode
+            - upper_quantile: Quantile used by upper-quantile cell mode
     
     Returns:
         CSV file with QC metrics for each channel.
@@ -1051,7 +1054,10 @@ def qc_analysis_command(args):
                 acquisition=acq,
                 channels=channels,
                 mode=args.mode,
-                mask=mask
+                mask=mask,
+                cell_signal_method=args.cell_signal_method,
+                positive_threshold_sd=args.positive_threshold_sd,
+                upper_quantile=args.upper_quantile,
             )
             
             if not results_df.empty:
@@ -2701,6 +2707,24 @@ Examples:
     qc_parser.add_argument('--channels', type=str, help='Comma-separated list of channels to analyze (uses all if not specified)')
     qc_parser.add_argument('--mode', choices=['pixel', 'cell'], default='pixel', help='Analysis mode (default: pixel)')
     qc_parser.add_argument('--mask', type=str, help='Path to segmentation mask file (required for cell mode)')
+    qc_parser.add_argument(
+        '--cell-signal-method',
+        choices=['positive_pixels', 'upper_quantile', 'all_cell_mean'],
+        default='positive_pixels',
+        help='Cell-mode signal definition (default: positive_pixels)',
+    )
+    qc_parser.add_argument(
+        '--positive-threshold-sd',
+        type=float,
+        default=2.0,
+        help='Robust background SD multiplier for positive-pixel cell mode (default: 2.0)',
+    )
+    qc_parser.add_argument(
+        '--upper-quantile',
+        type=float,
+        default=0.90,
+        help='Upper quantile in (0, 1] for upper-quantile cell mode (default: 0.90)',
+    )
     qc_parser.add_argument('--workers', type=int, default=None, help=f'Number of parallel workers (default: {get_default_workers()})')
     qc_parser.set_defaults(func=qc_analysis_command)
     
@@ -2808,4 +2832,3 @@ Examples:
 
 if __name__ == '__main__':
     main()
-
