@@ -50,6 +50,7 @@ def test_state_manager_paths_are_relative_to_state_folder(tmp_path):
     clustering_path = state_json["analysis_modules"]["clustering"]
     assert not clustering_path.startswith(str(state_dir.name))
     assert clustering_path.startswith("analysis/")
+    assert "\\" not in clustering_path
 
     # Renaming the state folder should not break loads
     renamed = tmp_path / "renamed_state_folder"
@@ -135,4 +136,3 @@ def test_state_manager_save_state_uses_utf8_for_text_outputs(tmp_path, monkeypat
     assert sm.save_state(state_dir, main_window_state, overwrite=True)
     assert (state_dir / "README.md").exists()
     assert (state_dir / "manifest.txt").exists()
-

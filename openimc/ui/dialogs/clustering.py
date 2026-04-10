@@ -1227,8 +1227,17 @@ class CellClusteringDialog(QtWidgets.QDialog):
             if nonblocking_refresh:
                 try:
                     self.canvas.updateGeometry()
+                    QtWidgets.QApplication.processEvents(QtCore.QEventLoop.AllEvents, 20)
+                    if getattr(self.canvas, 'figure', None) is self.figure:
+                        sync_figure_to_canvas(self.figure, self.canvas)
+                    if hasattr(self.canvas, 'resize_event'):
+                        try:
+                            self.canvas.resize_event()
+                        except Exception:
+                            pass
                 except Exception:
                     pass
+                refresh_canvas(self.canvas, draw=True)
             else:
                 try:
                     old_w = max(2, int(self.canvas.width()))

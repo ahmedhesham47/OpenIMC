@@ -19,6 +19,7 @@
 
 import builtins
 import importlib
+from types import SimpleNamespace
 
 import pytest
 
@@ -67,3 +68,24 @@ def test_squidpy_available_handles_broken_optional_import(monkeypatch):
     spatial_analysis_module.sq = None
     spatial_analysis_module.sc = None
     spatial_analysis_module.ad = None
+
+
+@pytest.mark.unit
+def test_squidpy_available_handles_failed_windows_probe(monkeypatch):
+    importlib.reload(spatial_analysis_module)
+
+    monkeypatch.setattr(spatial_analysis_module, "_should_probe_squidpy_import", lambda: True)
+    monkeypatch.setattr(
+        spatial_analysis_module.subprocess,
+        "run",
+        lambda *args, **kwargs: SimpleNamespace(returncode=3221225477, stderr="", stdout=""),
+    )
+    monkeypatch.setattr(
+        importlib,
+        "import_module",
+        lambda *args, **kwargs: (_ for _ in ()).throw(AssertionError("direct import should not run")),
+    )
+
+    assert spatial_analysis_module.squidpy_available() is False
+    assert spatial_analysis_module._HAVE_SQUIDPY is False
+    assert "3221225477" in str(spatial_analysis_module._SQUIDPY_IMPORT_ERROR)

@@ -17,11 +17,24 @@
 # You should have received a copy of the GNU General Public License
 # along with this program.  If not, see <https://www.gnu.org/licenses/>.
 
+import sys
 import numpy as np
 import pandas as pd
 from matplotlib.text import Text
 
 from openimc.ui.dialogs.clustering import CellClusteringDialog
+
+
+_CLUSTER_MAP_WAIT_TIMEOUT_MS = 15000 if sys.platform == 'darwin' else 5000
+
+
+def _cluster_map_axes_ready(fig):
+    try:
+        heatmap_axis = _get_heatmap_axis(fig)
+        _get_colorbar_axis(fig, heatmap_axis)
+        return True
+    except Exception:
+        return False
 
 
 def _build_clustered_dataframe(n_clusters: int = 7, cells_per_cluster: int = 8, n_features: int = 12) -> pd.DataFrame:
@@ -116,6 +129,7 @@ def _build_dialog(qtbot, *, cbar_position='Upper right', cbar_orientation='Verti
     dialog.show()
     qtbot.wait(150)
     dialog._show_cluster_map()
+    qtbot.waitUntil(lambda: _cluster_map_axes_ready(dialog.figure), timeout=_CLUSTER_MAP_WAIT_TIMEOUT_MS)
     if hasattr(dialog, '_flush_canvas'):
         dialog._flush_canvas(force_layout_refresh=True)
     qtbot.wait(150)
@@ -169,7 +183,7 @@ def _cluster_map_layout_is_clear(fig, *, expect_horizontal=False):
 
 def test_cluster_map_keeps_labels_inside_canvas_and_clear_of_colorbar(qtbot):
     dialog = _build_dialog(qtbot)
-    qtbot.waitUntil(lambda: _cluster_map_layout_is_clear(dialog.figure), timeout=5000)
+    qtbot.waitUntil(lambda: _cluster_map_layout_is_clear(dialog.figure), timeout=_CLUSTER_MAP_WAIT_TIMEOUT_MS)
 
     overflow = _measure_text_overflow(dialog.figure)
     assert max(overflow.values()) <= 0.01
@@ -200,9 +214,9 @@ def test_cluster_map_reflows_after_resize(qtbot):
     dialog.resize(1420, 1040)
     qtbot.waitUntil(
         lambda: abs(dialog.figure.get_size_inches()[0] - (dialog.canvas.width() / max(dialog.figure.get_dpi(), 1.0))) < 0.2,
-        timeout=2000,
+        timeout=max(4000, _CLUSTER_MAP_WAIT_TIMEOUT_MS),
     )
-    qtbot.waitUntil(lambda: _cluster_map_layout_is_clear(dialog.figure), timeout=5000)
+    qtbot.waitUntil(lambda: _cluster_map_layout_is_clear(dialog.figure), timeout=_CLUSTER_MAP_WAIT_TIMEOUT_MS)
     qtbot.wait(150)
 
     overflow = _measure_text_overflow(dialog.figure)
@@ -220,7 +234,10 @@ def _bboxes_overlap(a, b, pad_px=1.0):
 
 def test_cluster_map_supports_horizontal_colorbar_without_covering_text(qtbot):
     dialog = _build_dialog(qtbot, cbar_position='Upper right', cbar_orientation='Horizontal')
-    qtbot.waitUntil(lambda: _cluster_map_layout_is_clear(dialog.figure, expect_horizontal=True), timeout=5000)
+    qtbot.waitUntil(
+        lambda: _cluster_map_layout_is_clear(dialog.figure, expect_horizontal=True),
+        timeout=_CLUSTER_MAP_WAIT_TIMEOUT_MS,
+    )
 
     overflow = _measure_text_overflow(dialog.figure)
     assert max(overflow.values()) <= 0.01

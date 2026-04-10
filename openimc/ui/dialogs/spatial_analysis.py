@@ -31,6 +31,8 @@ The actual dialog implementations are in separate files:
 # Use environment variable approach as it's more reliable
 import importlib
 import os
+import subprocess
+import sys
 import warnings
 # Set environment variable before importing dask
 os.environ.setdefault('DASK_DATAFRAME__QUERY_PLANNING', 'False')
@@ -83,9 +85,60 @@ except ImportError:
 _HAVE_SQUIDPY = False
 _SQUIDPY_IMPORT_ATTEMPTED = False
 _SQUIDPY_IMPORT_ERROR = None
+_SQUIDPY_PROBE_ATTEMPTED = False
+_SQUIDPY_PROBE_ERROR = None
 sq = None
 sc = None
 ad = None
+
+
+def _should_probe_squidpy_import() -> bool:
+    """Use a subprocess probe on Windows so DLL crashes do not kill the main process."""
+    return sys.platform.startswith("win")
+
+
+def _probe_squidpy_import_in_subprocess() -> bool:
+    """Probe squidpy imports in a child process and cache the outcome."""
+    global _SQUIDPY_PROBE_ATTEMPTED, _SQUIDPY_PROBE_ERROR
+
+    if _SQUIDPY_PROBE_ATTEMPTED:
+        return _SQUIDPY_PROBE_ERROR is None
+
+    _SQUIDPY_PROBE_ATTEMPTED = True
+    probe_code = """
+import importlib
+import warnings
+
+with warnings.catch_warnings():
+    warnings.filterwarnings('ignore', category=FutureWarning, message='.*read_text.*')
+    warnings.filterwarnings('ignore', category=FutureWarning, message='.*__version__.*')
+    for module_name in ('squidpy', 'scanpy', 'anndata'):
+        importlib.import_module(module_name)
+"""
+
+    try:
+        result = subprocess.run(
+            [sys.executable, "-c", probe_code],
+            capture_output=True,
+            text=True,
+            check=False,
+            timeout=90,
+        )
+    except Exception as exc:
+        _SQUIDPY_PROBE_ERROR = f"Subprocess squidpy probe failed: {exc}"
+        return False
+
+    if result.returncode == 0:
+        _SQUIDPY_PROBE_ERROR = None
+        return True
+
+    detail = (result.stderr or result.stdout or "").strip()
+    if detail:
+        detail = detail.splitlines()[-1].strip()
+    else:
+        detail = f"Squidpy probe subprocess exited with code {result.returncode}"
+    _SQUIDPY_PROBE_ERROR = detail
+    return False
 
 
 def _get_squidpy_modules():
@@ -96,6 +149,15 @@ def _get_squidpy_modules():
         return sq, sc, ad
 
     if _SQUIDPY_IMPORT_ATTEMPTED:
+        return None
+
+    if _should_probe_squidpy_import() and not _probe_squidpy_import_in_subprocess():
+        _SQUIDPY_IMPORT_ATTEMPTED = True
+        _SQUIDPY_IMPORT_ERROR = _SQUIDPY_PROBE_ERROR
+        warnings.warn(
+            f"Failed to import squidpy: {_SQUIDPY_IMPORT_ERROR}. Squidpy features will be disabled.",
+            ImportWarning,
+        )
         return None
 
     _SQUIDPY_IMPORT_ATTEMPTED = True

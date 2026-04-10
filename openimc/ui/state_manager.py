@@ -63,6 +63,11 @@ class StateManager:
     
     def __init__(self):
         self.state_version = self.STATE_VERSION
+
+    @staticmethod
+    def _to_state_relative_path(path: Path, state_root: Path) -> str:
+        """Serialize state-managed paths with stable POSIX separators across platforms."""
+        return path.relative_to(state_root).as_posix()
     
     def save_state(
         self,
@@ -279,12 +284,12 @@ class StateManager:
                             if acq_id not in saved_images:
                                 saved_images[acq_id] = {}
                             # Store paths relative to the state folder for portability (renaming/moving the state folder)
-                            saved_images[acq_id][channel] = str(img_path.relative_to(images_dir.parent))
+                            saved_images[acq_id][channel] = self._to_state_relative_path(img_path, images_dir.parent)
                 elif isinstance(image_data, np.ndarray):
                     # Single image array
                     img_path = images_dir / f"{acq_id}.tif"
                     tifffile.imwrite(str(img_path), image_data)
-                    saved_images[acq_id] = str(img_path.relative_to(images_dir.parent))
+                    saved_images[acq_id] = self._to_state_relative_path(img_path, images_dir.parent)
                 elif isinstance(image_data, str):
                     # Already a file path - just record it
                     saved_images[acq_id] = image_data
@@ -395,12 +400,12 @@ class StateManager:
                 if isinstance(mask_data, np.ndarray):
                     # Save mask array
                     tifffile.imwrite(str(mask_path), mask_data.astype(np.uint16), compression='lzw')
-                    saved_masks[acq_id] = str(mask_path.relative_to(masks_dir.parent))
+                    saved_masks[acq_id] = self._to_state_relative_path(mask_path, masks_dir.parent)
                 elif isinstance(mask_data, str):
                     # Already a file path - copy it
                     if os.path.exists(mask_data):
                         shutil.copy2(mask_data, mask_path)
-                        saved_masks[acq_id] = str(mask_path.relative_to(masks_dir.parent))
+                        saved_masks[acq_id] = self._to_state_relative_path(mask_path, masks_dir.parent)
                     else:
                         saved_masks[acq_id] = mask_data
             except Exception as e:
@@ -486,7 +491,7 @@ class StateManager:
                 filename = feature_names.get(name, f"{name}_features.csv")
                 feature_path = features_dir / filename
                 df.to_csv(feature_path, index=False, encoding=self.TEXT_ENCODING)
-                saved_features[name] = str(feature_path.relative_to(features_dir.parent))
+                saved_features[name] = self._to_state_relative_path(feature_path, features_dir.parent)
         
         return saved_features
     
@@ -547,7 +552,7 @@ class StateManager:
                 with open(analysis_path, 'w', encoding=self.TEXT_ENCODING) as f:
                     json.dump(json_state, f, indent=2, default=self._json_serializer)
                 
-                saved_analysis[module_name] = str(analysis_path.relative_to(analysis_dir.parent))
+                saved_analysis[module_name] = self._to_state_relative_path(analysis_path, analysis_dir.parent)
         
         return saved_analysis
     
@@ -621,7 +626,7 @@ class StateManager:
                 state.to_csv(df_path, index=False, encoding=self.TEXT_ENCODING)
                 return {
                     "__type__": "DataFrame_file",
-                    "__path__": str(df_path.relative_to(analysis_dir.parent)),
+                    "__path__": self._to_state_relative_path(df_path, analysis_dir.parent),
                 }
             return {"__type__": "DataFrame", "__data__": state.to_dict('records')}
         elif isinstance(state, pd.Series):
@@ -652,7 +657,7 @@ class StateManager:
                 np.save(str(arr_path), state)
                 return {
                     "__type__": "ndarray_file",
-                    "__path__": str(arr_path.relative_to(analysis_dir.parent)),
+                    "__path__": self._to_state_relative_path(arr_path, analysis_dir.parent),
                     "__shape__": list(state.shape),
                     "__dtype__": str(state.dtype),
                 }
