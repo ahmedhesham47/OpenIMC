@@ -351,13 +351,8 @@ class QCAnalysisDialog(QtWidgets.QDialog):
         
     def _create_ui(self):
         layout = QtWidgets.QVBoxLayout(self)
-        
-        # Title
-        title_label = QtWidgets.QLabel("Quality Control Analysis")
-        title_label.setStyleSheet("QLabel { font-weight: bold; font-size: 12pt; }")
-        layout.addWidget(title_label)
-        
-        # Options panel
+
+        # Options panel (hosted in a separate popup to maximize plot space)
         options_group = QtWidgets.QGroupBox("Analysis Options")
         options_layout = QtWidgets.QVBoxLayout(options_group)
         
@@ -586,16 +581,26 @@ class QCAnalysisDialog(QtWidgets.QDialog):
 
         denoise_layout.addWidget(self.custom_denoise_frame)
         options_layout.addWidget(denoise_group)
-        
-        # Run button
-        run_layout = QtWidgets.QHBoxLayout()
+
+        self._settings_options_group = options_group
+        self._build_settings_dialog()
+
+        controls_row = QtWidgets.QHBoxLayout()
+        self.qc_settings_btn = QtWidgets.QPushButton("QC Settings...")
+        self.qc_settings_btn.setToolTip(
+            "Open acquisition, analysis mode, cell signal, denoising, and worker settings"
+        )
+        self.qc_settings_btn.clicked.connect(self._open_settings_dialog)
+        controls_row.addWidget(self.qc_settings_btn)
+
+        self.settings_summary_label = QtWidgets.QLabel("")
+        self.settings_summary_label.setStyleSheet("QLabel { color: #666; }")
+        controls_row.addWidget(self.settings_summary_label, 1)
+
         self.run_btn = QtWidgets.QPushButton("Calculate QC Metrics")
         self.run_btn.clicked.connect(self._run_analysis)
-        run_layout.addWidget(self.run_btn)
-        run_layout.addStretch()
-        options_layout.addLayout(run_layout)
-        
-        layout.addWidget(options_group)
+        controls_row.addWidget(self.run_btn)
+        layout.addLayout(controls_row)
         
         # Results tabs
         self.tabs = QtWidgets.QTabWidget()
@@ -685,7 +690,97 @@ class QCAnalysisDialog(QtWidgets.QDialog):
         self._populate_denoise_channel_list()
         self._on_denoise_source_changed()
         self._update_cell_signal_controls()
-        
+        self._connect_settings_summary_signals()
+        self._update_settings_summary()
+
+    def _build_settings_dialog(self):
+        """Create the popup dialog that hosts QC settings controls."""
+        self.qc_settings_dialog = QtWidgets.QDialog(self)
+        self.qc_settings_dialog.setWindowTitle("QC Analysis Settings")
+        self.qc_settings_dialog.setModal(True)
+        self.qc_settings_dialog.setMinimumSize(580, 460)
+
+        parent_size = self.size()
+        if parent_size.width() > 0 and parent_size.height() > 0:
+            dialog_width = max(580, int(parent_size.width() * 0.6))
+            dialog_height = max(460, int(parent_size.height() * 0.75))
+            self.qc_settings_dialog.resize(dialog_width, dialog_height)
+
+        dialog_layout = QtWidgets.QVBoxLayout(self.qc_settings_dialog)
+        help_label = QtWidgets.QLabel(
+            "Configure QC analysis options here. Then click 'Calculate QC Metrics' in the main window "
+            "to refresh the tables and plots."
+        )
+        help_label.setWordWrap(True)
+        dialog_layout.addWidget(help_label)
+
+        scroll_area = QtWidgets.QScrollArea()
+        scroll_area.setWidgetResizable(True)
+        scroll_area.setFrameShape(QtWidgets.QFrame.NoFrame)
+        scroll_area.setWidget(self._settings_options_group)
+        dialog_layout.addWidget(scroll_area, 1)
+
+        buttons_layout = QtWidgets.QHBoxLayout()
+        buttons_layout.addStretch()
+        done_btn = QtWidgets.QPushButton("Done")
+        done_btn.clicked.connect(self.qc_settings_dialog.accept)
+        buttons_layout.addWidget(done_btn)
+        dialog_layout.addLayout(buttons_layout)
+
+    def _open_settings_dialog(self):
+        """Open the popup dialog containing QC analysis settings."""
+        if not hasattr(self, 'qc_settings_dialog') or self.qc_settings_dialog is None:
+            return
+        self._on_denoise_source_changed()
+        self._update_cell_signal_controls()
+        self.qc_settings_dialog.exec_()
+        self._update_settings_summary()
+
+    def _connect_settings_summary_signals(self):
+        """Keep the compact settings summary synchronized with control changes."""
+        signal_bindings = [
+            (self.mode_combo.currentIndexChanged, self._update_settings_summary),
+            (self.acq_combo.currentIndexChanged, self._update_settings_summary),
+            (self.workers_spin.valueChanged, self._update_settings_summary),
+            (self.cell_signal_method_combo.currentIndexChanged, self._update_settings_summary),
+            (self.positive_threshold_sd_spin.valueChanged, self._update_settings_summary),
+            (self.upper_quantile_spin.valueChanged, self._update_settings_summary),
+            (self.denoise_source_combo.currentTextChanged, self._update_settings_summary),
+        ]
+        for signal, slot in signal_bindings:
+            signal.connect(slot)
+
+    def _update_settings_summary(self):
+        """Update the compact summary shown next to the settings button."""
+        if not hasattr(self, 'settings_summary_label'):
+            return
+
+        acq_text = self.acq_combo.currentText() if hasattr(self, 'acq_combo') else ""
+        mode_text = self.mode_combo.currentText() if hasattr(self, 'mode_combo') else ""
+        workers = self.workers_spin.value() if hasattr(self, 'workers_spin') else None
+        denoise_text = self.denoise_source_combo.currentText() if hasattr(self, 'denoise_source_combo') else "None"
+
+        parts = [part for part in [acq_text, mode_text] if part]
+
+        if self.analysis_mode == "cell":
+            method = self.get_cell_signal_method()
+            if method == "positive_pixels":
+                signal_text = f"Signal: Positive pixels (+{self.positive_threshold_sd_spin.value():.1f} SD)"
+            elif method == "upper_quantile":
+                signal_text = f"Signal: Top {self.upper_quantile_spin.value():.1f}% cells"
+            else:
+                signal_text = "Signal: All cell pixels"
+            parts.append(signal_text)
+
+        parts.append(f"Denoising: {denoise_text}")
+        if workers is not None:
+            worker_label = "worker" if workers == 1 else "workers"
+            parts.append(f"{workers} {worker_label}")
+
+        summary = " | ".join(parts)
+        self.settings_summary_label.setText(summary)
+        self.settings_summary_label.setToolTip(summary)
+    
     def _check_masks_exist(self) -> bool:
         """Check if any segmentation masks exist."""
         if not self.parent_window or not hasattr(self.parent_window, 'segmentation_masks'):
@@ -736,6 +831,7 @@ class QCAnalysisDialog(QtWidgets.QDialog):
         """Handle changes to the denoise source selection."""
         if hasattr(self, 'custom_denoise_frame'):
             self.custom_denoise_frame.setVisible(self.denoise_source_combo.currentText() == "Custom")
+        self._update_settings_summary()
 
     def _on_denoise_channel_changed(self):
         """Persist current custom settings before switching denoise channels."""
@@ -910,6 +1006,7 @@ class QCAnalysisDialog(QtWidgets.QDialog):
     def _on_cell_signal_method_changed(self):
         """Update cell signal controls when the selected method changes."""
         self._update_cell_signal_controls()
+        self._update_settings_summary()
 
     def get_cell_signal_method(self) -> str:
         """Return the selected cell signal method identifier."""
@@ -1054,6 +1151,7 @@ class QCAnalysisDialog(QtWidgets.QDialog):
         self._update_cell_signal_controls()
         # Try to restore cached results for the new mode
         self._restore_cached_results()
+        self._update_settings_summary()
     
     
     def _run_analysis(self):

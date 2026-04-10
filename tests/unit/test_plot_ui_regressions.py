@@ -183,6 +183,8 @@ def _build_qc_dialog(qtbot, parent=None) -> QCAnalysisDialog:
         qtbot.addWidget(parent)
     dialog = QCAnalysisDialog(parent)
     qtbot.addWidget(dialog)
+    if hasattr(dialog, 'qc_settings_dialog'):
+        qtbot.addWidget(dialog.qc_settings_dialog)
     dialog.resize(1100, 760)
     dialog.show()
     qtbot.wait(120)
@@ -289,9 +291,11 @@ def test_qc_snr_plot_uses_symlog_and_keeps_nonpositive_snr_points(qtbot):
 def test_qc_cell_signal_controls_toggle_by_mode_and_method(qtbot):
     parent = _QCTestParent(with_masks=True)
     dialog = _build_qc_dialog(qtbot, parent)
+    dialog.qc_settings_dialog.show()
+    qtbot.wait(50)
 
     assert dialog.analysis_mode == "cell"
-    assert dialog.cell_signal_group.isVisibleTo(dialog)
+    assert dialog.cell_signal_group.isVisibleTo(dialog.qc_settings_dialog)
     assert dialog.get_cell_signal_method() == "positive_pixels"
     assert dialog.positive_threshold_sd_spin.isVisible()
     assert not dialog.upper_quantile_spin.isVisible()
@@ -322,6 +326,25 @@ def test_qc_restores_cell_signal_ui_state(qtbot):
     assert dialog.get_cell_signal_method() == "upper_quantile"
     assert dialog.positive_threshold_sd_spin.value() == pytest.approx(3.0)
     assert dialog.upper_quantile_spin.value() == pytest.approx(95.0)
+
+
+def test_qc_settings_summary_reflects_current_popup_state(qtbot):
+    parent = _QCTestParent(with_masks=True)
+    dialog = _build_qc_dialog(qtbot, parent)
+
+    summary = dialog.settings_summary_label.text()
+    assert "All Acquisitions" in summary
+    assert "Cell-level" in summary
+    assert "Positive pixels" in summary
+
+    dialog.cell_signal_method_combo.setCurrentIndex(dialog.cell_signal_method_combo.findData("upper_quantile"))
+    dialog.upper_quantile_spin.setValue(95.0)
+    dialog.denoise_source_combo.setCurrentText("Viewer")
+    qtbot.wait(50)
+
+    summary = dialog.settings_summary_label.text()
+    assert "Top 95.0% cells" in summary
+    assert "Denoising: Viewer" in summary
 
 
 def test_qc_cache_key_includes_cell_signal_settings(qtbot):
@@ -873,6 +896,28 @@ def test_advanced_cooccurrence_heatmap_compacts_dense_labels(qtbot):
 
     assert max(overflow.values()) <= 0.03
     assert not any('Cell annotations hidden for readability' in text.get_text() for text in ax.texts)
+
+
+def test_advanced_cooccurrence_heatmap_preserves_typed_distance_selection(qtbot):
+    dialog = _build_advanced_dialog(qtbot, n_clusters=4)
+    dialog.sq_cooccur_plot_type_combo.setCurrentText("Heatmap")
+    assert isinstance(dialog.sq_cooccur_distance_spin, QtWidgets.QDoubleSpinBox)
+    dialog.sq_cooccur_interval = [10.0, 20.0, 30.0]
+    dialog.sq_cooccur_distance_spin.setValue(20.0)
+
+    categories = [1, 2, 3, 4]
+    occ = _build_cooccurrence_array(4, 3)
+    adata = _TempAnnData(
+        {'co_occurrence': {'occ': occ, 'interval': [0.0, 10.0, 20.0, 30.0]}},
+        categories,
+    )
+
+    dialog._plot_sq_cooccurrence(adata)
+    ax = dialog.sq_cooccur_canvas.figure.axes[0]
+
+    assert ax.get_title() == 'Co-occurrence Analysis at 20 µm'
+    assert dialog.sq_cooccur_distance_spin.value() == pytest.approx(20.0)
+    assert dialog.sq_cooccur_heatmap_distance == pytest.approx(20.0)
 
 
 def test_advanced_cooccurrence_export_dataframe_is_long_form(qtbot):

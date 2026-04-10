@@ -17,267 +17,234 @@
 # You should have received a copy of the GNU General Public License
 # along with this program.  If not, see <https://www.gnu.org/licenses/>.
 
-from typing import List, Optional
+from contextlib import contextmanager
+from typing import Dict, List, Optional, Tuple
 
 import numpy as np
 from PyQt5 import QtWidgets
 from PyQt5.QtCore import Qt
 
-# Configure matplotlib backend
 import matplotlib
-matplotlib.use('Qt5Agg')
+
+matplotlib.use("Qt5Agg")
 import matplotlib.pyplot as plt
 
-# Data types
 from openimc.data.mcd_loader import AcquisitionInfo, MCDLoader  # noqa: F401
-from openimc.ui.utils import combine_channels, arcsinh_normalize
 from openimc.ui.mpl_canvas import MplCanvas
-
-# Optional GPU runtime
-try:
-    import torch  # type: ignore
-    _HAVE_TORCH = True
-except Exception:
-    _HAVE_TORCH = False
+from openimc.ui.utils import arcsinh_normalize
 
 
 class DynamicComparisonDialog(QtWidgets.QDialog):
     def __init__(self, acqs: List[AcquisitionInfo], loader: MCDLoader, parent=None):
         super().__init__(parent)
         self.setWindowTitle("Dynamic Comparison Mode")
-        
-        # Set dialog size to 80% of screen size
+
         screen = QtWidgets.QApplication.desktop().screenGeometry()
         self.resize(int(screen.width() * 0.8), int(screen.height() * 0.8))
-        
+
         self.acqs = acqs
-        self.loader = loader  # Keep for backward compatibility (single file case)
-        self.parent_window = parent  # Store parent window to access loader methods for multiple files
-        self.selected_acquisitions = []
-        self.current_channel = None
-        
-        # Cache for loaded images to avoid reloading
-        self.image_cache = {}  # {(acquisition_id, channel): image}
-        self.max_cache_size = 50  # Limit overall items in cache
-        # Prefetch control (selected acquisitions up to 5)
+        self.loader = loader
+        self.parent_window = parent
+        self.selected_acquisitions: List[str] = []
+
+        # Cache full ROI stacks so RGB rendering can slice channels without re-reading.
+        self.image_stack_cache: Dict[str, np.ndarray] = {}
         self._prefetch_limit = 5
-        self._prefetch_inflight = set()
-        
-        # Store last selected channel for auto-selection
+        self._range_cache: Dict[Tuple[str, Optional[str], bool, float, Tuple[str, ...]], Tuple[float, float]] = {}
+
         self.last_selected_channel: Optional[str] = None
-        
-        # Store previous scaling channel to save values when switching
         self.previous_scaling_channel: Optional[str] = None
-        
-        # Store per-image scaling values for individual scaling
-        self.image_scaling = {}  # legacy per-image scaling for single channel
-        # Per-channel scaling storages
-        self.channel_linked_scaling = {}  # {channel: {'min': v, 'max': v}}
-        self.channel_per_image_scaling = {}  # {channel: {acq_id: {'min': v, 'max': v}}}
-        
-        # Per-image arcsinh state storage
-        self.image_arcsinh_state = {}  # {acq_id: {'enabled': bool, 'cofactor': float}}
-        
+        self._loaded_scaling_image_id: Optional[str] = None
+
+        self.channel_linked_scaling: Dict[str, Dict[str, float]] = {}
+        self.channel_per_image_scaling: Dict[str, Dict[str, Dict[str, float]]] = {}
+        self.image_arcsinh_state: Dict[str, Dict[str, object]] = {}
+
+        self.channel_color_assignments: Dict[str, str] = {}
+        self.channel_enabled_state: Dict[str, bool] = {}
+        self.available_colors_rgb = ["Red", "Green", "Blue"]
+
+        self._display_update_depth = 0
+        self._pending_display_update = False
+        self._canvas_slots: List[Dict[str, object]] = []
+
         self.setMinimumSize(1000, 700)
-        
-        # Create UI
         self._create_ui()
-        
-        # Start with empty selection - user must select acquisitions of interest
 
     def _get_loader_for_acquisition(self, acq_id: str):
-        """Get the appropriate loader for a given acquisition ID (handles multiple .mcd files)."""
-        if self.parent_window and hasattr(self.parent_window, '_get_loader_for_acquisition'):
+        """Get the appropriate loader for a given acquisition ID."""
+        if self.parent_window and hasattr(self.parent_window, "_get_loader_for_acquisition"):
             loader = self.parent_window._get_loader_for_acquisition(acq_id)
             if loader is not None:
                 return loader
-        # Fallback to single loader (for single file case)
         return self.loader
-    
+
     def _get_original_acq_id(self, acq_id: str) -> str:
-        """Get the original acquisition ID from a unique ID (for multi-file support)."""
-        if self.parent_window and hasattr(self.parent_window, '_get_original_acq_id'):
+        """Get the original acquisition ID from a unique ID."""
+        if self.parent_window and hasattr(self.parent_window, "_get_original_acq_id"):
             return self.parent_window._get_original_acq_id(acq_id)
-        # Fallback: return as-is (for single file case)
         return acq_id
+
+    @contextmanager
+    def _batch_display_updates(self):
+        self._display_update_depth += 1
+        try:
+            yield
+        finally:
+            self._display_update_depth = max(0, self._display_update_depth - 1)
+            if self._display_update_depth == 0 and self._pending_display_update:
+                self._pending_display_update = False
+                self._update_display()
+
+    def _request_display_update(self):
+        if self._display_update_depth > 0:
+            self._pending_display_update = True
+            return
+        self._update_display()
 
     def _create_ui(self):
         layout = QtWidgets.QVBoxLayout(self)
-        
-        # Use splitter to prioritize image view area
+
         splitter = QtWidgets.QSplitter(Qt.Horizontal)
         layout.addWidget(splitter)
-        # Control panel (left)
+
+        self.control_scroll = QtWidgets.QScrollArea()
+        self.control_scroll.setWidgetResizable(True)
+        self.control_scroll.setMinimumWidth(360)
+        self.control_scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarAsNeeded)
+        self.control_scroll.setVerticalScrollBarPolicy(Qt.ScrollBarAsNeeded)
+
         control_panel = QtWidgets.QWidget()
+        control_panel.setMinimumWidth(360)
         control_layout = QtWidgets.QVBoxLayout(control_panel)
-        
-        # Acquisition selection
+        self.control_scroll.setWidget(control_panel)
+        splitter.addWidget(self.control_scroll)
+
         acq_group = QtWidgets.QGroupBox("Acquisitions")
         acq_layout = QtWidgets.QVBoxLayout(acq_group)
-        
+
         acq_layout.addWidget(QtWidgets.QLabel("Available:"))
-        # Search box for acquisitions
         self.acq_search = QtWidgets.QLineEdit()
         self.acq_search.setPlaceholderText("Search acquisitions...")
         self.acq_search.textChanged.connect(self._filter_acquisitions)
         acq_layout.addWidget(self.acq_search)
+
         self.available_acq_list = QtWidgets.QListWidget()
         self.available_acq_list.setMaximumHeight(120)
         for ai in self.acqs:
-            # Use same format as main window: well [file_name] or name [file_name]
             import os
-            file_name = os.path.basename(ai.source_file) if hasattr(ai, 'source_file') and ai.source_file else "Unknown"
+
+            file_name = os.path.basename(ai.source_file) if getattr(ai, "source_file", None) else "Unknown"
             label = ai.well if ai.well else ai.name
-            label += f" [{file_name}]"
-            item = QtWidgets.QListWidgetItem(label)
+            item = QtWidgets.QListWidgetItem(f"{label} [{file_name}]")
             item.setData(Qt.UserRole, ai.id)
             self.available_acq_list.addItem(item)
-        
+        acq_layout.addWidget(self.available_acq_list)
+
         acq_buttons = QtWidgets.QHBoxLayout()
         self.add_acq_btn = QtWidgets.QPushButton("Add →")
         acq_buttons.addWidget(self.add_acq_btn)
-        
-        acq_layout.addWidget(self.available_acq_list)
         acq_layout.addLayout(acq_buttons)
-        
+
         acq_layout.addWidget(QtWidgets.QLabel("Selected:"))
         self.acq_list = QtWidgets.QListWidget()
         self.acq_list.setMaximumHeight(120)
-        
         acq_layout.addWidget(self.acq_list)
-        # Place the Remove button below the Selected list
+
         self.remove_acq_btn = QtWidgets.QPushButton("← Remove")
         acq_layout.addWidget(self.remove_acq_btn)
         control_layout.addWidget(acq_group)
-        
-        # Channel selection
+
         channel_group = QtWidgets.QGroupBox("Channel")
         channel_layout = QtWidgets.QVBoxLayout(channel_group)
-        
-        # Single-channel selector
+
         self.channel_combo = QtWidgets.QComboBox()
         channel_layout.addWidget(QtWidgets.QLabel("Marker channel:"))
         channel_layout.addWidget(self.channel_combo)
-        
-        # RGB mode and assignments (mimic main window)
+
         self.rgb_mode_chk = QtWidgets.QCheckBox("RGB Mode")
         self.rgb_mode_chk.toggled.connect(self._on_rgb_mode_toggled)
         channel_layout.addWidget(self.rgb_mode_chk)
-        
+
         self.rgb_frame = QtWidgets.QFrame()
         self.rgb_frame.setFrameStyle(QtWidgets.QFrame.Box)
         rgb_layout = QtWidgets.QVBoxLayout(self.rgb_frame)
-        # Red block
-        red_block = QtWidgets.QVBoxLayout()
-        red_block.addWidget(QtWidgets.QLabel("Red:"))
-        self.red_search = QtWidgets.QLineEdit()
-        self.red_search.setPlaceholderText("Search red channels...")
-        self.red_search.textChanged.connect(self._filter_red)
-        red_block.addWidget(self.red_search)
-        self.red_list = QtWidgets.QListWidget()
-        self.red_list.setMaximumHeight(140)
-        self.red_list.itemChanged.connect(lambda _i: (self._refresh_scaling_channel_options(), self._update_display()))
-        red_block.addWidget(self.red_list)
-        rgb_layout.addLayout(red_block)
-        # Green block
-        green_block = QtWidgets.QVBoxLayout()
-        green_block.addWidget(QtWidgets.QLabel("Green:"))
-        self.green_search = QtWidgets.QLineEdit()
-        self.green_search.setPlaceholderText("Search green channels...")
-        self.green_search.textChanged.connect(self._filter_green)
-        green_block.addWidget(self.green_search)
-        self.green_list = QtWidgets.QListWidget()
-        self.green_list.setMaximumHeight(140)
-        self.green_list.itemChanged.connect(lambda _i: (self._refresh_scaling_channel_options(), self._update_display()))
-        green_block.addWidget(self.green_list)
-        rgb_layout.addLayout(green_block)
-        # Blue block
-        blue_block = QtWidgets.QVBoxLayout()
-        blue_block.addWidget(QtWidgets.QLabel("Blue:"))
-        self.blue_search = QtWidgets.QLineEdit()
-        self.blue_search.setPlaceholderText("Search blue channels...")
-        self.blue_search.textChanged.connect(self._filter_blue)
-        blue_block.addWidget(self.blue_search)
-        self.blue_list = QtWidgets.QListWidget()
-        self.blue_list.setMaximumHeight(140)
-        self.blue_list.itemChanged.connect(lambda _i: (self._refresh_scaling_channel_options(), self._update_display()))
-        blue_block.addWidget(self.blue_list)
-        rgb_layout.addLayout(blue_block)
+
+        self.channel_color_search = QtWidgets.QLineEdit()
+        self.channel_color_search.setPlaceholderText("Search RGB channels...")
+        self.channel_color_search.textChanged.connect(self._filter_rgb_channels)
+        rgb_layout.addWidget(self.channel_color_search)
+
+        self.channel_color_table = QtWidgets.QTableWidget()
+        self.channel_color_table.setColumnCount(2)
+        self.channel_color_table.setHorizontalHeaderLabels(["Channel", "Color"])
+        self.channel_color_table.horizontalHeader().setStretchLastSection(True)
+        self.channel_color_table.verticalHeader().setVisible(False)
+        self.channel_color_table.setSelectionBehavior(QtWidgets.QAbstractItemView.SelectRows)
+        self.channel_color_table.setEditTriggers(QtWidgets.QAbstractItemView.NoEditTriggers)
+        self.channel_color_table.setMinimumHeight(170)
+        self.channel_color_table.setMaximumHeight(320)
+        self.channel_color_table.itemChanged.connect(self._on_rgb_channel_item_changed)
+        rgb_layout.addWidget(self.channel_color_table)
+
         self.rgb_frame.setVisible(False)
         channel_layout.addWidget(self.rgb_frame)
-        
-        # Display options
+        control_layout.addWidget(channel_group)
+
         options_group = QtWidgets.QGroupBox("Display Options")
         options_layout = QtWidgets.QVBoxLayout(options_group)
-        
+
         self.link_chk = QtWidgets.QCheckBox("Linked scaling (shared min/max)")
         self.link_chk.setChecked(True)
         self.grayscale_chk = QtWidgets.QCheckBox("Grayscale mode")
-        
+        self.custom_scaling_chk = QtWidgets.QCheckBox("Custom scaling")
+        self.overlay_chk = QtWidgets.QCheckBox("Show segmentation overlay (when available)")
+
         options_layout.addWidget(self.link_chk)
         options_layout.addWidget(self.grayscale_chk)
-        
-        # Custom scaling controls for comparison mode
-        self.custom_scaling_chk = QtWidgets.QCheckBox("Custom scaling")
-        self.custom_scaling_chk.toggled.connect(self._on_comparison_scaling_toggled)
         options_layout.addWidget(self.custom_scaling_chk)
-
-        # Optional segmentation overlay (if masks exist in parent)
-        self.overlay_chk = QtWidgets.QCheckBox("Show segmentation overlay (when available)")
-        self.overlay_chk.toggled.connect(self._update_display)
         options_layout.addWidget(self.overlay_chk)
-        
+
         self.scaling_frame = QtWidgets.QFrame()
         self.scaling_frame.setFrameStyle(QtWidgets.QFrame.Box)
         scaling_layout = QtWidgets.QVBoxLayout(self.scaling_frame)
         scaling_layout.addWidget(QtWidgets.QLabel("Custom Intensity Range:"))
-        # Channel selector for per-channel scaling
+
         self.scaling_channel_row = QtWidgets.QWidget()
         scaling_channel_layout = QtWidgets.QHBoxLayout(self.scaling_channel_row)
         scaling_channel_layout.setContentsMargins(0, 0, 0, 0)
         scaling_channel_layout.addWidget(QtWidgets.QLabel("Channel:"))
         self.scaling_channel_combo = QtWidgets.QComboBox()
-        self.scaling_channel_combo.currentTextChanged.connect(self._on_scaling_channel_changed)
         scaling_channel_layout.addWidget(self.scaling_channel_combo)
         scaling_channel_layout.addStretch()
         scaling_layout.addWidget(self.scaling_channel_row)
-        
-        # Image selection for individual scaling (shown only when link is OFF)
+
         self.image_selection_row = QtWidgets.QWidget()
         image_selection_layout = QtWidgets.QHBoxLayout(self.image_selection_row)
         image_selection_layout.setContentsMargins(0, 0, 0, 0)
         image_selection_layout.addWidget(QtWidgets.QLabel("Image:"))
         self.image_combo = QtWidgets.QComboBox()
-        self.image_combo.currentTextChanged.connect(self._on_image_selection_changed)
-        self.image_combo.currentIndexChanged.connect(self._on_image_selection_changed)
         image_selection_layout.addWidget(self.image_combo)
         image_selection_layout.addStretch()
         scaling_layout.addWidget(self.image_selection_row)
-        
-        # Min/Max controls (auto-apply on change)
+
         minmax_layout = QtWidgets.QHBoxLayout()
         minmax_layout.addWidget(QtWidgets.QLabel("Min:"))
         self.min_spinbox = QtWidgets.QDoubleSpinBox()
         self.min_spinbox.setRange(-999999, 999999)
         self.min_spinbox.setDecimals(3)
         self.min_spinbox.setValue(0.0)
-        self.min_spinbox.valueChanged.connect(lambda _v: self._apply_comparison_scaling())
         minmax_layout.addWidget(self.min_spinbox)
-        
         minmax_layout.addWidget(QtWidgets.QLabel("Max:"))
         self.max_spinbox = QtWidgets.QDoubleSpinBox()
         self.max_spinbox.setRange(-999999, 999999)
         self.max_spinbox.setDecimals(3)
         self.max_spinbox.setValue(100.0)
-        self.max_spinbox.valueChanged.connect(lambda _v: self._apply_comparison_scaling())
         minmax_layout.addWidget(self.max_spinbox)
-        
         scaling_layout.addLayout(minmax_layout)
-        
-        # Normalization controls
+
         norm_layout = QtWidgets.QHBoxLayout()
         self.arcsinh_chk = QtWidgets.QCheckBox("Arcsinh")
-        self.arcsinh_chk.toggled.connect(self._on_arcsinh_toggled)
         norm_layout.addWidget(self.arcsinh_chk)
         norm_layout.addWidget(QtWidgets.QLabel("cofactor:"))
         self.arcsinh_cofactor = QtWidgets.QDoubleSpinBox()
@@ -285,61 +252,98 @@ class DynamicComparisonDialog(QtWidgets.QDialog):
         self.arcsinh_cofactor.setDecimals(2)
         self.arcsinh_cofactor.setSingleStep(0.25)
         self.arcsinh_cofactor.setValue(1.0)
-        self.arcsinh_cofactor.valueChanged.connect(self._on_arcsinh_cofactor_changed)
         norm_layout.addWidget(self.arcsinh_cofactor)
         norm_layout.addStretch()
         scaling_layout.addLayout(norm_layout)
 
-        # Range helper buttons
         button_layout = QtWidgets.QHBoxLayout()
         self.default_range_btn = QtWidgets.QPushButton("Original Range")
-        self.default_range_btn.clicked.connect(self._comparison_default_range)
         button_layout.addWidget(self.default_range_btn)
         button_layout.addStretch()
         scaling_layout.addLayout(button_layout)
+
         self.scaling_frame.setVisible(False)
-        
         options_layout.addWidget(self.scaling_frame)
-
-        control_layout.addWidget(channel_group)
         control_layout.addWidget(options_group)
-        control_panel.setMaximumWidth(380)
-        splitter.addWidget(control_panel)
+        control_layout.addStretch(1)
 
-        # Image display area (right)
         self.image_scroll = QtWidgets.QScrollArea()
         self.image_widget = QtWidgets.QWidget()
         self.image_layout = QtWidgets.QGridLayout(self.image_widget)
+        self.image_layout.setContentsMargins(8, 8, 8, 8)
+        self.image_layout.setSpacing(8)
         self.image_scroll.setWidget(self.image_widget)
         self.image_scroll.setWidgetResizable(True)
         splitter.addWidget(self.image_scroll)
         splitter.setStretchFactor(0, 0)
         splitter.setStretchFactor(1, 1)
-        
-        # Connect signals
+        splitter.setSizes([420, max(700, self.width() - 420)])
+
         self.add_acq_btn.clicked.connect(self._add_acquisition)
         self.remove_acq_btn.clicked.connect(self._remove_acquisition)
-        self.channel_combo.currentTextChanged.connect(self._update_display)
+        self.channel_combo.currentTextChanged.connect(self._on_single_channel_changed)
         self.link_chk.toggled.connect(self._on_link_contrast_toggled)
-        self.grayscale_chk.toggled.connect(self._update_display)
-        self.acq_list.itemSelectionChanged.connect(self._update_display)
-        
-        # Initialize channel combo when acquisitions are added
-        self._update_channel_combo()
-        # Initial prefetch (no-op until user selects acquisitions)
-        self._start_prefetch_selected()
+        self.grayscale_chk.toggled.connect(lambda _checked: self._request_display_update())
+        self.custom_scaling_chk.toggled.connect(self._on_comparison_scaling_toggled)
+        self.overlay_chk.toggled.connect(lambda _checked: self._request_display_update())
+        self.scaling_channel_combo.currentTextChanged.connect(self._on_scaling_channel_changed)
+        self.image_combo.currentIndexChanged.connect(self._on_image_selection_changed)
+        self.min_spinbox.valueChanged.connect(lambda _value: self._apply_comparison_scaling())
+        self.max_spinbox.valueChanged.connect(lambda _value: self._apply_comparison_scaling())
+        self.arcsinh_chk.toggled.connect(self._on_arcsinh_toggled)
+        self.arcsinh_cofactor.valueChanged.connect(self._on_arcsinh_cofactor_changed)
+        self.default_range_btn.clicked.connect(self._comparison_default_range)
+
+        self._sync_channel_controls()
+        self._update_scaling_widget_states()
 
     def closeEvent(self, event):
-        """Handle dialog close event with proper cleanup."""
         self._clear_display()
         super().closeEvent(event)
 
+    def resizeEvent(self, event):
+        super().resizeEvent(event)
+        self._update_canvas_geometry()
+
     def __del__(self):
-        """Destructor to ensure cleanup."""
         try:
             self._clear_display()
         except Exception:
             pass
+
+    def _get_acquisition_info(self, acq_id: str) -> Optional[AcquisitionInfo]:
+        return next((ai for ai in self.acqs if ai.id == acq_id), None)
+
+    def _get_available_channels(self) -> List[str]:
+        if not self.selected_acquisitions:
+            return []
+
+        acquisition_channels = []
+        for acq_id in self.selected_acquisitions:
+            acq_info = self._get_acquisition_info(acq_id)
+            if acq_info is None:
+                continue
+            acquisition_channels.append(list(acq_info.channels))
+
+        if not acquisition_channels:
+            return []
+
+        common_channels = set(acquisition_channels[0])
+        for channels in acquisition_channels[1:]:
+            common_channels &= set(channels)
+
+        return [channel for channel in acquisition_channels[0] if channel in common_channels]
+
+    def _get_acquisition_subtitle(self, acq_id: str) -> str:
+        acq_info = self._get_acquisition_info(acq_id)
+        if not acq_info:
+            return "Unknown"
+
+        import os
+
+        file_name = os.path.basename(acq_info.source_file) if getattr(acq_info, "source_file", None) else "Unknown"
+        label = acq_info.well if acq_info.well else acq_info.name
+        return f"{label} [{file_name}]"
 
     def _filter_acquisitions(self):
         text = self.acq_search.text().lower()
@@ -347,1251 +351,901 @@ class DynamicComparisonDialog(QtWidgets.QDialog):
             item = self.available_acq_list.item(i)
             item.setHidden(text not in item.text().lower())
 
+    def _filter_rgb_channels(self):
+        text = self.channel_color_search.text().lower()
+        for row in range(self.channel_color_table.rowCount()):
+            item = self.channel_color_table.item(row, 0)
+            if item is not None:
+                self.channel_color_table.setRowHidden(row, text not in item.text().lower())
+
+    def _populate_channel_combo(self, channels: List[str], preferred_channel: Optional[str]):
+        self.channel_combo.blockSignals(True)
+        self.channel_combo.clear()
+        self.channel_combo.addItems(channels)
+
+        final_channel: Optional[str] = None
+        if preferred_channel and preferred_channel in channels:
+            final_channel = preferred_channel
+        elif channels:
+            final_channel = channels[0]
+
+        if final_channel:
+            self.channel_combo.setCurrentIndex(channels.index(final_channel))
+            self.last_selected_channel = final_channel
+        else:
+            self.last_selected_channel = None
+        self.channel_combo.blockSignals(False)
+
+    def _populate_rgb_table(self, channels: List[str]):
+        prev_assignments = self.channel_color_assignments.copy()
+        prev_enabled = self.channel_enabled_state.copy()
+
+        self.channel_color_table.blockSignals(True)
+        self.channel_color_table.setRowCount(0)
+        self.channel_color_assignments = {}
+        self.channel_enabled_state = {}
+
+        for row, channel in enumerate(channels):
+            self.channel_color_table.insertRow(row)
+
+            channel_item = QtWidgets.QTableWidgetItem(channel)
+            channel_item.setFlags(
+                (channel_item.flags() | Qt.ItemIsUserCheckable | Qt.ItemIsEnabled | Qt.ItemIsSelectable)
+                & ~Qt.ItemIsEditable
+            )
+            channel_item.setCheckState(Qt.Checked if prev_enabled.get(channel, False) else Qt.Unchecked)
+            self.channel_color_table.setItem(row, 0, channel_item)
+
+            color_combo = QtWidgets.QComboBox()
+            color_combo.addItems(self.available_colors_rgb)
+            initial_color = prev_assignments.get(channel, self.available_colors_rgb[row % len(self.available_colors_rgb)])
+            if initial_color not in self.available_colors_rgb:
+                initial_color = self.available_colors_rgb[0]
+            color_combo.blockSignals(True)
+            color_combo.setCurrentText(initial_color)
+            color_combo.blockSignals(False)
+            color_combo.currentTextChanged.connect(
+                lambda text, channel_name=channel: self._on_rgb_color_changed(channel_name, text)
+            )
+            self.channel_color_table.setCellWidget(row, 1, color_combo)
+
+            self.channel_enabled_state[channel] = channel_item.checkState() == Qt.Checked
+            self.channel_color_assignments[channel] = initial_color
+
+        self.channel_color_table.blockSignals(False)
+
+    def _sync_channel_controls(self):
+        channels = self._get_available_channels()
+        preferred_channel = self.last_selected_channel or self.channel_combo.currentText()
+        preferred_scaling_channel = self.scaling_channel_combo.currentText() or self.previous_scaling_channel
+        preferred_image = self.image_combo.currentData()
+
+        with self._batch_display_updates():
+            self._populate_channel_combo(channels, preferred_channel)
+            self._populate_rgb_table(channels)
+            self._refresh_scaling_channel_options(preferred_scaling_channel)
+            self._update_image_combo(preferred_image)
+            self._load_scaling_controls()
+
+        self._request_display_update()
+
+    def _on_single_channel_changed(self, channel: str):
+        if channel:
+            self.last_selected_channel = channel
+        with self._batch_display_updates():
+            self._refresh_scaling_channel_options(self.scaling_channel_combo.currentText())
+            self._update_image_combo(self.image_combo.currentData())
+            self._load_scaling_controls()
+        self._request_display_update()
+
     def _on_rgb_mode_toggled(self):
-        # Toggle visibility of RGB assignments vs single-channel combo
         is_rgb = self.rgb_mode_chk.isChecked()
         self.rgb_frame.setVisible(is_rgb)
         self.channel_combo.setEnabled(not is_rgb)
-        # Populate RGB lists based on first selected acquisition's channels
-        self._populate_rgb_lists()
-        self._update_display()
 
-    def _populate_rgb_lists(self):
-        # Populate with channels from first selected acquisition
-        self.red_list.blockSignals(True)
-        self.green_list.blockSignals(True)
-        self.blue_list.blockSignals(True)
-        self.red_list.clear()
-        self.green_list.clear()
-        self.blue_list.clear()
-        if not self.selected_acquisitions:
-            self.red_list.blockSignals(False)
-            self.green_list.blockSignals(False)
-            self.blue_list.blockSignals(False)
+        with self._batch_display_updates():
+            self._refresh_scaling_channel_options(self.scaling_channel_combo.currentText())
+            self._update_image_combo(self.image_combo.currentData())
+            self._load_scaling_controls()
+
+        self._request_display_update()
+
+    def _on_rgb_channel_item_changed(self, item: QtWidgets.QTableWidgetItem):
+        if item.column() != 0:
             return
-        acq_id = self.selected_acquisitions[0]
-        ai = next((a for a in self.acqs if a.id == acq_id), None)
-        channels = ai.channels if ai else []
-        for ch in channels:
-            for lst in (self.red_list, self.green_list, self.blue_list):
-                it = QtWidgets.QListWidgetItem(ch)
-                it.setFlags(it.flags() | Qt.ItemIsUserCheckable | Qt.ItemIsEnabled)
-                it.setCheckState(Qt.Unchecked)
-                lst.addItem(it)
-        self.red_list.blockSignals(False)
-        self.green_list.blockSignals(False)
-        self.blue_list.blockSignals(False)
 
-    def _filter_red(self):
-        text = self.red_search.text().lower()
-        for i in range(self.red_list.count()):
-            item = self.red_list.item(i)
-            item.setHidden(text not in item.text().lower())
+        channel = item.text()
+        self.channel_enabled_state[channel] = item.checkState() == Qt.Checked
 
-    def _filter_green(self):
-        text = self.green_search.text().lower()
-        for i in range(self.green_list.count()):
-            item = self.green_list.item(i)
-            item.setHidden(text not in item.text().lower())
+        with self._batch_display_updates():
+            self._refresh_scaling_channel_options(self.scaling_channel_combo.currentText())
+            self._load_scaling_controls()
 
-    def _filter_blue(self):
-        text = self.blue_search.text().lower()
-        for i in range(self.blue_list.count()):
-            item = self.blue_list.item(i)
-            item.setHidden(text not in item.text().lower())
+        self._request_display_update()
+
+    def _on_rgb_color_changed(self, channel_name: str, color_name: str):
+        self.channel_color_assignments[channel_name] = color_name
+        self._request_display_update()
+
+    def _checked_rgb_channels(self) -> List[str]:
+        channels: List[str] = []
+        for row in range(self.channel_color_table.rowCount()):
+            item = self.channel_color_table.item(row, 0)
+            if item is not None and item.checkState() == Qt.Checked:
+                channels.append(item.text())
+        return channels
+
+    def _checked_rgb_channels_by_color(self) -> Dict[str, List[str]]:
+        by_color = {color: [] for color in self.available_colors_rgb}
+        for row in range(self.channel_color_table.rowCount()):
+            item = self.channel_color_table.item(row, 0)
+            combo = self.channel_color_table.cellWidget(row, 1)
+            if item is None or combo is None or item.checkState() != Qt.Checked:
+                continue
+            color = combo.currentText()
+            if color in by_color:
+                by_color[color].append(item.text())
+        return by_color
+
+    def _current_scaling_channels(self) -> List[str]:
+        if self.rgb_mode_chk.isChecked():
+            return self._checked_rgb_channels()
+        channel = self.channel_combo.currentText()
+        return [channel] if channel else []
+
+    def _refresh_scaling_channel_options(self, preferred_channel: Optional[str] = None):
+        channels = self._current_scaling_channels()
+        seen = set()
+        ordered_channels = []
+        for channel in channels:
+            if channel not in seen:
+                ordered_channels.append(channel)
+                seen.add(channel)
+
+        current_channel = preferred_channel or self.scaling_channel_combo.currentText() or self.previous_scaling_channel
+        self.scaling_channel_combo.blockSignals(True)
+        self.scaling_channel_combo.clear()
+        self.scaling_channel_combo.addItems(ordered_channels)
+
+        final_channel: Optional[str] = None
+        if current_channel and current_channel in ordered_channels:
+            final_channel = current_channel
+        elif ordered_channels:
+            final_channel = ordered_channels[0]
+
+        if final_channel:
+            self.scaling_channel_combo.setCurrentIndex(ordered_channels.index(final_channel))
+            self.previous_scaling_channel = final_channel
+        else:
+            self.previous_scaling_channel = None
+        self.scaling_channel_combo.blockSignals(False)
+
+    def _update_image_combo(self, preferred_image: Optional[str] = None):
+        self.image_combo.blockSignals(True)
+        self.image_combo.clear()
+
+        for acq_id in self.selected_acquisitions:
+            self.image_combo.addItem(self._get_acquisition_subtitle(acq_id), acq_id)
+
+        final_image: Optional[str] = None
+        if preferred_image and preferred_image in self.selected_acquisitions:
+            final_image = preferred_image
+        elif self.selected_acquisitions:
+            final_image = self.selected_acquisitions[0]
+
+        if final_image:
+            self.image_combo.setCurrentIndex(self.selected_acquisitions.index(final_image))
+        self.image_combo.blockSignals(False)
+
+    def _update_scaling_widget_states(self):
+        custom_scaling = self.custom_scaling_chk.isChecked()
+        linked = self.link_chk.isChecked()
+        arcsinh_enabled = custom_scaling and not linked
+        spinboxes_enabled = custom_scaling and (linked or not self.arcsinh_chk.isChecked())
+
+        self.scaling_frame.setVisible(custom_scaling)
+        self.scaling_channel_row.setVisible(custom_scaling)
+        self.image_selection_row.setVisible(custom_scaling and not linked)
+        self.image_combo.setEnabled(custom_scaling and not linked)
+        self.default_range_btn.setEnabled(custom_scaling)
+        self.min_spinbox.setEnabled(spinboxes_enabled)
+        self.max_spinbox.setEnabled(spinboxes_enabled)
+        self.arcsinh_chk.setEnabled(arcsinh_enabled)
+        self.arcsinh_cofactor.setEnabled(arcsinh_enabled and self.arcsinh_chk.isChecked())
+
+    def _clear_range_cache(self):
+        self._range_cache.clear()
+
+    def _clear_cache(self):
+        self.image_stack_cache.clear()
+        self._clear_range_cache()
+
+    def _prune_stack_cache(self):
+        allowed = set(self.selected_acquisitions)
+        for acq_id in list(self.image_stack_cache.keys()):
+            if acq_id not in allowed:
+                del self.image_stack_cache[acq_id]
+        self._clear_range_cache()
+
+    def _get_cached_stack(self, acq_id: str) -> np.ndarray:
+        if acq_id in self.image_stack_cache:
+            return self.image_stack_cache[acq_id]
+
+        loader = self._get_loader_for_acquisition(acq_id)
+        original_acq_id = self._get_original_acq_id(acq_id)
+        if loader is None:
+            raise RuntimeError(f"No loader available for acquisition {acq_id}.")
+
+        stack = loader.get_all_channels(original_acq_id)
+        if stack.ndim == 2:
+            stack = stack[..., np.newaxis]
+        self.image_stack_cache[acq_id] = stack
+        return stack
+
+    def _get_channel_image(self, acq_id: str, channel: str) -> np.ndarray:
+        stack = self._get_cached_stack(acq_id)
+        acq_info = self._get_acquisition_info(acq_id)
+        if acq_info is None or channel not in acq_info.channels:
+            raise ValueError(f"Channel '{channel}' not found in acquisition {acq_id}.")
+        channel_index = acq_info.channels.index(channel)
+        return stack[..., channel_index]
+
+    def _start_prefetch_selected(self):
+        self._prune_stack_cache()
+        for acq_id in self.selected_acquisitions[: self._prefetch_limit]:
+            try:
+                self._get_cached_stack(acq_id)
+            except Exception as exc:
+                print(f"Prefetch error for {acq_id}: {exc}")
+
+    def _store_current_scaling_state(self):
+        if not self.custom_scaling_chk.isChecked():
+            return
+
+        channel = self.previous_scaling_channel or self.scaling_channel_combo.currentText()
+        if not channel:
+            return
+
+        current_min = self.min_spinbox.value()
+        current_max = self.max_spinbox.value()
+
+        if self.link_chk.isChecked():
+            self.channel_linked_scaling[channel] = {"min": current_min, "max": current_max}
+            return
+
+        target_acq_id = self._loaded_scaling_image_id or self.image_combo.currentData()
+        if not target_acq_id:
+            return
+
+        per_image = self.channel_per_image_scaling.setdefault(channel, {})
+        per_image[target_acq_id] = {"min": current_min, "max": current_max}
+
+    def _get_current_scaling_channel(self) -> Optional[str]:
+        channel = self.scaling_channel_combo.currentText()
+        if channel:
+            return channel
+        channel = self.channel_combo.currentText()
+        return channel or None
+
+    def _get_current_arcsinh_state(self, acq_id: str) -> Tuple[bool, float]:
+        state = self.image_arcsinh_state.get(acq_id, {})
+        enabled = bool(state.get("enabled", False))
+        cofactor = float(state.get("cofactor", self.arcsinh_cofactor.value()))
+        return enabled, cofactor
+
+    def _should_apply_arcsinh(self, acq_id: str, channel: str) -> Tuple[bool, float]:
+        if self.link_chk.isChecked():
+            return False, self.arcsinh_cofactor.value()
+
+        current_scaling_channel = self._get_current_scaling_channel()
+        if channel != current_scaling_channel:
+            return False, self.arcsinh_cofactor.value()
+
+        enabled, cofactor = self._get_current_arcsinh_state(acq_id)
+        return enabled, cofactor
+
+    def _get_transformed_channel_image(self, acq_id: str, channel: str) -> np.ndarray:
+        image = self._get_channel_image(acq_id, channel).astype(np.float32, copy=False)
+        should_apply, cofactor = self._should_apply_arcsinh(acq_id, channel)
+        if should_apply:
+            return arcsinh_normalize(image, cofactor)
+        return image
+
+    def _compute_default_range(self, channel: str, acq_id: Optional[str] = None) -> Tuple[float, float]:
+        if not channel:
+            return 0.0, 1.0
+
+        if acq_id is None:
+            should_apply = False
+            cofactor = 0.0
+            selection_key = tuple(self.selected_acquisitions)
+            cache_key = (channel, None, should_apply, cofactor, selection_key)
+            if cache_key in self._range_cache:
+                return self._range_cache[cache_key]
+
+            mins: List[float] = []
+            maxs: List[float] = []
+            for selected_acq in self.selected_acquisitions:
+                image = self._get_transformed_channel_image(selected_acq, channel)
+                mins.append(float(np.min(image)))
+                maxs.append(float(np.max(image)))
+            if not mins or not maxs:
+                return 0.0, 1.0
+            value = (min(mins), max(maxs))
+            self._range_cache[cache_key] = value
+            return value
+
+        should_apply, cofactor = self._should_apply_arcsinh(acq_id, channel)
+        cache_key = (channel, acq_id, should_apply, float(cofactor if should_apply else 0.0), ())
+        if cache_key in self._range_cache:
+            return self._range_cache[cache_key]
+
+        image = self._get_transformed_channel_image(acq_id, channel)
+        value = (float(np.min(image)), float(np.max(image)))
+        self._range_cache[cache_key] = value
+        return value
+
+    def _resolve_display_range(self, channel: str, acq_id: str) -> Tuple[float, float]:
+        if not self.custom_scaling_chk.isChecked():
+            if self.link_chk.isChecked():
+                return self._compute_default_range(channel, None)
+            return self._compute_default_range(channel, acq_id)
+
+        current_scaling_channel = self._get_current_scaling_channel()
+        if self.link_chk.isChecked():
+            if current_scaling_channel == channel:
+                return self.min_spinbox.value(), self.max_spinbox.value()
+
+            values = self.channel_linked_scaling.get(channel)
+            if values is None:
+                vmin, vmax = self._compute_default_range(channel, None)
+                self.channel_linked_scaling[channel] = {"min": vmin, "max": vmax}
+                return vmin, vmax
+            return float(values["min"]), float(values["max"])
+
+        if current_scaling_channel == channel and self.image_combo.currentData() == acq_id:
+            return self.min_spinbox.value(), self.max_spinbox.value()
+
+        per_image = self.channel_per_image_scaling.setdefault(channel, {})
+        if acq_id not in per_image:
+            vmin, vmax = self._compute_default_range(channel, acq_id)
+            per_image[acq_id] = {"min": vmin, "max": vmax}
+        values = per_image[acq_id]
+        return float(values["min"]), float(values["max"])
+
+    def _set_spinbox_values(self, minimum: float, maximum: float):
+        self.min_spinbox.blockSignals(True)
+        self.max_spinbox.blockSignals(True)
+        self.min_spinbox.setValue(float(minimum))
+        self.max_spinbox.setValue(float(maximum))
+        self.min_spinbox.blockSignals(False)
+        self.max_spinbox.blockSignals(False)
+
+    def _load_image_arcsinh_state(self):
+        current_acq_id = self.image_combo.currentData()
+        if not current_acq_id:
+            return
+
+        enabled, cofactor = self._get_current_arcsinh_state(current_acq_id)
+        self.arcsinh_chk.blockSignals(True)
+        self.arcsinh_cofactor.blockSignals(True)
+        self.arcsinh_chk.setChecked(enabled)
+        self.arcsinh_cofactor.setValue(cofactor)
+        self.arcsinh_chk.blockSignals(False)
+        self.arcsinh_cofactor.blockSignals(False)
+
+    def _load_scaling_controls(self):
+        self._update_scaling_widget_states()
+        if not self.custom_scaling_chk.isChecked():
+            return
+
+        channel = self._get_current_scaling_channel()
+        if not channel:
+            return
+
+        if self.link_chk.isChecked():
+            values = self.channel_linked_scaling.get(channel)
+            if values is None:
+                vmin, vmax = self._compute_default_range(channel, None)
+                self.channel_linked_scaling[channel] = {"min": vmin, "max": vmax}
+            else:
+                vmin = float(values["min"])
+                vmax = float(values["max"])
+            self._loaded_scaling_image_id = None
+            self._set_spinbox_values(vmin, vmax)
+            self.previous_scaling_channel = channel
+            self._update_scaling_widget_states()
+            return
+
+        current_acq_id = self.image_combo.currentData()
+        if not current_acq_id:
+            return
+
+        self._load_image_arcsinh_state()
+        should_apply, _cofactor = self._should_apply_arcsinh(current_acq_id, channel)
+        if should_apply:
+            vmin, vmax = self._compute_default_range(channel, current_acq_id)
+        else:
+            per_image = self.channel_per_image_scaling.setdefault(channel, {})
+            if current_acq_id not in per_image:
+                vmin, vmax = self._compute_default_range(channel, current_acq_id)
+                per_image[current_acq_id] = {"min": vmin, "max": vmax}
+            values = per_image[current_acq_id]
+            vmin = float(values["min"])
+            vmax = float(values["max"])
+
+        self._loaded_scaling_image_id = current_acq_id
+        self.previous_scaling_channel = channel
+        self._set_spinbox_values(vmin, vmax)
+        self._update_scaling_widget_states()
+
+    def _comparison_auto_range(self):
+        self._comparison_default_range()
+
+    def _comparison_auto_contrast(self):
+        if not self.custom_scaling_chk.isChecked():
+            return
+
+        channel = self._get_current_scaling_channel()
+        if not channel:
+            return
+
+        if self.link_chk.isChecked():
+            pixels = [self._get_transformed_channel_image(acq_id, channel).ravel() for acq_id in self.selected_acquisitions]
+            if not pixels:
+                return
+            all_pixels = np.concatenate(pixels)
+            vmin = float(np.percentile(all_pixels, 1))
+            vmax = float(np.percentile(all_pixels, 99))
+            self.channel_linked_scaling[channel] = {"min": vmin, "max": vmax}
+            self._set_spinbox_values(vmin, vmax)
+        else:
+            current_acq_id = self.image_combo.currentData()
+            if not current_acq_id:
+                return
+            image = self._get_transformed_channel_image(current_acq_id, channel)
+            vmin = float(np.percentile(image, 1))
+            vmax = float(np.percentile(image, 99))
+            self.channel_per_image_scaling.setdefault(channel, {})[current_acq_id] = {"min": vmin, "max": vmax}
+            self._set_spinbox_values(vmin, vmax)
+
+        self._request_display_update()
+
+    def _comparison_default_range(self):
+        if not self.custom_scaling_chk.isChecked():
+            return
+
+        channel = self._get_current_scaling_channel()
+        if not channel:
+            return
+
+        if self.link_chk.isChecked():
+            vmin, vmax = self._compute_default_range(channel, None)
+            self.channel_linked_scaling[channel] = {"min": vmin, "max": vmax}
+        else:
+            current_acq_id = self.image_combo.currentData()
+            if not current_acq_id:
+                return
+            vmin, vmax = self._compute_default_range(channel, current_acq_id)
+            self.channel_per_image_scaling.setdefault(channel, {})[current_acq_id] = {"min": vmin, "max": vmax}
+
+        self._set_spinbox_values(vmin, vmax)
+        self._request_display_update()
+
+    def _restore_default_range(self):
+        self._comparison_default_range()
+
+    def _on_comparison_scaling_toggled(self):
+        with self._batch_display_updates():
+            self._refresh_scaling_channel_options(self.scaling_channel_combo.currentText())
+            self._update_image_combo(self.image_combo.currentData())
+            self._load_scaling_controls()
+        self._request_display_update()
+
+    def _on_scaling_channel_changed(self):
+        if self.custom_scaling_chk.isChecked():
+            self._store_current_scaling_state()
+        self.previous_scaling_channel = self.scaling_channel_combo.currentText() or None
+        self._clear_range_cache()
+
+        with self._batch_display_updates():
+            self._load_scaling_controls()
+
+        self._request_display_update()
+
+    def _on_arcsinh_toggled(self):
+        current_acq_id = self.image_combo.currentData()
+        if current_acq_id:
+            self.image_arcsinh_state[current_acq_id] = {
+                "enabled": self.arcsinh_chk.isChecked(),
+                "cofactor": self.arcsinh_cofactor.value(),
+            }
+        self.channel_per_image_scaling.clear()
+        self._clear_range_cache()
+
+        with self._batch_display_updates():
+            self._load_scaling_controls()
+
+        self._request_display_update()
+
+    def _on_arcsinh_cofactor_changed(self):
+        current_acq_id = self.image_combo.currentData()
+        if current_acq_id:
+            state = self.image_arcsinh_state.setdefault(
+                current_acq_id,
+                {"enabled": False, "cofactor": self.arcsinh_cofactor.value()},
+            )
+            state["cofactor"] = self.arcsinh_cofactor.value()
+        self.channel_per_image_scaling.clear()
+        self._clear_range_cache()
+
+        with self._batch_display_updates():
+            self._load_scaling_controls()
+
+        self._request_display_update()
+
+    def _apply_comparison_scaling(self):
+        if not self.custom_scaling_chk.isChecked():
+            return
+
+        channel = self._get_current_scaling_channel()
+        if not channel:
+            return
+
+        if self.link_chk.isChecked():
+            self.channel_linked_scaling[channel] = {
+                "min": self.min_spinbox.value(),
+                "max": self.max_spinbox.value(),
+            }
+        else:
+            current_acq_id = self.image_combo.currentData()
+            if current_acq_id:
+                self.channel_per_image_scaling.setdefault(channel, {})[current_acq_id] = {
+                    "min": self.min_spinbox.value(),
+                    "max": self.max_spinbox.value(),
+                }
+        self._request_display_update()
+
+    def _on_link_contrast_toggled(self):
+        if self.custom_scaling_chk.isChecked():
+            self._store_current_scaling_state()
+        self._clear_range_cache()
+
+        with self._batch_display_updates():
+            self._refresh_scaling_channel_options(self.scaling_channel_combo.currentText())
+            self._update_image_combo(self.image_combo.currentData())
+            self._load_scaling_controls()
+
+        self._request_display_update()
+
+    def _on_image_selection_changed(self):
+        if not self.custom_scaling_chk.isChecked() or self.link_chk.isChecked():
+            return
+
+        self._store_current_scaling_state()
+        self._clear_range_cache()
+
+        with self._batch_display_updates():
+            self._load_scaling_controls()
+
+        self._request_display_update()
 
     def _add_acquisition(self):
         current_item = self.available_acq_list.currentItem()
-        if current_item:
-            acq_id = current_item.data(Qt.UserRole)
-            if acq_id not in self.selected_acquisitions:
-                # Store current channel before updating
-                current_channel = self.channel_combo.currentText()
-                
-                self.selected_acquisitions.append(acq_id)
-                # Create a new item with the same data
-                new_item = QtWidgets.QListWidgetItem(current_item.text())
-                new_item.setData(Qt.UserRole, acq_id)
-                self.acq_list.addItem(new_item)
-                
-                # Update channel combo (will preserve current channel if possible)
-                self._update_channel_combo()
-                
-                # Start background prefetch for selected acquisitions
+        if current_item is None:
+            return
+
+        acq_id = current_item.data(Qt.UserRole)
+        if acq_id in self.selected_acquisitions:
+            return
+
+        self.selected_acquisitions.append(acq_id)
+        new_item = QtWidgets.QListWidgetItem(current_item.text())
+        new_item.setData(Qt.UserRole, acq_id)
+        self.acq_list.addItem(new_item)
+
         self._start_prefetch_selected()
-        if self.custom_scaling_chk.isChecked() and not self.link_chk.isChecked():
-            self._update_image_combo()
+        self._sync_channel_controls()
 
     def _remove_acquisition(self):
         current_item = self.acq_list.currentItem()
-        if current_item:
-            acq_id = current_item.data(Qt.UserRole)
-            self.selected_acquisitions.remove(acq_id)
-            self.acq_list.takeItem(self.acq_list.row(current_item))
-            self._update_channel_combo()
-            # Update prefetch set and prune cache
-            self._start_prefetch_selected()
-            if self.custom_scaling_chk.isChecked() and not self.link_chk.isChecked():
-                self._update_image_combo()
+        if current_item is None:
+            return
+
+        acq_id = current_item.data(Qt.UserRole)
+        if acq_id not in self.selected_acquisitions:
+            return
+
+        self.selected_acquisitions.remove(acq_id)
+        self.acq_list.takeItem(self.acq_list.row(current_item))
+
+        self._prune_stack_cache()
+        self._sync_channel_controls()
+
+    def _normalize_to_unit(self, image: np.ndarray, vmin: float, vmax: float) -> np.ndarray:
+        if vmax <= vmin:
+            return np.zeros_like(image, dtype=np.float32)
+        return np.clip((image.astype(np.float32, copy=False) - vmin) / (vmax - vmin), 0.0, 1.0)
+
+    def _build_rgb_image(self, acq_id: str, channels_by_color: Dict[str, List[str]]) -> Optional[np.ndarray]:
+        ordered_channels = []
+        for color in self.available_colors_rgb:
+            ordered_channels.extend(channels_by_color[color])
+        if not ordered_channels:
+            return None
+
+        base_image = self._get_transformed_channel_image(acq_id, ordered_channels[0])
+        rgb_image = np.zeros(base_image.shape + (3,), dtype=np.float32)
+
+        for color_index, color in enumerate(self.available_colors_rgb):
+            plane = np.zeros(base_image.shape, dtype=np.float32)
+            for channel in channels_by_color[color]:
+                image = self._get_transformed_channel_image(acq_id, channel)
+                vmin, vmax = self._resolve_display_range(channel, acq_id)
+                plane += self._normalize_to_unit(image, vmin, vmax)
+            rgb_image[..., color_index] = np.clip(plane, 0.0, 1.0)
+
+        return rgb_image
+
+    def _get_overlay_mask(self, acq_id: str, expected_shape: Tuple[int, int]) -> Optional[np.ndarray]:
+        if not self.overlay_chk.isChecked():
+            return None
+
+        parent = self.parent()
+        masks = getattr(parent, "segmentation_masks", {}) if parent else {}
+        if acq_id not in masks:
+            return None
+
+        try:
+            mask = masks[acq_id]
+            mask_bool = mask.astype(bool)
+            if mask_bool.ndim == 2 and mask_bool.shape == expected_shape:
+                return mask_bool
+        except Exception:
+            return None
+        return None
+
+    def _build_display_specs(self) -> List[Dict[str, object]]:
+        specs: List[Dict[str, object]] = []
+        grayscale = self.grayscale_chk.isChecked()
+        is_rgb = self.rgb_mode_chk.isChecked()
+
+        if is_rgb:
+            channels_by_color = self._checked_rgb_channels_by_color()
+            if not any(channels_by_color[color] for color in self.available_colors_rgb):
+                return specs
+
+            for acq_id in self.selected_acquisitions:
+                rgb_image = self._build_rgb_image(acq_id, channels_by_color)
+                if rgb_image is None:
+                    continue
+
+                if grayscale:
+                    image = np.mean(rgb_image, axis=2)
+                    specs.append(
+                        {
+                            "mode": "rgb_gray",
+                            "image": image,
+                            "cmap": "gray",
+                            "vmin": 0.0,
+                            "vmax": 1.0,
+                            "show_colorbar": True,
+                            "title": self._get_acquisition_subtitle(acq_id),
+                            "overlay_mask": self._get_overlay_mask(acq_id, image.shape),
+                        }
+                    )
+                else:
+                    specs.append(
+                        {
+                            "mode": "rgb",
+                            "image": rgb_image,
+                            "cmap": None,
+                            "vmin": None,
+                            "vmax": None,
+                            "show_colorbar": False,
+                            "title": self._get_acquisition_subtitle(acq_id),
+                            "overlay_mask": self._get_overlay_mask(acq_id, rgb_image.shape[:2]),
+                        }
+                    )
+            return specs
+
+        channel = self.channel_combo.currentText()
+        if not channel:
+            return specs
+
+        for acq_id in self.selected_acquisitions:
+            image = self._get_transformed_channel_image(acq_id, channel)
+            vmin, vmax = self._resolve_display_range(channel, acq_id)
+            specs.append(
+                {
+                    "mode": "single",
+                    "image": image,
+                    "cmap": "gray" if grayscale else "viridis",
+                    "vmin": vmin,
+                    "vmax": vmax,
+                    "show_colorbar": True,
+                    "title": self._get_acquisition_subtitle(acq_id),
+                    "overlay_mask": self._get_overlay_mask(acq_id, image.shape),
+                }
+            )
+
+        return specs
+
+    def _create_canvas_slot(self) -> Dict[str, object]:
+        canvas = MplCanvas(width=4, height=4, dpi=100)
+        canvas.setParent(self.image_widget)
+        return {
+            "canvas": canvas,
+            "image_artist": None,
+            "colorbar": None,
+            "overlay_artists": [],
+            "mode": None,
+        }
+
+    def _remove_overlay_artists(self, slot: Dict[str, object]):
+        for artist in slot.get("overlay_artists", []):
+            try:
+                artist.remove()
+            except Exception:
+                pass
+        slot["overlay_artists"] = []
+
+    def _remove_colorbar(self, slot: Dict[str, object]):
+        colorbar = slot.get("colorbar")
+        if colorbar is not None:
+            try:
+                colorbar.remove()
+            except Exception:
+                pass
+        slot["colorbar"] = None
+
+    def _release_canvas_slot(self, slot: Dict[str, object]):
+        self._remove_overlay_artists(slot)
+        self._remove_colorbar(slot)
+        canvas = slot.get("canvas")
+        if canvas is None:
+            return
+        self.image_layout.removeWidget(canvas)
+        if hasattr(canvas, "fig"):
+            try:
+                canvas.fig.clear()
+                plt.close(canvas.fig)
+            except Exception:
+                pass
+        slot["image_artist"] = None
+        slot["mode"] = None
+        canvas.deleteLater()
+
+    def _ensure_canvas_slots(self, count: int):
+        while len(self._canvas_slots) < count:
+            self._canvas_slots.append(self._create_canvas_slot())
+
+        while len(self._canvas_slots) > count:
+            slot = self._canvas_slots.pop()
+            self._release_canvas_slot(slot)
+
+        cols = max(1, min(3, count))
+        for index, slot in enumerate(self._canvas_slots):
+            row = index // cols
+            col = index % cols
+            self.image_layout.addWidget(slot["canvas"], row, col)
+        self._update_canvas_geometry()
+
+    def _update_canvas_geometry(self):
+        count = len(self._canvas_slots)
+        if count == 0:
+            return
+
+        cols = max(1, min(3, count))
+        rows = (count + cols - 1) // cols
+
+        margins = self.image_layout.contentsMargins()
+        h_spacing = self.image_layout.horizontalSpacing()
+        v_spacing = self.image_layout.verticalSpacing()
+        if h_spacing < 0:
+            h_spacing = self.image_layout.spacing()
+        if v_spacing < 0:
+            v_spacing = self.image_layout.spacing()
+
+        viewport_width = max(1, self.image_scroll.viewport().width())
+        viewport_height = max(1, self.image_scroll.viewport().height())
+        available_width = max(120, viewport_width - margins.left() - margins.right() - (h_spacing * (cols - 1)))
+        available_height = max(120, viewport_height - margins.top() - margins.bottom() - (v_spacing * (rows - 1)))
+
+        tile_width = max(120, available_width // cols)
+        tile_height = max(tile_width, min(available_height // rows, int(tile_width * 1.4)))
+
+        for column in range(3):
+            self.image_layout.setColumnStretch(column, 1 if column < cols else 0)
+        for row in range(max(1, rows)):
+            self.image_layout.setRowStretch(row, 1)
+
+        for slot in self._canvas_slots:
+            canvas = slot["canvas"]
+            canvas.setFixedSize(tile_width, tile_height)
+
+    def _update_canvas_slot(self, slot: Dict[str, object], spec: Dict[str, object]):
+        canvas: MplCanvas = slot["canvas"]  # type: ignore[assignment]
+        ax = canvas.ax
+        mode = spec["mode"]
+        image_artist = slot.get("image_artist")
+        mode_changed = slot.get("mode") != mode or image_artist is None
+
+        self._remove_overlay_artists(slot)
+
+        if mode_changed:
+            self._remove_colorbar(slot)
+            ax.clear()
+            if mode == "rgb":
+                image_artist = ax.imshow(spec["image"], interpolation="nearest")
+            else:
+                image_artist = ax.imshow(
+                    spec["image"],
+                    interpolation="nearest",
+                    cmap=spec["cmap"],
+                    vmin=spec["vmin"],
+                    vmax=spec["vmax"],
+                )
+            slot["image_artist"] = image_artist
+            slot["mode"] = mode
+        else:
+            image_artist = slot["image_artist"]
+            image_artist.set_data(spec["image"])
+            if mode != "rgb":
+                image_artist.set_cmap(spec["cmap"])
+                image_artist.set_clim(spec["vmin"], spec["vmax"])
+
+        overlay_mask = spec.get("overlay_mask")
+        if overlay_mask is not None:
+            try:
+                contour = ax.contour(overlay_mask, levels=[0.5], colors="r", linewidths=0.6, alpha=0.7)
+                slot["overlay_artists"] = list(contour.collections)
+            except Exception:
+                slot["overlay_artists"] = []
+
+        ax.set_title(spec["title"], fontsize=10)
+        ax.axis("off")
+
+        if spec["show_colorbar"]:
+            if slot.get("colorbar") is None or mode_changed:
+                self._remove_colorbar(slot)
+                slot["colorbar"] = canvas.fig.colorbar(image_artist, ax=ax, shrink=0.8, aspect=20)
+            else:
+                slot["colorbar"].update_normal(image_artist)
+        else:
+            self._remove_colorbar(slot)
+
+        canvas.draw()
 
     def _update_display(self):
-        """Update the image display with proper cleanup."""
-        # Clear existing images with proper cleanup
-        self._clear_display()
-        
         if not self.selected_acquisitions:
+            self._ensure_canvas_slots(0)
             return
-        
-        is_rgb = self.rgb_mode_chk.isChecked() if hasattr(self, 'rgb_mode_chk') else False
-        channel = self.channel_combo.currentText()
-        self.last_selected_channel = channel
-        grayscale = self.grayscale_chk.isChecked()
-        link_contrast = self.link_chk.isChecked()
-        
-        # Load images
-        images = []
-        titles = []
-        if is_rgb:
-            # Build per-acquisition RGB composites
-            def _checked(lst: QtWidgets.QListWidget) -> List[str]:
-                vals = []
-                for i in range(lst.count()):
-                    it = lst.item(i)
-                    if it.checkState() == Qt.Checked:
-                        vals.append(it.text())
-                return vals
-            reds = _checked(self.red_list)
-            greens = _checked(self.green_list)
-            blues = _checked(self.blue_list)
-            for acq_id in self.selected_acquisitions:
-                try:
-                    # Sum selected channels per color
-                    def _get_cached(acq: str, ch_name: str):
-                        key = (acq, ch_name)
-                        if key in self.image_cache:
-                            return self.image_cache[key]
-                        # Get correct loader and original acquisition ID for multiple .mcd files
-                        loader = self._get_loader_for_acquisition(acq)
-                        original_acq_id = self._get_original_acq_id(acq)
-                        if loader is None:
-                            return None
-                        arr = loader.get_image(original_acq_id, ch_name)
-                        self.image_cache[key] = arr
-                        self._manage_cache_size()
-                        return arr
-                    def _normalize_with_channel_settings(channel_name: str, arr: np.ndarray, acquisition_id: str) -> np.ndarray:
-                        # Optional arcsinh - only apply to the selected scaling channel and selected image
-                        a = arr.astype(np.float32, copy=False)
-                        selected_scaling_channel = self.scaling_channel_combo.currentText()
-                        # Check if arcsinh should be applied to this specific image
-                        if link_contrast:
-                            # In linked mode, use global arcsinh setting
-                            should_apply_arcsinh = (self.arcsinh_chk.isChecked() and 
-                                                   channel_name == selected_scaling_channel)
-                        else:
-                            # In unlinked mode, check per-image arcsinh state
-                            image_arcsinh = self.image_arcsinh_state.get(acquisition_id, {})
-                            should_apply_arcsinh = (image_arcsinh.get('enabled', False) and 
-                                                   channel_name == selected_scaling_channel)
-                        if should_apply_arcsinh:
-                            # Get the cofactor for this image
-                            if link_contrast:
-                                cofactor = self.arcsinh_cofactor.value()
-                            else:
-                                image_arcsinh = self.image_arcsinh_state.get(acquisition_id, {})
-                                cofactor = image_arcsinh.get('cofactor', self.arcsinh_cofactor.value())
-                            a = arcsinh_normalize(a, cofactor)
-                        # Custom scaling per channel
-                        if self.custom_scaling_chk.isChecked():
-                            vmin = None
-                            vmax = None
-                            if self.link_chk.isChecked():
-                                if channel_name in self.channel_linked_scaling:
-                                    vals = self.channel_linked_scaling[channel_name]
-                                    vmin, vmax = vals.get('min'), vals.get('max')
-                                else:
-                                    # compute global across selected acquisitions for this channel
-                                    try:
-                                        imgs = []
-                                        for aq in self.selected_acquisitions:
-                                            loader = self._get_loader_for_acquisition(aq)
-                                            original_acq_id = self._get_original_acq_id(aq)
-                                            if loader is not None:
-                                                imgs.append(loader.get_image(original_acq_id, channel_name))
-                                        selected_scaling_channel = self.scaling_channel_combo.currentText()
-                                        # Only apply arcsinh if this is the selected scaling channel and arcsinh is enabled
-                                        if self.arcsinh_chk.isChecked() and channel_name == selected_scaling_channel and not link_contrast:
-                                            imgs = [arcsinh_normalize(im, self.arcsinh_cofactor.value()) for im in imgs]
-                                        vmin = float(min(np.min(im) for im in imgs))
-                                        vmax = float(max(np.max(im) for im in imgs))
-                                        self.channel_linked_scaling[channel_name] = {'min': vmin, 'max': vmax}
-                                    except Exception:
-                                        vmin = float(np.min(a))
-                                        vmax = float(np.max(a))
-                            else:
-                                per_img = self.channel_per_image_scaling.get(channel_name, {})
-                                if acquisition_id in per_img:
-                                    vals = per_img[acquisition_id]
-                                    vmin, vmax = vals.get('min'), vals.get('max')
-                                else:
-                                    # Use the transformed range (after arcsinh if applied)
-                                    vmin = float(np.min(a))
-                                    vmax = float(np.max(a))
-                                    per_img.setdefault(acquisition_id, {'min': vmin, 'max': vmax})
-                                    self.channel_per_image_scaling[channel_name] = per_img
-                            if vmin is not None and vmax is not None and vmax > vmin:
-                                # Don't normalize to 0-1, just clip to the range
-                                a = np.clip(a, vmin, vmax)
-                        return a
-                    def _sum_channels(names: List[str]):
-                        if not names:
-                            # Return zeros of first available channel size
-                            base = _get_cached(acq_id, channel) if channel else None
-                            if base is None:
-                                return None
-                            return np.zeros_like(base, dtype=np.float32)
-                        acc = None
-                        for ch in names:
-                            arr = _get_cached(acq_id, ch)
-                            arr_n = _normalize_with_channel_settings(ch, arr, acq_id)
-                            acc = arr_n if acc is None else (acc + arr_n)
-                        if acc is None:
-                            return None
-                        # Don't clip to 0-1, keep the actual summed values
-                        return acc
-                    r = _sum_channels(reds)
-                    g = _sum_channels(greens)
-                    b = _sum_channels(blues)
-                    if r is None or g is None or b is None:
-                        continue
-                    
-                    # Normalize each channel for RGB display
-                    def _normalize_channel(channel_data, channel_name):
-                        if channel_data is None:
-                            return None
-                        
-                        # Determine if arcsinh should be applied for this channel and image
-                        selected_scaling_channel = self.scaling_channel_combo.currentText()
-                        # Check if arcsinh should be applied to this specific image
-                        if link_contrast:
-                            # In linked mode, use global arcsinh setting
-                            should_apply_arcsinh = (self.arcsinh_chk.isChecked() and 
-                                                   channel_name == selected_scaling_channel)
-                        else:
-                            # In unlinked mode, check per-image arcsinh state
-                            image_arcsinh = self.image_arcsinh_state.get(acq_id, {})
-                            should_apply_arcsinh = (image_arcsinh.get('enabled', False) and 
-                                                   channel_name == selected_scaling_channel)
-                        
-                        # If custom scaling is enabled, use the custom range for this channel
-                        if self.custom_scaling_chk.isChecked():
-                            # Check if this is the currently selected scaling channel
-                            if channel_name == selected_scaling_channel:
-                                # In unlinked mode, only use spinbox values for the currently selected image
-                                if not link_contrast and acq_id == self.image_combo.currentData():
-                                    ch_min = self.min_spinbox.value()
-                                    ch_max = self.max_spinbox.value()
-                                    # If arcsinh is applied, transform the min/max values
-                                    if should_apply_arcsinh:
-                                        # Get the cofactor for this image
-                                        if link_contrast:
-                                            cofactor = self.arcsinh_cofactor.value()
-                                        else:
-                                            image_arcsinh = self.image_arcsinh_state.get(acq_id, {})
-                                            cofactor = image_arcsinh.get('cofactor', self.arcsinh_cofactor.value())
-                                        ch_min = arcsinh_normalize(np.array([ch_min]), cofactor)[0]
-                                        ch_max = arcsinh_normalize(np.array([ch_max]), cofactor)[0]
-                                else:
-                                    # For linked mode or non-selected images, use stored values
-                                    if link_contrast:
-                                        # In linked mode, use the current spinbox values for the selected scaling channel
-                                        ch_min = self.min_spinbox.value()
-                                        ch_max = self.max_spinbox.value()
-                                        # If arcsinh is applied, transform the min/max values
-                                        if should_apply_arcsinh:
-                                            # Get the cofactor for this image
-                                            if link_contrast:
-                                                cofactor = self.arcsinh_cofactor.value()
-                                            else:
-                                                image_arcsinh = self.image_arcsinh_state.get(acq_id, {})
-                                                cofactor = image_arcsinh.get('cofactor', self.arcsinh_cofactor.value())
-                                            ch_min = arcsinh_normalize(np.array([ch_min]), cofactor)[0]
-                                            ch_max = arcsinh_normalize(np.array([ch_max]), cofactor)[0]
-                                    else:
-                                        per_img = self.channel_per_image_scaling.get(channel_name, {})
-                                        if acq_id in per_img:
-                                            vals = per_img[acq_id]
-                                            ch_min, ch_max = vals.get('min'), vals.get('max')
-                                        else:
-                                            ch_min = float(np.min(channel_data))
-                                            ch_max = float(np.max(channel_data))
-                            else:
-                                # For other channels, use stored values or calculate from data
-                                if link_contrast:
-                                    # Use linked scaling for this channel
-                                    if channel_name in self.channel_linked_scaling:
-                                        vals = self.channel_linked_scaling[channel_name]
-                                        ch_min, ch_max = vals.get('min'), vals.get('max')
-                                    else:
-                                        # Calculate global range for this channel
-                                        try:
-                                            imgs = []
-                                            for aq in self.selected_acquisitions:
-                                                loader = self._get_loader_for_acquisition(aq)
-                                                original_acq_id = self._get_original_acq_id(aq)
-                                                if loader is not None:
-                                                    imgs.append(loader.get_image(original_acq_id, channel_name))
-                                            # Don't apply arcsinh to non-selected channels
-                                            ch_min = float(min(np.min(im) for im in imgs))
-                                            ch_max = float(max(np.max(im) for im in imgs))
-                                            self.channel_linked_scaling[channel_name] = {'min': ch_min, 'max': ch_max}
-                                        except Exception:
-                                            ch_min = float(np.min(channel_data))
-                                            ch_max = float(np.max(channel_data))
-                                else:
-                                    # Use per-image scaling for this channel
-                                    per_img = self.channel_per_image_scaling.get(channel_name, {})
-                                    if acq_id in per_img:
-                                        vals = per_img[acq_id]
-                                        ch_min, ch_max = vals.get('min'), vals.get('max')
-                                    else:
-                                        ch_min = float(np.min(channel_data))
-                                        ch_max = float(np.max(channel_data))
-                                        per_img.setdefault(acq_id, {'min': ch_min, 'max': ch_max})
-                                        self.channel_per_image_scaling[channel_name] = per_img
-                        else:
-                            # No custom scaling, use the channel's own range
-                            ch_min = float(np.min(channel_data))
-                            ch_max = float(np.max(channel_data))
-                        
-                        # Apply arcsinh transformation if needed
-                        if should_apply_arcsinh:
-                            # Get the cofactor for this image
-                            if link_contrast:
-                                cofactor = self.arcsinh_cofactor.value()
-                            else:
-                                image_arcsinh = self.image_arcsinh_state.get(acq_id, {})
-                                cofactor = image_arcsinh.get('cofactor', self.arcsinh_cofactor.value())
-                            
-                            # Apply arcsinh transformation
-                            transformed_data = arcsinh_normalize(channel_data, cofactor)
-                            # Calculate the range of the transformed data
-                            trans_min = np.min(transformed_data)
-                            trans_max = np.max(transformed_data)
-                            # Normalize the transformed data to 0-1 range
-                            if trans_max > trans_min:
-                                return (transformed_data - trans_min) / (trans_max - trans_min)
-                            else:
-                                return np.zeros_like(transformed_data)
-                        else:
-                            # Normalize to [0,1] using the determined range
-                            if ch_max > ch_min:
-                                return (channel_data - ch_min) / (ch_max - ch_min)
-                            else:
-                                return np.zeros_like(channel_data)
-                    
-                    r_norm = _normalize_channel(r, reds[0] if reds else "red")
-                    g_norm = _normalize_channel(g, greens[0] if greens else "green")
-                    b_norm = _normalize_channel(b, blues[0] if blues else "blue")
-                    
-                    rgb = np.dstack([r_norm, g_norm, b_norm])
-                    images.append(rgb)
-                    titles.append(self._get_acquisition_subtitle(acq_id))
-                except Exception as e:
-                    print(f"Error building RGB for {acq_id}: {e}")
-                    continue
-        else:
-            for acq_id in self.selected_acquisitions:
-                try:
-                    if not channel:
-                        continue
-                    key = (acq_id, channel)
-                    if key in self.image_cache:
-                        img = self.image_cache[key]
-                    else:
-                        # Get correct loader and original acquisition ID for multiple .mcd files
-                        loader = self._get_loader_for_acquisition(acq_id)
-                        original_acq_id = self._get_original_acq_id(acq_id)
-                        if loader is None:
-                            continue
-                        img = loader.get_image(original_acq_id, channel)
-                        self.image_cache[key] = img
-                        self._manage_cache_size()
-                    images.append(img)
-                    titles.append(self._get_acquisition_subtitle(acq_id))
-                except Exception as e:
-                    print(f"Error loading image for {acq_id}: {e}")
-                    continue
-        
-        if not images:
-            return
-        
-        # Calculate grid layout
-        n_images = len(images)
-        cols = min(3, n_images)
-        rows = (n_images + cols - 1) // cols
-        
-        # Calculate scaling based on custom scaling and link contrast settings
-        custom_scaling_enabled = self.custom_scaling_chk.isChecked()
-        custom_min = self.min_spinbox.value() if custom_scaling_enabled else None
-        custom_max = self.max_spinbox.value() if custom_scaling_enabled else None
-        
-        # Determine if arcsinh should be applied globally
-        # Disable arcsinh when linked scaling is enabled
-        selected_scaling_channel = self.scaling_channel_combo.currentText()
-        global_arcsinh_applied = (self.arcsinh_chk.isChecked() and 
-                                 channel == selected_scaling_channel and 
-                                 not link_contrast)
-        
-        # Calculate global min/max if link contrast is enabled
-        vmin = None
-        vmax = None
-        if link_contrast and len(images) > 1:
-            if custom_scaling_enabled:
-                # Use custom scaling for linked contrast
-                vmin = custom_min
-                vmax = custom_max
-            else:
-                # Use global min/max for fair comparison (after optional transform)
-                def _transform_for_display_global(arr: np.ndarray) -> np.ndarray:
-                    a = arr
-                    # Apply arcsinh if it should be applied globally
-                    if global_arcsinh_applied:
-                        a = arcsinh_normalize(a, self.arcsinh_cofactor.value())
-                    return a
-                
-                # Calculate global range across all images
-                all_mins = []
-                all_maxs = []
-                for img in images:
-                    transformed = _transform_for_display_global(img)
-                    if is_rgb and not grayscale:
-                        # For RGB color display, data is already properly scaled, no global scaling needed
-                        continue
-                    else:
-                        all_mins.append(np.min(transformed))
-                        all_maxs.append(np.max(transformed))
-                
-                if all_mins and all_maxs:
-                    vmin = min(all_mins)
-                    vmax = max(all_maxs)
-        elif not link_contrast and custom_scaling_enabled:
-            # For individual scaling with custom scaling enabled,
-            # each image can have its own custom scaling range
-            # We'll handle this per-image in the display loop
-            pass
-        
-        # Display images
-        for i, (img, title) in enumerate(zip(images, titles)):
-            row = i // cols
-            col = i % cols
-            
-            # Create canvas with proper parent
-            try:
-                canvas = MplCanvas(width=4, height=4, dpi=100)
-                canvas.setParent(self.image_widget)
-            except Exception as e:
-                print(f"Error creating canvas: {e}")
-                continue
-            
-            # Determine scaling for this image
-            img_vmin = vmin
-            img_vmax = vmax
-            
-            if img_vmin is None or img_vmax is None:
-                # Individual scaling - check for per-image custom scaling
-                acq_id = self.selected_acquisitions[i]
-                # Check if arcsinh should be applied to this specific image
-                if link_contrast:
-                    # In linked mode, use global arcsinh setting
-                    is_arcsinh_applied = global_arcsinh_applied
-                else:
-                    # In unlinked mode, check per-image arcsinh state
-                    image_arcsinh = self.image_arcsinh_state.get(acq_id, {})
-                    is_arcsinh_applied = image_arcsinh.get('enabled', False)
-                
-                if custom_scaling_enabled and not link_contrast:
-                    # Check for per-channel per-image scaling
-                    ch = selected_scaling_channel or channel
-                    per_img = self.channel_per_image_scaling.get(ch, {})
-                    if acq_id in per_img:
-                        # Use custom scaling for this specific image
-                        stored_min = per_img[acq_id]['min']
-                        stored_max = per_img[acq_id]['max']
-                        
-                        if is_arcsinh_applied:
-                            # Apply arcsinh to the stored min/max values to get the transformed range
-                            img_vmin = arcsinh_normalize(np.array([stored_min]), self.arcsinh_cofactor.value())[0]
-                            img_vmax = arcsinh_normalize(np.array([stored_max]), self.arcsinh_cofactor.value())[0]
-                        else:
-                            img_vmin = stored_min
-                            img_vmax = stored_max
-                    else:
-                        # Use image's own min/max range (after arcsinh if applicable)
-                        if is_arcsinh_applied:
-                            # Get the cofactor for this image
-                            if link_contrast:
-                                cofactor = self.arcsinh_cofactor.value()
-                            else:
-                                image_arcsinh = self.image_arcsinh_state.get(acq_id, {})
-                                cofactor = image_arcsinh.get('cofactor', self.arcsinh_cofactor.value())
-                            
-                            # Apply arcsinh to get the transformed range
-                            transformed_img = arcsinh_normalize(img, cofactor)
-                            img_vmin = np.min(transformed_img)
-                            img_vmax = np.max(transformed_img)
-                            # Normalize the transformed data to 0-1 range
-                            if img_vmax > img_vmin:
-                                img = (transformed_img - img_vmin) / (img_vmax - img_vmin)
-                            else:
-                                img = np.zeros_like(transformed_img)
-                            # Set vmin/vmax to 0-1 for display
-                            img_vmin = 0.0
-                            img_vmax = 1.0
-                        else:
-                            img_vmin = np.min(img)
-                            img_vmax = np.max(img)
-                else:
-                    # Use image's own min/max range (after arcsinh if applicable)
-                    if is_arcsinh_applied:
-                        # Get the cofactor for this image
-                        if link_contrast:
-                            cofactor = self.arcsinh_cofactor.value()
-                        else:
-                            image_arcsinh = self.image_arcsinh_state.get(acq_id, {})
-                            cofactor = image_arcsinh.get('cofactor', self.arcsinh_cofactor.value())
-                        
-                        # Apply arcsinh to get the transformed range
-                        transformed_img = arcsinh_normalize(img, cofactor)
-                        img_vmin = np.min(transformed_img)
-                        img_vmax = np.max(transformed_img)
-                        # Normalize the transformed data to 0-1 range
-                        if img_vmax > img_vmin:
-                            img = (transformed_img - img_vmin) / (img_vmax - img_vmin)
-                        else:
-                            img = np.zeros_like(transformed_img)
-                        # Set vmin/vmax to 0-1 for display
-                        img_vmin = 0.0
-                        img_vmax = 1.0
-                    else:
-                        img_vmin = np.min(img)
-                        img_vmax = np.max(img)
-            
-            # Display image with optional arcsinh transformation only
-            def _transform_for_display(arr: np.ndarray, acq_id_for_scaling: Optional[str], channel_name: Optional[str]) -> np.ndarray:
-                a = arr.astype(np.float32, copy=False)
-                
-                # Arcsinh transformation is now handled in the vmin/vmax calculation above
-                # This function just returns the data as-is since it's already been processed
-                return a
-            if is_rgb and not grayscale:
-                # RGB data is already properly scaled (either to [0,1] or using custom scaling)
-                im = canvas.ax.imshow(img, interpolation="nearest")
-            elif is_rgb and grayscale:
-                # Show mean across channels as grayscale
-                # img already normalized per-channel above
-                gray = np.mean(img, axis=2)
-                im = canvas.ax.imshow(gray, interpolation="nearest", cmap='gray', vmin=img_vmin, vmax=img_vmax)
-            else:
-                channel_name = self.channel_combo.currentText() if self.channel_combo.currentText() else None
-                transformed = _transform_for_display(img, self.selected_acquisitions[i], channel_name)
-                im = canvas.ax.imshow(transformed, interpolation="nearest", 
-                                    cmap='gray' if grayscale else 'viridis',
-                                    vmin=img_vmin, vmax=img_vmax)
 
-            # Optional mask overlay
-            if self.overlay_chk.isChecked():
-                parent = self.parent()
-                masks = getattr(parent, 'segmentation_masks', {}) if parent else {}
-                acq_id_overlay = self.selected_acquisitions[i] if i < len(self.selected_acquisitions) else None
-                if acq_id_overlay and acq_id_overlay in masks:
-                    try:
-                        mask = masks[acq_id_overlay]
-                        mask_bool = mask.astype(bool)
-                        if mask_bool.ndim == 2 and mask_bool.shape == img.shape[:2]:
-                            canvas.ax.contour(mask_bool, levels=[0.5], colors='r', linewidths=0.6, alpha=0.7)
-                    except Exception:
-                        pass
-            
-            canvas.ax.set_title(title, fontsize=10)
-            canvas.ax.axis("off")
-            
-            # Add colorbar
-            # Add colorbar only for single-channel display
-            if not is_rgb or grayscale:
-                cbar = canvas.fig.colorbar(im, ax=canvas.ax, shrink=0.8, aspect=20)
-            
-            self.image_layout.addWidget(canvas, row, col)
+        try:
+            specs = self._build_display_specs()
+        except Exception as exc:
+            print(f"Comparison display error: {exc}")
+            specs = []
+
+        if not specs:
+            self._ensure_canvas_slots(0)
+            return
+
+        self._ensure_canvas_slots(len(specs))
+        for slot, spec in zip(self._canvas_slots, specs):
+            self._update_canvas_slot(slot, spec)
+        self.image_widget.update()
 
     def _clear_display(self):
-        """Clear all displayed images with proper matplotlib cleanup."""
-        # Remove all widgets from the layout
+        while self._canvas_slots:
+            slot = self._canvas_slots.pop()
+            self._release_canvas_slot(slot)
         while self.image_layout.count():
             child = self.image_layout.takeAt(0)
             if child.widget():
-                widget = child.widget()
-                # Properly close matplotlib figures
-                if hasattr(widget, 'fig'):
-                    try:
-                        widget.fig.clear()
-                        plt.close(widget.fig)
-                    except Exception:
-                        pass
-                widget.deleteLater()
-        
-        # Force update to ensure widgets are actually removed
+                child.widget().setParent(None)
         self.image_widget.update()
-        
-    def _update_channel_combo(self):
-        """Update the channel combo box based on selected acquisitions."""
-        old_channel = self.channel_combo.currentText()
-        self.channel_combo.clear()
-        self.scaling_channel_combo.clear()
-        if self.selected_acquisitions:
-            # Get channels from first selected acquisition
-            ai = next(a for a in self.acqs if a.id == self.selected_acquisitions[0])
-            self.channel_combo.addItems(ai.channels)
-            # Populate scaling channel combo with currently selected channels
-            self._refresh_scaling_channel_options()
-            
-            # Pre-select the last selected channel if it exists in this acquisition
-            if self.last_selected_channel and self.last_selected_channel in ai.channels:
-                index = ai.channels.index(self.last_selected_channel)
-                self.channel_combo.setCurrentIndex(index)
-            elif old_channel and old_channel in ai.channels:
-                # Try to preserve the previously selected channel if it exists
-                index = ai.channels.index(old_channel)
-                self.channel_combo.setCurrentIndex(index)
-                self.last_selected_channel = old_channel
-            elif ai.channels:
-                # Select first channel by default if no previous selection
-                self.channel_combo.setCurrentIndex(0)
-                self.last_selected_channel = ai.channels[0]
-            
-            # Clear cache if channel changed
-            new_channel = self.channel_combo.currentText()
-            if old_channel and old_channel != new_channel:
-                self._clear_cache()
-            
-            # Auto-load images if channel is selected
-            if self.channel_combo.currentText():
-                self._update_display()
-        else:
-            self._clear_cache()
-
-    def _clear_cache(self):
-        """Clear the image cache."""
-        self.image_cache.clear()
-    
-    def _manage_cache_size(self):
-        """Remove oldest entries if cache exceeds max size."""
-        if len(self.image_cache) > self.max_cache_size:
-            # Remove oldest entries (simple FIFO)
-            keys_to_remove = list(self.image_cache.keys())[:len(self.image_cache) - self.max_cache_size]
-            for key in keys_to_remove:
-                del self.image_cache[key]
-    
-    def _get_acquisition_subtitle(self, acq_id: str) -> str:
-        """Get acquisition subtitle showing well/description and file name."""
-        acq_info = next((ai for ai in self.acqs if ai.id == acq_id), None)
-        if not acq_info:
-            return "Unknown"
-        
-        # Use same format as main window: well [file_name] or name [file_name]
-        import os
-        file_name = os.path.basename(acq_info.source_file) if hasattr(acq_info, 'source_file') and acq_info.source_file else "Unknown"
-        label = acq_info.well if acq_info.well else acq_info.name
-        return f"{label} [{file_name}]"
-
-    def _on_comparison_scaling_toggled(self):
-        """Handle custom scaling checkbox toggle in comparison mode."""
-        self.scaling_frame.setVisible(self.custom_scaling_chk.isChecked())
-        if self.custom_scaling_chk.isChecked():
-            if self.link_chk.isChecked():
-                self._comparison_auto_range()
-            else:
-                self._update_image_combo()
-            # Populate scaling channel options
-            self._refresh_scaling_channel_options()
-        
-        # Update control states based on link contrast
-        self._on_link_contrast_toggled()
-
-    def _on_scaling_channel_changed(self):
-        # When the scaling channel changes, save current values and reload appropriate min/max for current context
-        if not self.custom_scaling_chk.isChecked():
-            return
-        
-        # Save current min/max values for the previous channel (if any)
-        self._save_current_channel_scaling()
-        
-        # Update the previous channel to the current one
-        self.previous_scaling_channel = self.scaling_channel_combo.currentText()
-        
-        if self.link_chk.isChecked():
-            ch = self.scaling_channel_combo.currentText()
-            vals = self.channel_linked_scaling.get(ch)
-            if vals:
-                self.min_spinbox.setValue(vals.get('min', self.min_spinbox.value()))
-                self.max_spinbox.setValue(vals.get('max', self.max_spinbox.value()))
-            else:
-                # compute from current selection
-                try:
-                    imgs = []
-                    for aq in self.selected_acquisitions:
-                        loader = self._get_loader_for_acquisition(aq)
-                        original_acq_id = self._get_original_acq_id(aq)
-                        if loader is not None:
-                            imgs.append(loader.get_image(original_acq_id, ch))
-                    # Only apply arcsinh to the currently selected scaling channel
-                    if self.arcsinh_chk.isChecked() and ch == self.scaling_channel_combo.currentText():
-                        imgs = [arcsinh_normalize(im, self.arcsinh_cofactor.value()) for im in imgs]
-                    vmin = float(min(np.min(im) for im in imgs))
-                    vmax = float(max(np.max(im) for im in imgs))
-                    self.channel_linked_scaling[ch] = {'min': vmin, 'max': vmax}
-                    self.min_spinbox.setValue(vmin)
-                    self.max_spinbox.setValue(vmax)
-                except Exception:
-                    pass
-        else:
-            self._load_image_scaling()
-        
-        # Update spinbox for arcsinh if needed
-        self._update_spinbox_for_arcsinh()
-        
-        self._update_display()
-
-    def _save_current_channel_scaling(self):
-        """Save the current min/max values for the previous scaling channel."""
-        if not self.previous_scaling_channel or not self.custom_scaling_chk.isChecked():
-            return
-        
-        # Save current spinbox values for the previous channel
-        current_min = self.min_spinbox.value()
-        current_max = self.max_spinbox.value()
-        
-        if self.link_chk.isChecked():
-            # Save to linked scaling storage
-            self.channel_linked_scaling[self.previous_scaling_channel] = {
-                'min': current_min, 
-                'max': current_max
-            }
-        else:
-            # Save to per-image scaling storage
-            current_acq_id = self.image_combo.currentData()
-            if current_acq_id:
-                per_img = self.channel_per_image_scaling.get(self.previous_scaling_channel, {})
-                per_img[current_acq_id] = {'min': current_min, 'max': current_max}
-                self.channel_per_image_scaling[self.previous_scaling_channel] = per_img
-
-    def _on_arcsinh_toggled(self):
-        """Handle arcsinh checkbox toggle - clear scaling cache to force recalculation."""
-        # Clear stored scaling values so they get recalculated with new transformation
-        self.channel_linked_scaling.clear()
-        self.channel_per_image_scaling.clear()
-        self.image_scaling.clear()
-        
-        # Save arcsinh state for the currently selected image in unlinked mode
-        if not self.link_chk.isChecked() and self.image_combo.currentData():
-            current_acq_id = self.image_combo.currentData()
-            self.image_arcsinh_state[current_acq_id] = {
-                'enabled': self.arcsinh_chk.isChecked(),
-                'cofactor': self.arcsinh_cofactor.value()
-            }
-        
-        # Update spinbox values and make them uneditable when arcsinh is applied
-        self._update_spinbox_for_arcsinh()
-        
-        self._update_display()
-
-    def _on_arcsinh_cofactor_changed(self):
-        """Handle arcsinh cofactor change - clear scaling cache to force recalculation."""
-        # Clear stored scaling values so they get recalculated with new cofactor
-        self.channel_linked_scaling.clear()
-        self.channel_per_image_scaling.clear()
-        self.image_scaling.clear()
-        
-        # Update arcsinh state for the currently selected image in unlinked mode
-        if not self.link_chk.isChecked() and self.image_combo.currentData():
-            current_acq_id = self.image_combo.currentData()
-            if current_acq_id in self.image_arcsinh_state:
-                self.image_arcsinh_state[current_acq_id]['cofactor'] = self.arcsinh_cofactor.value()
-        
-        # Update spinbox values and make them uneditable when arcsinh is applied
-        self._update_spinbox_for_arcsinh()
-        
-        self._update_display()
-
-    def _update_spinbox_for_arcsinh(self):
-        """Update spinbox values and make them uneditable when arcsinh is applied."""
-        if not self.arcsinh_chk.isChecked() or not self.custom_scaling_chk.isChecked():
-            # Arcsinh is disabled or custom scaling is disabled, make spinboxes editable
-            self.min_spinbox.setEnabled(True)
-            self.max_spinbox.setEnabled(True)
-            
-            # Restore default range when arcsinh is turned off
-            if not self.arcsinh_chk.isChecked() and self.custom_scaling_chk.isChecked():
-                self._restore_default_range()
-            return
-        
-        # Arcsinh is enabled, update spinbox values and make them uneditable
-        try:
-            if self.link_chk.isChecked():
-                # Linked mode - use global range
-                channel = self.scaling_channel_combo.currentText()
-                if not channel or not self.selected_acquisitions:
-                    return
-                
-                # Get all images for this channel
-                imgs = []
-                for aq in self.selected_acquisitions:
-                    loader = self._get_loader_for_acquisition(aq)
-                    original_acq_id = self._get_original_acq_id(aq)
-                    if loader is not None:
-                        imgs.append(loader.get_image(original_acq_id, channel))
-                # Apply arcsinh to get the transformed range
-                transformed_imgs = [arcsinh_normalize(im, self.arcsinh_cofactor.value()) for im in imgs]
-                vmin = float(min(np.min(im) for im in transformed_imgs))
-                vmax = float(max(np.max(im) for im in transformed_imgs))
-                
-                # Update spinboxes
-                self.min_spinbox.blockSignals(True)
-                self.max_spinbox.blockSignals(True)
-                self.min_spinbox.setValue(vmin)
-                self.max_spinbox.setValue(vmax)
-                self.min_spinbox.blockSignals(False)
-                self.max_spinbox.blockSignals(False)
-                
-                # Make spinboxes uneditable
-                self.min_spinbox.setEnabled(False)
-                self.max_spinbox.setEnabled(False)
-                
-            else:
-                # Unlinked mode - use range for currently selected image
-                current_acq_id = self.image_combo.currentData()
-                channel = self.scaling_channel_combo.currentText()
-                if not current_acq_id or not channel:
-                    return
-                
-                # Get image for this acquisition and channel
-                loader = self._get_loader_for_acquisition(current_acq_id)
-                original_acq_id = self._get_original_acq_id(current_acq_id)
-                if loader is None:
-                    return
-                img = loader.get_image(original_acq_id, channel)
-                # Apply arcsinh to get the transformed range
-                transformed_img = arcsinh_normalize(img, self.arcsinh_cofactor.value())
-                vmin = float(np.min(transformed_img))
-                vmax = float(np.max(transformed_img))
-                
-                # Update spinboxes
-                self.min_spinbox.blockSignals(True)
-                self.max_spinbox.blockSignals(True)
-                self.min_spinbox.setValue(vmin)
-                self.max_spinbox.setValue(vmax)
-                self.min_spinbox.blockSignals(False)
-                self.max_spinbox.blockSignals(False)
-                
-                # Make spinboxes uneditable
-                self.min_spinbox.setEnabled(False)
-                self.max_spinbox.setEnabled(False)
-                
-        except Exception as e:
-            print(f"Error updating spinbox for arcsinh: {e}")
-            # On error, make spinboxes editable
-            self.min_spinbox.setEnabled(True)
-            self.max_spinbox.setEnabled(True)
-
-    def _restore_default_range(self):
-        """Restore the default range of the image when arcsinh is turned off."""
-        try:
-            if self.link_chk.isChecked():
-                # Linked mode - use global range across all images
-                channel = self.scaling_channel_combo.currentText()
-                if not channel or not self.selected_acquisitions:
-                    return
-                
-                # Get all images for this channel (without arcsinh transformation)
-                imgs = []
-                for aq in self.selected_acquisitions:
-                    loader = self._get_loader_for_acquisition(aq)
-                    original_acq_id = self._get_original_acq_id(aq)
-                    if loader is not None:
-                        imgs.append(loader.get_image(original_acq_id, channel))
-                vmin = float(min(np.min(im) for im in imgs))
-                vmax = float(max(np.max(im) for im in imgs))
-                
-                # Update spinboxes
-                self.min_spinbox.blockSignals(True)
-                self.max_spinbox.blockSignals(True)
-                self.min_spinbox.setValue(vmin)
-                self.max_spinbox.setValue(vmax)
-                self.min_spinbox.blockSignals(False)
-                self.max_spinbox.blockSignals(False)
-                
-            else:
-                # Unlinked mode - use range for currently selected image
-                current_acq_id = self.image_combo.currentData()
-                channel = self.scaling_channel_combo.currentText()
-                if not current_acq_id or not channel:
-                    return
-                
-                # Get image for this acquisition and channel (without arcsinh transformation)
-                loader = self._get_loader_for_acquisition(current_acq_id)
-                original_acq_id = self._get_original_acq_id(current_acq_id)
-                if loader is None:
-                    return
-                img = loader.get_image(original_acq_id, channel)
-                vmin = float(np.min(img))
-                vmax = float(np.max(img))
-                
-                # Update spinboxes
-                self.min_spinbox.blockSignals(True)
-                self.max_spinbox.blockSignals(True)
-                self.min_spinbox.setValue(vmin)
-                self.max_spinbox.setValue(vmax)
-                self.min_spinbox.blockSignals(False)
-                self.max_spinbox.blockSignals(False)
-                
-        except Exception as e:
-            print(f"Error restoring default range: {e}")
-
-    def _refresh_scaling_channel_options(self):
-        """Populate scaling channel combo with currently selected channels (RGB or single)."""
-        self.scaling_channel_combo.blockSignals(True)
-        self.scaling_channel_combo.clear()
-        channels_for_scaling = []
-        if self.rgb_mode_chk.isChecked():
-            def _checked(lst: QtWidgets.QListWidget):
-                vals = []
-                for i in range(lst.count()):
-                    it = lst.item(i)
-                    if it.checkState() == Qt.Checked:
-                        vals.append(it.text())
-                return vals
-            seen = set()
-            for ch in _checked(self.red_list) + _checked(self.green_list) + _checked(self.blue_list):
-                if ch not in seen:
-                    channels_for_scaling.append(ch)
-                    seen.add(ch)
-        else:
-            if self.channel_combo.currentText():
-                channels_for_scaling = [self.channel_combo.currentText()]
-        self.scaling_channel_combo.addItems(channels_for_scaling)
-        self.scaling_channel_combo.blockSignals(False)
-        
-        # Initialize previous scaling channel if not set
-        if not self.previous_scaling_channel and channels_for_scaling:
-            self.previous_scaling_channel = channels_for_scaling[0]
-
-    def _comparison_auto_range(self):
-        """Set min/max values to the current images' range in comparison mode."""
-        if not self.selected_acquisitions or not self.channel_combo.currentText():
-            return
-        
-        channel = self.channel_combo.currentText()
-        try:
-            # Get all images to determine range
-            images = []
-            for acq_id in self.selected_acquisitions:
-                loader = self._get_loader_for_acquisition(acq_id)
-                original_acq_id = self._get_original_acq_id(acq_id)
-                if loader is not None:
-                    img = loader.get_image(original_acq_id, channel)
-                    images.append(img)
-            
-            if images:
-                # Calculate global range across all images
-                global_min = min(np.min(img) for img in images)
-                global_max = max(np.max(img) for img in images)
-                
-                self.min_spinbox.setValue(float(global_min))
-                self.max_spinbox.setValue(float(global_max))
-        except Exception as e:
-            print(f"Error getting comparison range: {e}")
-
-    def _comparison_auto_contrast(self):
-        """Set scaling to maximize contrast using percentile-based scaling in comparison mode."""
-        if not self.selected_acquisitions or not self.channel_combo.currentText():
-            return
-        
-        channel = self.channel_combo.currentText()
-        
-        if self.link_chk.isChecked():
-            # Linked scaling - use global percentiles across all images
-            try:
-                images = []
-                for acq_id in self.selected_acquisitions:
-                    loader = self._get_loader_for_acquisition(acq_id)
-                    original_acq_id = self._get_original_acq_id(acq_id)
-                    if loader is not None:
-                        img = loader.get_image(original_acq_id, channel)
-                        images.append(img)
-                
-                if images:
-                    all_pixels = np.concatenate([img.flatten() for img in images])
-                    min_val = float(np.percentile(all_pixels, 1))
-                    max_val = float(np.percentile(all_pixels, 99))
-                    
-                    self.min_spinbox.setValue(min_val)
-                    self.max_spinbox.setValue(max_val)
-            except Exception as e:
-                print(f"Error in comparison auto contrast: {e}")
-        else:
-            # Individual scaling - use percentiles for selected image only
-            current_acq_id = self.image_combo.currentData()
-            if not current_acq_id:
-                return
-            
-            try:
-                loader = self._get_loader_for_acquisition(current_acq_id)
-                original_acq_id = self._get_original_acq_id(current_acq_id)
-                if loader is None:
-                    return
-                img = loader.get_image(original_acq_id, channel)
-                min_val = float(np.percentile(img, 1))
-                max_val = float(np.percentile(img, 99))
-                
-                self.min_spinbox.setValue(min_val)
-                self.max_spinbox.setValue(max_val)
-            except Exception as e:
-                print(f"Error in individual auto contrast: {e}")
-
-    def _comparison_default_range(self):
-        """Set scaling to the images' actual min/max range in comparison mode."""
-        if not self.selected_acquisitions or not self.channel_combo.currentText():
-            return
-        
-        channel = self.channel_combo.currentText()
-        
-        if self.link_chk.isChecked():
-            # Linked scaling - use global range across all images
-            try:
-                images = []
-                for acq_id in self.selected_acquisitions:
-                    loader = self._get_loader_for_acquisition(acq_id)
-                    original_acq_id = self._get_original_acq_id(acq_id)
-                    if loader is not None:
-                        img = loader.get_image(original_acq_id, channel)
-                        images.append(img)
-                
-                if images:
-                    global_min = min(np.min(img) for img in images)
-                    global_max = max(np.max(img) for img in images)
-                    
-                    self.min_spinbox.setValue(float(global_min))
-                    self.max_spinbox.setValue(float(global_max))
-            except Exception as e:
-                print(f"Error in comparison default range: {e}")
-        else:
-            # Individual scaling - use range for selected image only
-            current_acq_id = self.image_combo.currentData()
-            if not current_acq_id:
-                return
-            
-            try:
-                loader = self._get_loader_for_acquisition(current_acq_id)
-                original_acq_id = self._get_original_acq_id(current_acq_id)
-                if loader is None:
-                    return
-                img = loader.get_image(original_acq_id, channel)
-                min_val = float(np.min(img))
-                max_val = float(np.max(img))
-                
-                self.min_spinbox.setValue(min_val)
-                self.max_spinbox.setValue(max_val)
-            except Exception as e:
-                print(f"Error in individual default range: {e}")
-
-    def _apply_comparison_scaling(self):
-        """Apply the current scaling settings and refresh display in comparison mode."""
-        if not self.link_chk.isChecked():
-            # For individual scaling, save the scaling for the selected image
-            self._save_image_scaling()
-        else:
-            # For linked scaling, save the current values for the current channel
-            current_channel = self.scaling_channel_combo.currentText()
-            if current_channel:
-                self.channel_linked_scaling[current_channel] = {
-                    'min': self.min_spinbox.value(),
-                    'max': self.max_spinbox.value()
-                }
-        self._update_display()
-
-    def _on_link_contrast_toggled(self):
-        """Handle link contrast checkbox toggle in comparison mode."""
-        # Update custom scaling controls based on link contrast setting
-        if self.link_chk.isChecked():
-            # Link contrast ON - custom scaling controls are enabled
-            self.min_spinbox.setEnabled(True)
-            self.max_spinbox.setEnabled(True)
-            self.default_range_btn.setEnabled(True)
-            self.image_combo.setEnabled(False)  # No image selection needed for linked scaling
-            if hasattr(self, 'image_selection_row'):
-                self.image_selection_row.setVisible(False)
-            # In linked mode, scaling applies per channel globally
-            self.scaling_channel_row.setVisible(True)
-            # Disable arcsinh in linked mode
-            self.arcsinh_chk.setEnabled(False)
-            self.arcsinh_cofactor.setEnabled(False)
-        else:
-            # Link contrast OFF - individual scaling, enable image selection
-            self.min_spinbox.setEnabled(True)
-            self.max_spinbox.setEnabled(True)
-            self.default_range_btn.setEnabled(True)
-            self.image_combo.setEnabled(True)  # Enable image selection for individual scaling
-            self._update_image_combo()
-            if hasattr(self, 'image_selection_row'):
-                self.image_selection_row.setVisible(True)
-            self.scaling_channel_row.setVisible(True)
-            # Re-enable arcsinh in unlinked mode
-            self.arcsinh_chk.setEnabled(True)
-            self.arcsinh_cofactor.setEnabled(True)
-        
-        # Update spinbox for arcsinh if needed
-        self._update_spinbox_for_arcsinh()
-        
-        # Refresh display
-        self._update_display()
-
-    def _update_image_combo(self):
-        """Update the image selection combo box with selected acquisitions."""
-        self.image_combo.clear()
-        if not self.selected_acquisitions or not self.channel_combo.currentText():
-            return
-        
-        channel = self.channel_combo.currentText()
-        for acq_id in self.selected_acquisitions:
-            acq_info = next((ai for ai in self.acqs if ai.id == acq_id), None)
-            if acq_info:
-                # Use same format as main window: well [file_name] or name [file_name]
-                import os
-                file_name = os.path.basename(acq_info.source_file) if hasattr(acq_info, 'source_file') and acq_info.source_file else "Unknown"
-                label = acq_info.well if acq_info.well else acq_info.name
-                label += f" [{file_name}]"
-                self.image_combo.addItem(label, acq_id)
-        
-        # Select first image if available
-        if self.image_combo.count() > 0:
-            self.image_combo.setCurrentIndex(0)
-            self._load_image_scaling()
-
-    def _on_image_selection_changed(self):
-        """Handle changes to the image selection for individual scaling."""
-        if not self.link_chk.isChecked() and self.custom_scaling_chk.isChecked():
-            # Save the current image's scaling before switching
-            self._save_image_scaling()
-            
-            # Load the new image's scaling
-            self._load_image_scaling()
-            
-            # Load the arcsinh state for the new image
-            self._load_image_arcsinh_state()
-            
-            # Update spinbox for arcsinh if needed
-            self._update_spinbox_for_arcsinh()
-            
-            self._update_display()
-
-    def _load_image_scaling(self):
-        """Load scaling values for the currently selected image."""
-        current_acq_id = self.image_combo.currentData()
-        if not current_acq_id or not self.channel_combo.currentText():
-            return
-        
-        # Determine which channel's scaling to load
-        ch = self.scaling_channel_combo.currentText() or self.channel_combo.currentText()
-        per_img = self.channel_per_image_scaling.get(ch, {})
-        if current_acq_id in per_img:
-            # Load saved values
-            min_val = per_img[current_acq_id]['min']
-            max_val = per_img[current_acq_id]['max']
-        else:
-            # Use default range (image's own min/max)
-            try:
-                channel = ch
-                loader = self._get_loader_for_acquisition(current_acq_id)
-                original_acq_id = self._get_original_acq_id(current_acq_id)
-                if loader is None:
-                    return
-                img = loader.get_image(original_acq_id, channel)
-                min_val = float(np.min(img))
-                max_val = float(np.max(img))
-            except Exception as e:
-                print(f"Error loading image scaling: {e}")
-                return
-        
-        # Update spinboxes
-        self.min_spinbox.setValue(min_val)
-        self.max_spinbox.setValue(max_val)
-
-    def _load_image_arcsinh_state(self):
-        """Load arcsinh state for the currently selected image."""
-        current_acq_id = self.image_combo.currentData()
-        if not current_acq_id:
-            return
-        
-        # Load the arcsinh state for this image
-        image_arcsinh = self.image_arcsinh_state.get(current_acq_id, {})
-        is_enabled = image_arcsinh.get('enabled', False)
-        cofactor = image_arcsinh.get('cofactor', self.arcsinh_cofactor.value())
-        
-        # Update the UI to reflect the image's arcsinh state
-        self.arcsinh_chk.setChecked(is_enabled)
-        self.arcsinh_cofactor.setValue(cofactor)
-
-    def _save_image_scaling(self):
-        """Save current scaling values for the selected image."""
-        current_acq_id = self.image_combo.currentData()
-        if not current_acq_id:
-            return
-        
-        min_val = self.min_spinbox.value()
-        max_val = self.max_spinbox.value()
-        ch = self.scaling_channel_combo.currentText() or self.channel_combo.currentText()
-        
-        # Save the current values
-        per_img = self.channel_per_image_scaling.get(ch, {})
-        per_img[current_acq_id] = {'min': min_val, 'max': max_val}
-        self.channel_per_image_scaling[ch] = per_img
-
-    def _start_prefetch_selected(self):
-        """Prefetch all channels for up to the first N selected acquisitions."""
-        if not self.selected_acquisitions:
-            return
-        # Limit to first N acquisitions to manage memory
-        target_acqs = self.selected_acquisitions[: self._prefetch_limit]
-        # Remove cache entries for acquisitions no longer within the limit
-        allowed = set(target_acqs)
-        keys_to_remove = [k for k in self.image_cache.keys() if k[0] not in allowed]
-        for k in keys_to_remove:
-            try:
-                del self.image_cache[k]
-            except Exception:
-                pass
-        # Prefetch per acquisition
-        for acq_id in target_acqs:
-            if acq_id in self._prefetch_inflight:
-                continue
-            try:
-                ai = next((a for a in self.acqs if a.id == acq_id), None)
-                channels = ai.channels if ai else []
-                # Load all channels at once for this acquisition
-                # Get correct loader and original acquisition ID for multiple .mcd files
-                loader = self._get_loader_for_acquisition(acq_id)
-                original_acq_id = self._get_original_acq_id(acq_id)
-                if loader is None:
-                    continue
-                stack = loader.get_all_channels(original_acq_id)
-                for idx, ch_name in enumerate(channels):
-                    try:
-                        self.image_cache[(acq_id, ch_name)] = stack[..., idx]
-                    except Exception:
-                        continue
-                self._manage_cache_size()
-            except Exception as e:
-                print(f"Prefetch error for {acq_id}: {e}")
 
     def _refresh_markers(self):
-        """Legacy method - redirect to _update_channel_combo."""
-        self._update_channel_combo()
+        self._sync_channel_controls()

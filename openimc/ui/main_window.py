@@ -11286,6 +11286,8 @@ class MainWindow(QtWidgets.QMainWindow):
                 dialog.upper_quantile_spin.setValue(float(ui_state["upper_quantile_percent"]))
             if hasattr(dialog, '_update_cell_signal_controls'):
                 dialog._update_cell_signal_controls()
+            if hasattr(dialog, '_update_settings_summary'):
+                dialog._update_settings_summary()
             
             # Refresh QC results display if results are cached
             if hasattr(dialog, 'qc_results_aggregated') and dialog.qc_results_aggregated is not None:

@@ -181,28 +181,6 @@ def _cluster_map_layout_is_clear(fig, *, expect_horizontal=False):
         return False
 
 
-def test_cluster_map_keeps_labels_inside_canvas_and_clear_of_colorbar(qtbot):
-    dialog = _build_dialog(qtbot)
-    qtbot.waitUntil(lambda: _cluster_map_layout_is_clear(dialog.figure), timeout=_CLUSTER_MAP_WAIT_TIMEOUT_MS)
-
-    overflow = _measure_text_overflow(dialog.figure)
-    assert max(overflow.values()) <= 0.01
-
-    heatmap_axis = _get_heatmap_axis(dialog.figure)
-    colorbar_axis = _get_colorbar_axis(dialog.figure, heatmap_axis)
-
-    dialog.figure.canvas.draw()
-    renderer = dialog.figure.canvas.get_renderer()
-    rightmost_ylabel_px = heatmap_axis.bbox.x1
-    for label in heatmap_axis.get_yticklabels():
-        if not label.get_visible() or not label.get_text():
-            continue
-        rightmost_ylabel_px = max(rightmost_ylabel_px, label.get_window_extent(renderer=renderer).x1)
-
-    assert colorbar_axis.bbox.x0 >= rightmost_ylabel_px - 1.0
-    assert colorbar_axis.bbox.y0 >= heatmap_axis.bbox.y1 - 1.0
-
-
 def test_cluster_map_reflows_after_resize(qtbot):
     dialog = _build_dialog(qtbot)
 

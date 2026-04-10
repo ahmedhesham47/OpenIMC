@@ -609,11 +609,18 @@ class AdvancedSpatialAnalysisDialog(QtWidgets.QDialog):
         self.sq_cooccur_plot_type_combo.setToolTip("Curves: Show co-occurrence across all distances. Heatmap: Show co-occurrence matrix at a selected distance.")
         sq_cooccur_plot_layout.addWidget(self.sq_cooccur_plot_type_combo)
         
-        sq_cooccur_plot_layout.addWidget(QtWidgets.QLabel("Distance for heatmap:"))
-        self.sq_cooccur_distance_combo = QtWidgets.QComboBox()
-        self.sq_cooccur_distance_combo.setToolTip("Select a distance from the interval to display in the heatmap.")
-        self.sq_cooccur_distance_combo.setEnabled(False)  # Enabled only when heatmap is selected
-        sq_cooccur_plot_layout.addWidget(self.sq_cooccur_distance_combo)
+        sq_cooccur_plot_layout.addWidget(QtWidgets.QLabel("Distance for heatmap (µm):"))
+        self.sq_cooccur_distance_spin = QtWidgets.QDoubleSpinBox()
+        self.sq_cooccur_distance_spin.setRange(0.0, 100000.0)
+        self.sq_cooccur_distance_spin.setDecimals(3)
+        self.sq_cooccur_distance_spin.setSingleStep(5.0)
+        self.sq_cooccur_distance_spin.setButtonSymbols(QtWidgets.QAbstractSpinBox.NoButtons)
+        self.sq_cooccur_distance_spin.setKeyboardTracking(False)
+        self.sq_cooccur_distance_spin.setToolTip(
+            "Type one of the computed interval distances to display in the heatmap."
+        )
+        self.sq_cooccur_distance_spin.setEnabled(False)  # Enabled only when heatmap is selected
+        sq_cooccur_plot_layout.addWidget(self.sq_cooccur_distance_spin)
         sq_cooccur_plot_layout.addStretch()
         
         sq_cooccur_layout.addLayout(sq_cooccur_params)
@@ -634,10 +641,11 @@ class AdvancedSpatialAnalysisDialog(QtWidgets.QDialog):
         self.sq_cooccur_ref_cluster_combo.currentIndexChanged.connect(self._on_sq_cooccur_ref_cluster_changed)
         self.sq_cooccur_cluster_combo.currentIndexChanged.connect(self._on_sq_cooccur_cluster_column_changed)
         self.sq_cooccur_plot_type_combo.currentTextChanged.connect(self._on_sq_cooccur_plot_type_changed)
-        self.sq_cooccur_distance_combo.currentIndexChanged.connect(self._on_sq_cooccur_distance_changed)
+        self.sq_cooccur_distance_spin.valueChanged.connect(self._on_sq_cooccur_distance_changed)
         
         # Store interval for distance selection
         self.sq_cooccur_interval = None
+        self.sq_cooccur_heatmap_distance = None
     
     def _create_sq_autocorr_tab(self):
         """Create spatial autocorrelation tab."""
@@ -1114,6 +1122,133 @@ class AdvancedSpatialAnalysisDialog(QtWidgets.QDialog):
         if combo is None:
             return None
         return combo.currentData()
+
+    def _normalize_cooccur_distances(
+        self,
+        raw_interval: Any,
+        *,
+        expected_size: Optional[int] = None,
+        fallback: Any = None,
+    ) -> List[float]:
+        """Return co-occurrence distances aligned to the occurrence array depth."""
+
+        def _to_float_list(values: Any) -> List[float]:
+            if values is None:
+                return []
+            try:
+                return [float(value) for value in np.asarray(values, dtype=float).reshape(-1).tolist()]
+            except Exception:
+                return []
+
+        interval_values = _to_float_list(raw_interval)
+        fallback_values = _to_float_list(fallback)
+
+        if not interval_values:
+            interval_values = list(fallback_values)
+
+        if expected_size is None:
+            return interval_values
+
+        if len(interval_values) == expected_size + 1:
+            distances = interval_values[1:]
+        else:
+            distances = interval_values[:expected_size]
+
+        if len(distances) < expected_size and fallback_values:
+            if len(fallback_values) == expected_size + 1:
+                fallback_slice = fallback_values[1:]
+            else:
+                fallback_slice = fallback_values[:expected_size]
+            for value in fallback_slice:
+                if len(distances) >= expected_size:
+                    break
+                if not any(np.isclose(value, existing, rtol=1e-6, atol=1e-6) for existing in distances):
+                    distances.append(value)
+
+        if len(distances) < expected_size:
+            distances.extend(float(idx) for idx in range(len(distances), expected_size))
+
+        return [float(distance) for distance in distances[:expected_size]]
+
+    def _match_cooccur_distance(self, requested_distance: Any, distances: List[float]) -> Optional[float]:
+        """Return the matching available distance, accounting for float roundoff."""
+        if requested_distance is None:
+            return None
+
+        try:
+            requested_value = float(requested_distance)
+        except (TypeError, ValueError):
+            return None
+
+        for distance in distances:
+            if np.isclose(float(distance), requested_value, rtol=1e-6, atol=1e-6):
+                return float(distance)
+        return None
+
+    def _set_sq_cooccur_distance_metadata(self, distances: List[float]) -> None:
+        """Update the heatmap distance input metadata without changing the current value."""
+        cleaned_distances = [float(distance) for distance in distances]
+        self.sq_cooccur_interval = cleaned_distances or None
+
+        if not hasattr(self, 'sq_cooccur_distance_spin'):
+            return
+
+        if len(cleaned_distances) > 1:
+            diffs = sorted(
+                abs(cleaned_distances[idx] - cleaned_distances[idx - 1])
+                for idx in range(1, len(cleaned_distances))
+                if not np.isclose(cleaned_distances[idx], cleaned_distances[idx - 1], rtol=1e-6, atol=1e-6)
+            )
+            if diffs:
+                self.sq_cooccur_distance_spin.setSingleStep(float(diffs[0]))
+
+        if cleaned_distances:
+            available_text = ", ".join(f"{distance:g}" for distance in cleaned_distances)
+            self.sq_cooccur_distance_spin.setToolTip(
+                "Type one of the computed interval distances to display in the heatmap. "
+                f"Available: {available_text} µm."
+            )
+        else:
+            self.sq_cooccur_distance_spin.setToolTip(
+                "Run co-occurrence analysis first to populate valid heatmap distances."
+            )
+
+    def _sync_sq_cooccur_distance_input(
+        self,
+        distances: List[float],
+        *,
+        preferred_distance: Optional[float] = None,
+    ) -> None:
+        """Sync the heatmap distance input to the available co-occurrence distances."""
+        cleaned_distances = [float(distance) for distance in distances]
+        self._set_sq_cooccur_distance_metadata(cleaned_distances)
+
+        if not cleaned_distances or not hasattr(self, 'sq_cooccur_distance_spin'):
+            return
+
+        selected_distance = self._match_cooccur_distance(preferred_distance, cleaned_distances)
+        if selected_distance is None:
+            selected_distance = self._match_cooccur_distance(self.sq_cooccur_heatmap_distance, cleaned_distances)
+        if selected_distance is None:
+            selected_distance = self._match_cooccur_distance(self.sq_cooccur_distance_spin.value(), cleaned_distances)
+        if selected_distance is None:
+            selected_distance = cleaned_distances[0]
+
+        blocker = QtCore.QSignalBlocker(self.sq_cooccur_distance_spin)
+        self.sq_cooccur_distance_spin.setValue(selected_distance)
+        del blocker
+        self.sq_cooccur_heatmap_distance = selected_distance
+
+    def _get_sq_cooccur_plot_adata(self) -> Optional[Any]:
+        """Return the co-occurrence AnnData to plot for the current ROI selection."""
+        roi_id = self._get_selected_roi(self.sq_cooccur_roi_combo)
+        if roi_id is not None:
+            return self.anndata_cache.get(roi_id)
+
+        for adata in self.anndata_cache.values():
+            if self._find_uns_key(adata, ['co_occurrence'], contains=['co', 'occur']) is not None:
+                return adata
+        return None
     
     def _on_sq_nhood_roi_changed(self):
         """Handle ROI change in neighborhood enrichment tab."""
@@ -1163,93 +1298,67 @@ class AdvancedSpatialAnalysisDialog(QtWidgets.QDialog):
     
     def _on_sq_cooccur_roi_changed(self):
         """Handle ROI change in co-occurrence tab."""
-        roi_id = self._get_selected_roi(self.sq_cooccur_roi_combo)
-        if roi_id and roi_id in self.anndata_cache:
-            adata = self.anndata_cache[roi_id]
-            # Update reference cluster combo (even if no co-occurrence data yet)
-            self._update_cooccur_ref_cluster_combo(adata)
-            # Check for co-occurrence data with alternative key names
-            has_cooccur = False
-            for key in adata.uns.keys():
-                if 'co' in key.lower() and 'occur' in key.lower():
-                    has_cooccur = True
-                    break
-            if has_cooccur:
-                self._plot_sq_cooccurrence(adata)
-                self.sq_cooccur_save_btn.setEnabled(True)
-        elif roi_id is None:
-            # "All ROIs" selected - try to populate from first available ROI
-            if self.anndata_cache:
-                first_adata = list(self.anndata_cache.values())[0]
-                self._update_cooccur_ref_cluster_combo(first_adata)
+        adata = self._get_sq_cooccur_plot_adata()
+        if adata is None:
+            return
+
+        # Update reference cluster combo (even if no co-occurrence data yet)
+        self._update_cooccur_ref_cluster_combo(adata)
+
+        has_cooccur = self._find_uns_key(adata, ['co_occurrence'], contains=['co', 'occur']) is not None
+        if has_cooccur:
+            self._plot_sq_cooccurrence(adata)
+            self.sq_cooccur_save_btn.setEnabled(True)
     
     def _on_sq_cooccur_ref_cluster_changed(self):
         """Handle reference cluster change in co-occurrence tab."""
-        roi_id = self._get_selected_roi(self.sq_cooccur_roi_combo)
-        if roi_id and roi_id in self.anndata_cache:
-            adata = self.anndata_cache[roi_id]
-            # Check for co-occurrence data with alternative key names
-            has_cooccur = False
-            for key in adata.uns.keys():
-                if 'co' in key.lower() and 'occur' in key.lower():
-                    has_cooccur = True
-                    break
-            if has_cooccur:
-                self._plot_sq_cooccurrence(adata)
-                self.sq_cooccur_save_btn.setEnabled(True)
-    
+        adata = self._get_sq_cooccur_plot_adata()
+        if adata is None:
+            return
+
+        has_cooccur = self._find_uns_key(adata, ['co_occurrence'], contains=['co', 'occur']) is not None
+        if has_cooccur:
+            self._plot_sq_cooccurrence(adata)
+            self.sq_cooccur_save_btn.setEnabled(True)
+
     def _on_sq_cooccur_cluster_column_changed(self):
         """Handle cluster column change in co-occurrence tab."""
-        roi_id = self._get_selected_roi(self.sq_cooccur_roi_combo)
-        if roi_id and roi_id in self.anndata_cache:
-            adata = self.anndata_cache[roi_id]
-            # Update reference cluster combo
-            self._update_cooccur_ref_cluster_combo(adata)
-            # Check for co-occurrence data with alternative key names
-            has_cooccur = False
-            for key in adata.uns.keys():
-                if 'co' in key.lower() and 'occur' in key.lower():
-                    has_cooccur = True
-                    break
-            if has_cooccur:
-                self._plot_sq_cooccurrence(adata)
-                self.sq_cooccur_save_btn.setEnabled(True)
-    
+        adata = self._get_sq_cooccur_plot_adata()
+        if adata is None:
+            return
+
+        self._update_cooccur_ref_cluster_combo(adata)
+        has_cooccur = self._find_uns_key(adata, ['co_occurrence'], contains=['co', 'occur']) is not None
+        if has_cooccur:
+            self._plot_sq_cooccurrence(adata)
+            self.sq_cooccur_save_btn.setEnabled(True)
+
     def _on_sq_cooccur_plot_type_changed(self):
         """Handle plot type change in co-occurrence tab."""
         plot_type = self.sq_cooccur_plot_type_combo.currentText()
-        # Enable/disable distance combo based on plot type
-        self.sq_cooccur_distance_combo.setEnabled(plot_type == "Heatmap")
+        # Enable/disable distance input based on plot type
+        self.sq_cooccur_distance_spin.setEnabled(plot_type == "Heatmap")
         
-        # Replot if data is available
-        roi_id = self._get_selected_roi(self.sq_cooccur_roi_combo)
-        if roi_id and roi_id in self.anndata_cache:
-            adata = self.anndata_cache[roi_id]
-            # Check for co-occurrence data
-            has_cooccur = False
-            for key in adata.uns.keys():
-                if 'co' in key.lower() and 'occur' in key.lower():
-                    has_cooccur = True
-                    break
-            if has_cooccur:
-                self._plot_sq_cooccurrence(adata)
-    
-    def _on_sq_cooccur_distance_changed(self):
+        adata = self._get_sq_cooccur_plot_adata()
+        if adata is None:
+            return
+
+        has_cooccur = self._find_uns_key(adata, ['co_occurrence'], contains=['co', 'occur']) is not None
+        if has_cooccur:
+            self._plot_sq_cooccurrence(adata)
+
+    def _on_sq_cooccur_distance_changed(self, *_args):
         """Handle distance selection change for heatmap in co-occurrence tab."""
         # Replot if heatmap is selected and data is available
         plot_type = self.sq_cooccur_plot_type_combo.currentText()
         if plot_type == "Heatmap":
-            roi_id = self._get_selected_roi(self.sq_cooccur_roi_combo)
-            if roi_id and roi_id in self.anndata_cache:
-                adata = self.anndata_cache[roi_id]
-                # Check for co-occurrence data
-                has_cooccur = False
-                for key in adata.uns.keys():
-                    if 'co' in key.lower() and 'occur' in key.lower():
-                        has_cooccur = True
-                        break
-                if has_cooccur:
-                    self._plot_sq_cooccurrence(adata)
+            adata = self._get_sq_cooccur_plot_adata()
+            if adata is None:
+                return
+
+            has_cooccur = self._find_uns_key(adata, ['co_occurrence'], contains=['co', 'occur']) is not None
+            if has_cooccur:
+                self._plot_sq_cooccurrence(adata)
     
     def _on_sq_nhood_cluster_changed(self):
         """Handle cluster column change in neighborhood enrichment tab."""
@@ -2036,13 +2145,10 @@ class AdvancedSpatialAnalysisDialog(QtWidgets.QDialog):
                 return
             
             
-            # Store interval for distance selection
-            self.sq_cooccur_interval = nhood_sizes
-            
-            # Update distance combo
-            self.sq_cooccur_distance_combo.clear()
-            for dist in nhood_sizes:
-                self.sq_cooccur_distance_combo.addItem(f"{dist} µm", dist)
+            self._sync_sq_cooccur_distance_input(
+                nhood_sizes,
+                preferred_distance=self.sq_cooccur_heatmap_distance,
+            )
             
             # Check if cluster column exists
             filtered_df = self._get_filtered_dataframe()
@@ -2170,164 +2276,153 @@ class AdvancedSpatialAnalysisDialog(QtWidgets.QDialog):
             categories = []
         
         
+        occ_array = None
+        if isinstance(cooccur_data, dict) and 'occ' in cooccur_data:
+            try:
+                occ_array = np.asarray(cooccur_data['occ'], dtype=float)
+            except Exception:
+                occ_array = None
+
+        available_distances = self._normalize_cooccur_distances(
+            cooccur_data.get('interval', cooccur_data.get('distances')) if isinstance(cooccur_data, dict) else None,
+            expected_size=occ_array.shape[2] if occ_array is not None and occ_array.ndim == 3 else None,
+            fallback=self.sq_cooccur_interval,
+        )
+        had_distance_metadata = self.sq_cooccur_interval is not None
+        self._set_sq_cooccur_distance_metadata(available_distances)
+
+        current_distance_value = self.sq_cooccur_distance_spin.value() if hasattr(self, 'sq_cooccur_distance_spin') else None
+        current_distance_valid = self._match_cooccur_distance(current_distance_value, available_distances) is not None
+        stored_distance_valid = self._match_cooccur_distance(self.sq_cooccur_heatmap_distance, available_distances) is not None
+        if available_distances and (not had_distance_metadata or (not current_distance_valid and not stored_distance_valid)):
+            self._sync_sq_cooccur_distance_input(available_distances)
+
         # Handle heatmap plotting
         if plot_type == "Heatmap":
-            # Try to populate distance combo if empty but interval data is available
-            if self.sq_cooccur_distance_combo.count() == 0:
-                interval_to_populate = self.sq_cooccur_interval
-                if interval_to_populate is None and isinstance(cooccur_data, dict):
-                    if 'interval' in cooccur_data:
-                        interval_to_populate = cooccur_data['interval']
-                    elif 'distances' in cooccur_data:
-                        interval_to_populate = cooccur_data['distances']
-                
-                if interval_to_populate is not None:
-                    # Convert to list if needed
-                    if isinstance(interval_to_populate, np.ndarray):
-                        interval_to_populate = interval_to_populate.tolist()
-                    # Populate combo
-                    self.sq_cooccur_distance_combo.clear()
-                    for dist in interval_to_populate:
-                        self.sq_cooccur_distance_combo.addItem(f"{dist} µm", dist)
-                    # Store for future use
-                    if self.sq_cooccur_interval is None:
-                        self.sq_cooccur_interval = interval_to_populate
-                else:
-                    ax = self.sq_cooccur_canvas.figure.add_subplot(111)
-                    ax.text(0.5, 0.5, 'No distances available.\nPlease run co-occurrence analysis first.', 
-                           ha='center', va='center', transform=ax.transAxes)
-                    self.sq_cooccur_canvas.draw()
-                    return
-            
-            selected_distance = self.sq_cooccur_distance_combo.currentData()
+            if not available_distances:
+                ax = self.sq_cooccur_canvas.figure.add_subplot(111)
+                ax.text(0.5, 0.5, 'No distances available.\nPlease run co-occurrence analysis first.', 
+                       ha='center', va='center', transform=ax.transAxes)
+                self.sq_cooccur_canvas.draw()
+                return
+
+            selected_distance = self._match_cooccur_distance(
+                self.sq_cooccur_distance_spin.value(),
+                available_distances,
+            )
             if selected_distance is None:
+                requested_distance = self.sq_cooccur_distance_spin.value()
+                available_text = ", ".join(f"{distance:g}" for distance in available_distances)
+                self.sq_cooccur_canvas.figure.clear()
                 ax = self.sq_cooccur_canvas.figure.add_subplot(111)
-                ax.text(0.5, 0.5, 'Please select a distance for the heatmap.', 
+                ax.text(
+                    0.5,
+                    0.5,
+                    f"Distance {requested_distance:g} µm is not available.\nAvailable distances: {available_text} µm.",
+                    ha='center',
+                    va='center',
+                    transform=ax.transAxes,
+                )
+                self.sq_cooccur_canvas.draw()
+                return
+
+            if occ_array is None or occ_array.ndim != 3:
+                ax = self.sq_cooccur_canvas.figure.add_subplot(111)
+                ax.text(0.5, 0.5, 'Co-occurrence data format not suitable for heatmap.\nExpected 3D array.', 
                        ha='center', va='center', transform=ax.transAxes)
                 self.sq_cooccur_canvas.draw()
                 return
-            
-            # Find the index of the selected distance
-            # Try to get interval from stored value or extract from data
-            interval_to_use = self.sq_cooccur_interval
-            if interval_to_use is None and isinstance(cooccur_data, dict):
-                if 'interval' in cooccur_data:
-                    interval_to_use = cooccur_data['interval']
-                elif 'distances' in cooccur_data:
-                    interval_to_use = cooccur_data['distances']
-            
-            if interval_to_use is None:
-                ax = self.sq_cooccur_canvas.figure.add_subplot(111)
-                ax.text(0.5, 0.5, 'Interval data not available.\nPlease run co-occurrence analysis first.', 
-                       ha='center', va='center', transform=ax.transAxes)
-                self.sq_cooccur_canvas.draw()
-                return
-            
-            # Convert to list if it's a numpy array
-            if isinstance(interval_to_use, np.ndarray):
-                interval_to_use = interval_to_use.tolist()
-            
-            try:
-                distance_idx = interval_to_use.index(selected_distance)
-            except ValueError:
-                ax = self.sq_cooccur_canvas.figure.add_subplot(111)
-                ax.text(0.5, 0.5, f'Distance {selected_distance} not found in interval.', 
-                       ha='center', va='center', transform=ax.transAxes)
-                self.sq_cooccur_canvas.draw()
-                return
-            
-            # Extract heatmap data
-            if isinstance(cooccur_data, dict) and 'occ' in cooccur_data:
-                occ_array = cooccur_data['occ']
-                if occ_array.ndim == 3:
-                    # Extract 2D slice at the selected distance
-                    heatmap_data = occ_array[:, :, distance_idx]
-                    self.sq_cooccur_canvas.figure.clear()
-                    ax = self.sq_cooccur_canvas.figure.add_subplot(111)
-                    
-                    # Create DataFrame for better visualization
-                    if len(categories) == heatmap_data.shape[0] == heatmap_data.shape[1]:
-                        cluster_labels = [self._get_cluster_display_name(c) for c in categories]
-                        df = pd.DataFrame(heatmap_data, index=cluster_labels, columns=cluster_labels)
-                    else:
-                        df = pd.DataFrame(heatmap_data)
-                    style = dense_heatmap_style(
-                        n_rows=df.shape[0],
-                        n_cols=df.shape[1],
-                        row_labels=df.index.astype(str).tolist(),
-                        col_labels=df.columns.astype(str).tolist(),
-                        base_tick_fontsize=9.5,
-                        base_annotation_fontsize=8.5,
-                        allow_annotations=True,
-                    )
-                    annot_data = np.round(df.to_numpy(), 3) if style['show_annotations'] else False
 
-                    sns.heatmap(
-                        df,
-                        annot=annot_data,
-                        fmt='.3f',
-                        cmap='YlOrRd',
-                        square=style['square_cells'],
-                        linewidths=style['linewidths'],
-                        cbar_kws={
-                            'label': 'Co-occurrence Score',
-                            'shrink': style['colorbar_shrink'],
-                            'fraction': style['colorbar_fraction'],
-                            'pad': style['colorbar_pad'],
-                        },
-                        ax=ax,
-                        annot_kws={
-                            'size': style['annotation_fontsize'],
-                            'weight': 'normal',
-                            'color': 'black',
-                        },
-                        xticklabels=True,
-                        yticklabels=True,
-                    )
+            self.sq_cooccur_heatmap_distance = selected_distance
+            if not np.isclose(self.sq_cooccur_distance_spin.value(), selected_distance, rtol=1e-6, atol=1e-6):
+                blocker = QtCore.QSignalBlocker(self.sq_cooccur_distance_spin)
+                self.sq_cooccur_distance_spin.setValue(selected_distance)
+                del blocker
 
-                    ax.set_xticklabels(
-                        ax.get_xticklabels(),
-                        rotation=style['x_rotation'],
-                        ha='right',
-                        fontsize=style['tick_fontsize'],
-                    )
-                    ax.set_yticklabels(ax.get_yticklabels(), rotation=0, fontsize=style['tick_fontsize'])
+            distance_idx = next(
+                idx for idx, distance in enumerate(available_distances)
+                if np.isclose(distance, selected_distance, rtol=1e-6, atol=1e-6)
+            )
 
-                    ax.set_xlabel('To Phenotype', fontsize=style['axis_fontsize'], fontweight='bold')
-                    ax.set_ylabel('From Phenotype', fontsize=style['axis_fontsize'], fontweight='bold')
-                    ax.set_title(
-                        f'Co-occurrence Analysis at {selected_distance} µm',
-                        fontsize=style['title_fontsize'],
-                        fontweight='bold',
-                        pad=12,
-                    )
-                    ax.tick_params(axis='both', labelsize=style['tick_fontsize'])
-
-                    colorbar = ax.collections[0].colorbar if ax.collections else None
-                    if colorbar is not None:
-                        colorbar.ax.tick_params(labelsize=style['colorbar_fontsize'])
-                        colorbar.set_label('Co-occurrence Score', fontsize=style['axis_fontsize'])
-
-                    self._fit_canvas(self.sq_cooccur_canvas, pad=0.95)
-                    return
-                else:
-                    ax = self.sq_cooccur_canvas.figure.add_subplot(111)
-                    ax.text(0.5, 0.5, 'Co-occurrence data format not suitable for heatmap.\nExpected 3D array.', 
-                           ha='center', va='center', transform=ax.transAxes)
-                    self.sq_cooccur_canvas.draw()
-                    return
+            heatmap_data = occ_array[:, :, distance_idx]
+            self.sq_cooccur_canvas.figure.clear()
+            ax = self.sq_cooccur_canvas.figure.add_subplot(111)
+            
+            # Create DataFrame for better visualization
+            if len(categories) == heatmap_data.shape[0] == heatmap_data.shape[1]:
+                cluster_labels = [self._get_cluster_display_name(c) for c in categories]
+                df = pd.DataFrame(heatmap_data, index=cluster_labels, columns=cluster_labels)
             else:
-                ax = self.sq_cooccur_canvas.figure.add_subplot(111)
-                ax.text(0.5, 0.5, 'Co-occurrence data format not recognized for heatmap.', 
-                       ha='center', va='center', transform=ax.transAxes)
-                self.sq_cooccur_canvas.draw()
-                return
+                df = pd.DataFrame(heatmap_data)
+            style = dense_heatmap_style(
+                n_rows=df.shape[0],
+                n_cols=df.shape[1],
+                row_labels=df.index.astype(str).tolist(),
+                col_labels=df.columns.astype(str).tolist(),
+                base_tick_fontsize=9.5,
+                base_annotation_fontsize=8.5,
+                allow_annotations=True,
+            )
+            annot_data = np.round(df.to_numpy(), 3) if style['show_annotations'] else False
+
+            sns.heatmap(
+                df,
+                annot=annot_data,
+                fmt='.3f',
+                cmap='YlOrRd',
+                square=style['square_cells'],
+                linewidths=style['linewidths'],
+                cbar_kws={
+                    'label': 'Co-occurrence Score',
+                    'shrink': style['colorbar_shrink'],
+                    'fraction': style['colorbar_fraction'],
+                    'pad': style['colorbar_pad'],
+                },
+                ax=ax,
+                annot_kws={
+                    'size': style['annotation_fontsize'],
+                    'weight': 'normal',
+                    'color': 'black',
+                },
+                xticklabels=True,
+                yticklabels=True,
+            )
+
+            ax.set_xticklabels(
+                ax.get_xticklabels(),
+                rotation=style['x_rotation'],
+                ha='right',
+                fontsize=style['tick_fontsize'],
+            )
+            ax.set_yticklabels(ax.get_yticklabels(), rotation=0, fontsize=style['tick_fontsize'])
+
+            ax.set_xlabel('To Phenotype', fontsize=style['axis_fontsize'], fontweight='bold')
+            ax.set_ylabel('From Phenotype', fontsize=style['axis_fontsize'], fontweight='bold')
+            ax.set_title(
+                f'Co-occurrence Analysis at {selected_distance:g} µm',
+                fontsize=style['title_fontsize'],
+                fontweight='bold',
+                pad=12,
+            )
+            ax.tick_params(axis='both', labelsize=style['tick_fontsize'])
+
+            colorbar = ax.collections[0].colorbar if ax.collections else None
+            if colorbar is not None:
+                colorbar.ax.tick_params(labelsize=style['colorbar_fontsize'])
+                colorbar.set_label('Co-occurrence Score', fontsize=style['axis_fontsize'])
+
+            self._fit_canvas(self.sq_cooccur_canvas, pad=0.95)
+            return
         
         # Plot using squidpy's exact approach
         # Based on sq.pl.co_occurrence source code
         occurrence_data = cooccur_data
         out = occurrence_data["occ"]
-        interval = occurrence_data["interval"][1:]  # Skip first value like squidpy does
+        interval = self._normalize_cooccur_distances(
+            occurrence_data.get("interval", occurrence_data.get("distances")),
+            expected_size=out.shape[2] if len(out.shape) >= 3 else None,
+            fallback=self.sq_cooccur_interval,
+        )
         
         # IMPORTANT: The 'out' array shape is determined by the categories used when
         # co-occurrence was computed. We need to use those categories, not necessarily
@@ -3601,17 +3696,11 @@ class AdvancedSpatialAnalysisDialog(QtWidgets.QDialog):
         if occ.ndim != 3:
             return pd.DataFrame()
 
-        raw_interval = cooccur_data.get('interval', cooccur_data.get('distances'))
-        if raw_interval is None:
-            distances = list(range(occ.shape[2]))
-        else:
-            interval_values = np.asarray(raw_interval, dtype=float).reshape(-1).tolist()
-            if len(interval_values) == occ.shape[2] + 1:
-                distances = interval_values[1:]
-            else:
-                distances = interval_values[:occ.shape[2]]
-        if len(distances) < occ.shape[2]:
-            distances.extend(float(idx) for idx in range(len(distances), occ.shape[2]))
+        distances = self._normalize_cooccur_distances(
+            cooccur_data.get('interval', cooccur_data.get('distances')),
+            expected_size=occ.shape[2],
+            fallback=self.sq_cooccur_interval,
+        )
 
         categories = self._get_obs_categories(adata, cluster_key, expected_size=occ.shape[0])
 
