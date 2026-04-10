@@ -114,3 +114,25 @@ def test_apply_harmony_correction_rejects_unexpected_shape(monkeypatch, sample_b
             max_iter=3,
             pca_variance=0.95,
         )
+
+
+@pytest.mark.unit
+def test_apply_harmony_correction_defers_import_until_use(monkeypatch, sample_batch_df):
+    """Harmony import errors should surface only when Harmony correction is requested."""
+    monkeypatch.setattr(bc, "run_harmony", None, raising=False)
+    monkeypatch.setattr(bc, "_HAVE_HARMONY", True)
+    monkeypatch.setattr(
+        bc,
+        "_get_run_harmony",
+        lambda: (_ for _ in ()).throw(ImportError("torch DLL failed")),
+    )
+
+    with pytest.raises(ImportError, match="torch DLL failed"):
+        bc.apply_harmony_correction(
+            data=sample_batch_df,
+            batch_var="source_file",
+            features=["CD3_mean", "CD4_mean", "area_um2"],
+            n_clusters=5,
+            max_iter=3,
+            pca_variance=0.95,
+        )

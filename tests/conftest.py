@@ -20,11 +20,25 @@
 """
 Pytest configuration and shared fixtures for OpenIMC tests.
 """
+import os
+import sys
 import numpy as np
 import pytest
 from pathlib import Path
 import tempfile
 import shutil
+
+
+# Ensure pytest-qt can create a QApplication in headless Linux sessions.
+# macOS CI has a native Qt backend available and should not be forced into
+# offscreen mode here.
+if (
+    sys.platform.startswith("linux")
+    and not os.environ.get("QT_QPA_PLATFORM")
+    and not (os.environ.get("DISPLAY") or os.environ.get("WAYLAND_DISPLAY"))
+):
+    os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
+    os.environ.setdefault("QT_QUICK_BACKEND", "software")
 
 
 @pytest.fixture
@@ -246,4 +260,3 @@ def get_test_data_path(test_data_dir):
         f"No test data found in {test_data_dir}. "
         f"Expected either .mcd/.mcdx file or OME-TIFF files (.ome.tif, .ome.tiff, .tif, .tiff)"
     )
-

@@ -3431,6 +3431,8 @@ class CellClusteringDialog(QtWidgets.QDialog):
         cluster_strip = np.array([cluster_color_map.get(cid, (0.7, 0.7, 0.7)) for cid in cluster_order])
 
         layout_margin_adjust = {'left': 0.0, 'right': 0.0, 'bottom': 0.0, 'top': 0.0}
+        label_spacer_extra_in = 0.0
+        top_band_extra_in = 0.0
         max_layout_passes = 4
 
         for layout_pass in range(max_layout_passes):
@@ -3451,7 +3453,7 @@ class CellClusteringDialog(QtWidgets.QDialog):
             row_sizes = []
             if top_dendro_visible:
                 row_keys.append('top_dendrogram')
-                row_sizes.append(top_dendro_in)
+                row_sizes.append(top_dendro_in + top_band_extra_in)
             if is_landscape:
                 row_keys.append('cluster_strip')
                 row_sizes.append(strip_in)
@@ -3472,7 +3474,7 @@ class CellClusteringDialog(QtWidgets.QDialog):
             col_keys.append('heatmap')
             col_sizes.append(heatmap_width_in)
             col_keys.append('label_spacer')
-            col_sizes.append(label_spacer_in)
+            col_sizes.append(label_spacer_in + label_spacer_extra_in)
             if reserve_right_cbar_slot:
                 col_keys.append('cbar_slot_right')
                 col_sizes.append(cbar_slot_in)
@@ -3841,6 +3843,40 @@ class CellClusteringDialog(QtWidgets.QDialog):
             # First pass: measure real text extents, then reserve just enough margin so
             # the live GUI view keeps labels inside the window without hurting export.
             if layout_pass + 1 < max_layout_passes:
+                collision_needs_retry = False
+                try:
+                    self.figure.canvas.draw()
+                    renderer = self.figure.canvas.get_renderer()
+                    rightmost_ylabel_px = ax_heatmap.bbox.x1
+                    for lbl in ax_heatmap.get_yticklabels():
+                        if not lbl.get_visible() or not lbl.get_text():
+                            continue
+                        rightmost_ylabel_px = max(rightmost_ylabel_px, lbl.get_window_extent(renderer=renderer).x1)
+
+                    cbar_bbox = ax_cbar.bbox
+                    min_gap_px = 2.0
+                    horizontal_shortfall_px = max(0.0, (rightmost_ylabel_px + min_gap_px) - cbar_bbox.x0)
+                    vertical_shortfall_px = max(0.0, (ax_heatmap.bbox.y1 + min_gap_px) - cbar_bbox.y0)
+
+                    if horizontal_shortfall_px > 0.0:
+                        label_spacer_extra_in = min(
+                            3.0,
+                            label_spacer_extra_in + (horizontal_shortfall_px / max(dpi, 1.0)) + 0.05,
+                        )
+                        collision_needs_retry = True
+
+                    if cbar_position in {'Upper right', 'Upper left'} and vertical_shortfall_px > 0.0:
+                        top_band_extra_in = min(
+                            1.5,
+                            top_band_extra_in + (vertical_shortfall_px / max(dpi, 1.0)) + 0.04,
+                        )
+                        collision_needs_retry = True
+                except Exception:
+                    pass
+
+                if collision_needs_retry:
+                    continue
+
                 overflow = self._measure_figure_text_overflow()
                 max_overflow = max(overflow.values())
                 if max_overflow > 0.0035:

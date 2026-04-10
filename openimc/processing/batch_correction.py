@@ -23,7 +23,8 @@ Batch Correction Processing Functions
 This module provides batch correction implementations using Combat and Harmony.
 """
 
-from typing import Optional, List, Dict
+from typing import Optional, List, Dict, Callable
+import importlib.util
 import pandas as pd
 import numpy as np
 
@@ -34,11 +35,9 @@ try:
 except ImportError:
     _HAVE_COMBAT = False
 
-try:
-    from harmonypy import run_harmony
-    _HAVE_HARMONY = True
-except ImportError:
-    _HAVE_HARMONY = False
+_HAVE_HARMONY = importlib.util.find_spec("harmonypy") is not None
+run_harmony: Optional[Callable] = None
+_HARMONY_IMPORT_ERROR: Optional[BaseException] = None
 
 try:
     import bbknn
@@ -63,6 +62,35 @@ NON_FEATURE_METADATA_COLUMNS = {
     'well', 'cluster', 'source_file', 'source_well', 'source_file_acquisition_id',
     'batch_group'
 }
+
+
+def _get_run_harmony() -> Callable:
+    """Return harmonypy.run_harmony, importing it only when needed."""
+    global run_harmony, _HAVE_HARMONY, _HARMONY_IMPORT_ERROR
+
+    if callable(run_harmony):
+        return run_harmony
+
+    if not _HAVE_HARMONY:
+        if _HARMONY_IMPORT_ERROR is not None:
+            raise ImportError(
+                "Harmony is not installed or could not be imported. "
+                "Install with: pip install harmonypy"
+            ) from _HARMONY_IMPORT_ERROR
+        raise ImportError("Harmony is not installed. Install with: pip install harmonypy")
+
+    try:
+        from harmonypy import run_harmony as harmony_runner
+    except Exception as exc:
+        _HARMONY_IMPORT_ERROR = exc
+        _HAVE_HARMONY = False
+        raise ImportError(
+            "Harmony is not installed or could not be imported. "
+            "Install with: pip install harmonypy"
+        ) from exc
+
+    run_harmony = harmony_runner
+    return harmony_runner
 
 
 def get_feature_columns_from_dataframe(
@@ -383,8 +411,7 @@ def apply_harmony_correction(
     pd.DataFrame
         Dataframe with corrected features
     """
-    if not _HAVE_HARMONY:
-        raise ImportError("Harmony is not installed. Install with: pip install harmonypy")
+    harmony_runner = _get_run_harmony()
     
     # Import sklearn for PCA
     from sklearn.decomposition import PCA
@@ -420,7 +447,7 @@ def apply_harmony_correction(
         meta_data = pd.DataFrame({batch_var: data[batch_var].astype(str)})
         
         # Apply Harmony correction in PCA space
-        harmony_result = run_harmony(
+        harmony_result = harmony_runner(
             pca_data,
             meta_data,
             vars_use=[batch_var],

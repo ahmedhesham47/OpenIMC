@@ -7,6 +7,12 @@ on:
 jobs:
   test:
     runs-on: ${{ matrix.os }}
+    env:
+      OPENIMC_DISABLE_GPU: "1"
+      OPENIMC_DISABLE_LLM: "1"
+      OPENIMC_DISABLE_ILASTIK: "1"
+      CUDA_VISIBLE_DEVICES: ""
+      TORCH_USE_CUDA_DSA: "0"
     strategy:
       fail-fast: false
       matrix:
@@ -17,39 +23,22 @@ jobs:
       - uses: actions/setup-python@v5
         with:
           python-version: ${{ matrix.python-version }}
+      - name: Configure headless Qt on Linux
+        if: runner.os == 'Linux'
+        run: |
+          echo "QT_QPA_PLATFORM=offscreen" >> "$GITHUB_ENV"
+          echo "QT_QUICK_BACKEND=software" >> "$GITHUB_ENV"
       - name: Install dependencies
-        env:
-          CUDA_VISIBLE_DEVICES: ""
-          TORCH_USE_CUDA_DSA: "0"
         run: |
           python -m pip install --upgrade pip
           pip install -r requirements.txt
           pip install pytest
       - name: Run fast tests
-        env:
-          OPENIMC_DISABLE_GPU: "1"
-          OPENIMC_DISABLE_LLM: "1"
-          OPENIMC_DISABLE_ILASTIK: "1"
-          CUDA_VISIBLE_DEVICES: ""
-          TORCH_USE_CUDA_DSA: "0"
         run: |
           pytest -m "not slow"
       - name: Run integration tests
-        env:
-          OPENIMC_DISABLE_GPU: "1"
-          OPENIMC_DISABLE_LLM: "1"
-          OPENIMC_DISABLE_ILASTIK: "1"
-          CUDA_VISIBLE_DEVICES: ""
-          TORCH_USE_CUDA_DSA: "0"
         run: |
           pytest -m "integration"
       - name: Run regression tests
-        env:
-          OPENIMC_DISABLE_GPU: "1"
-          OPENIMC_DISABLE_LLM: "1"
-          OPENIMC_DISABLE_ILASTIK: "1"
-          CUDA_VISIBLE_DEVICES: ""
-          TORCH_USE_CUDA_DSA: "0"
         run: |
           pytest -m "regression"
-
