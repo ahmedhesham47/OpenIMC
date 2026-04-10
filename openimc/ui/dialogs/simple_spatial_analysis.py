@@ -71,7 +71,8 @@ from openimc.ui.dialogs.spatial_analysis import (
     _HAVE_SPARSE,
     _HAVE_IGRAPH,
     _HAVE_SEABORN,
-    _HAVE_SQUIDPY  # May be needed for some checks
+    _HAVE_SQUIDPY,
+    squidpy_available,
 )
 
 try:
@@ -2644,7 +2645,7 @@ class SimpleSpatialAnalysisDialog(QtWidgets.QDialog):
     def _open_advanced_analysis(self):
         """Open the advanced spatial analysis dialog and close this simple dialog."""
         # Check if AdvancedSpatialAnalysisDialog is available
-        if not _HAVE_SQUIDPY:
+        if not (_HAVE_SQUIDPY or squidpy_available()):
             QtWidgets.QMessageBox.warning(
                 self,
                 "Squidpy Not Available",

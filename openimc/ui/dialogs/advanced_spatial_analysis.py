@@ -74,11 +74,13 @@ from openimc.ui.dialogs.label_customization_dialogs import (
     edit_feature_label_map,
 )
 from openimc.ui.dialogs.progress_dialog import run_blocking_task_with_progress
+from openimc.ui.dialogs import spatial_analysis as spatial_analysis_module
 from openimc.ui.dialogs.spatial_analysis import (
     SourceFileFilterDialog,
     _HAVE_SQUIDPY,
     _HAVE_SPARSE,
-    _get_vivid_colors
+    _get_squidpy_modules,
+    _get_vivid_colors,
 )
 from openimc.core import (
     dataframe_to_anndata,
@@ -90,33 +92,29 @@ from openimc.core import (
     export_anndata
 )
 
-try:
-    # Suppress FutureWarning about anndata.read_text deprecation and squidpy __version__ deprecation
-    import warnings
-    with warnings.catch_warnings():
-        warnings.filterwarnings('ignore', category=FutureWarning, message='.*read_text.*')
-        warnings.filterwarnings('ignore', category=FutureWarning, message='.*__version__.*')
-        import squidpy as sq
-        import anndata as ad
+sq = None
+ad = None
+_HAVE_SQUIDPY_LOCAL = False
+_SQUIDPY_IMPORT_ERROR = None
+
+
+def _ensure_local_squidpy() -> bool:
+    """Load squidpy on demand for the advanced dialog."""
+    global sq, ad, _HAVE_SQUIDPY_LOCAL, _SQUIDPY_IMPORT_ERROR
+
+    if _HAVE_SQUIDPY_LOCAL and sq is not None and ad is not None:
+        return True
+
+    squidpy_modules = _get_squidpy_modules()
+    if squidpy_modules is None:
+        _HAVE_SQUIDPY_LOCAL = False
+        _SQUIDPY_IMPORT_ERROR = getattr(spatial_analysis_module, "_SQUIDPY_IMPORT_ERROR", None)
+        return False
+
+    sq, _scanpy_module, ad = squidpy_modules
     _HAVE_SQUIDPY_LOCAL = True
     _SQUIDPY_IMPORT_ERROR = None
-except (ImportError, RuntimeError) as e:
-    sq = None
-    ad = None
-    _HAVE_SQUIDPY_LOCAL = False
-    _SQUIDPY_IMPORT_ERROR = str(e)
-    import traceback
-    traceback.print_exc()
-    # Log the error for debugging
-    import warnings
-    warnings.warn(f"Failed to import squidpy in advanced_spatial_analysis: {e}. Squidpy features will be disabled.", ImportWarning)
-except Exception as e:
-    sq = None
-    ad = None
-    _HAVE_SQUIDPY_LOCAL = False
-    _SQUIDPY_IMPORT_ERROR = str(e)
-    import traceback
-    traceback.print_exc()
+    return True
 
 try:
     from scipy import sparse as sp
@@ -129,7 +127,7 @@ class AdvancedSpatialAnalysisDialog(QtWidgets.QDialog):
     def __init__(self, feature_dataframe: pd.DataFrame, batch_corrected_dataframe=None, clustered_cells_dataframe=None, parent=None):
         
         # Check both the imported flag and local import status
-        if not _HAVE_SQUIDPY and not _HAVE_SQUIDPY_LOCAL:
+        if not (_HAVE_SQUIDPY or _ensure_local_squidpy()):
             error_msg = "squidpy is required for AdvancedSpatialAnalysisDialog. Please install with: pip install squidpy anndata"
             if '_SQUIDPY_IMPORT_ERROR' in globals() and _SQUIDPY_IMPORT_ERROR:
                 error_msg += f"\n\nImport error details: {_SQUIDPY_IMPORT_ERROR}"

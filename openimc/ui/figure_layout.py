@@ -20,8 +20,48 @@
 from typing import Dict, Iterable, Optional, Sequence
 import warnings
 
+from matplotlib import rcParams
 from matplotlib.figure import Figure
 from matplotlib.text import Text
+
+
+def _canvas_device_pixel_ratio(canvas) -> float:
+    """Return a sane Qt device-pixel ratio for live canvas sizing."""
+    if canvas is None:
+        return 1.0
+    dpr = 1.0
+    try:
+        if hasattr(canvas, 'devicePixelRatioF'):
+            dpr = float(canvas.devicePixelRatioF())
+        elif hasattr(canvas, 'devicePixelRatio'):
+            dpr = float(canvas.devicePixelRatio())
+    except Exception:
+        dpr = 1.0
+    if dpr < 1.0:
+        return 1.0
+    return dpr
+
+
+def _get_base_figure_dpi(figure: Figure, device_pixel_ratio: float) -> float:
+    """Recover the figure's logical DPI before any Qt HiDPI scaling."""
+    base_dpi = getattr(figure, '_openimc_base_dpi', None)
+    if base_dpi is not None:
+        try:
+            base_dpi = float(base_dpi)
+        except Exception:
+            base_dpi = None
+    if base_dpi is None:
+        current_dpi = float(figure.get_dpi() or 100.0)
+        default_dpi = float(rcParams.get('figure.dpi', current_dpi) or current_dpi)
+        if (
+            device_pixel_ratio > 1.0
+            and abs(current_dpi - (default_dpi * device_pixel_ratio)) < abs(current_dpi - default_dpi)
+        ):
+            base_dpi = current_dpi / device_pixel_ratio
+        else:
+            base_dpi = current_dpi
+        setattr(figure, '_openimc_base_dpi', base_dpi)
+    return max(36.0, float(base_dpi))
 
 
 def sync_figure_to_canvas(figure: Figure, canvas) -> None:
@@ -29,10 +69,13 @@ def sync_figure_to_canvas(figure: Figure, canvas) -> None:
     if figure is None or canvas is None:
         return
     try:
-        dpi = float(figure.get_dpi() or 100.0)
-        width_px = max(1, int(canvas.width()))
-        height_px = max(1, int(canvas.height()))
-        figure.set_size_inches(width_px / dpi, height_px / dpi, forward=False)
+        dpr = _canvas_device_pixel_ratio(canvas)
+        base_dpi = _get_base_figure_dpi(figure, dpr)
+        target_dpi = base_dpi * dpr
+        width_px = max(1.0, float(canvas.width()) * dpr)
+        height_px = max(1.0, float(canvas.height()) * dpr)
+        figure.set_dpi(target_dpi)
+        figure.set_size_inches(width_px / target_dpi, height_px / target_dpi, forward=False)
     except Exception:
         # Best-effort only.
         pass

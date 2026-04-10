@@ -41,7 +41,7 @@ from openimc.utils.logger import get_logger
 from openimc.ui.dialogs.figure_save_dialog import save_figure_with_options
 from openimc.ui.dialogs.plot_config_dialog import PlotConfigDialog
 from openimc.ui.dialogs.progress_dialog import run_blocking_task_with_progress
-from openimc.ui.figure_layout import fit_figure_to_canvas
+from openimc.ui.figure_layout import fit_figure_to_canvas, sync_figure_to_canvas
 from openimc.ui.cluster_utils import (
     canonicalize_cluster_id,
     cluster_sort_key,
@@ -1173,10 +1173,7 @@ class CellClusteringDialog(QtWidgets.QDialog):
         if getattr(self.canvas, 'figure', None) is not self.figure:
             self.canvas.figure = self.figure
         try:
-            dpi = float(self.figure.get_dpi() or 100.0)
-            width_px = max(1, int(self.canvas.width()))
-            height_px = max(1, int(self.canvas.height()))
-            self.figure.set_size_inches(width_px / dpi, height_px / dpi, forward=False)
+            sync_figure_to_canvas(self.figure, self.canvas)
         except Exception:
             # Size sync is best-effort; continue with clear-only if unavailable.
             pass
@@ -3893,7 +3890,11 @@ class CellClusteringDialog(QtWidgets.QDialog):
 
             break
 
-        self._finalize_standard_plot(pad=0.6, allow_text_compaction=True)
+        self._finalize_standard_plot(
+            pad=0.6,
+            allow_text_compaction=True,
+            force_layout_refresh=True,
+        )
     
     def _create_seaborn_heatmap(self):
         """Create heatmap using seaborn clustermap with color bars."""

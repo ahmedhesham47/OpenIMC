@@ -734,7 +734,8 @@ def _skip_if_squidpy_unavailable():
     from openimc.ui.dialogs import advanced_spatial_analysis as advanced_module
 
     if not (advanced_module._HAVE_SQUIDPY or advanced_module._HAVE_SQUIDPY_LOCAL):
-        pytest.skip("squidpy not available")
+        if not advanced_module._ensure_local_squidpy():
+            pytest.skip("squidpy not available")
     return advanced_module.AdvancedSpatialAnalysisDialog
 
 

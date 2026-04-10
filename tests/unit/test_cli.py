@@ -20,6 +20,8 @@
 """
 Unit tests for CLI functions.
 """
+import builtins
+import importlib
 import pytest
 import json
 import tempfile
@@ -31,6 +33,7 @@ import pandas as pd
 import tifffile
 
 from openimc.cli import load_data, parse_denoise_settings, qc_analysis_command
+import openimc.cli as cli_module
 from openimc.core import qc_analysis
 from openimc.data.mcd_loader import AcquisitionInfo
 
@@ -204,3 +207,31 @@ class TestQCAnalysisCLI:
         assert actual.loc[0, "signal_quantile"] == pytest.approx(0.75)
         assert actual.loc[0, "snr"] == pytest.approx(expected.loc[0, "snr"])
         assert actual.loc[0, "signal_mean"] == pytest.approx(expected.loc[0, "signal_mean"])
+
+
+@pytest.mark.unit
+def test_cli_module_import_defers_optional_segmentation_backends(monkeypatch):
+    attempted_imports = []
+    real_import = builtins.__import__
+    real_find_spec = importlib.util.find_spec
+
+    def guarded_import(name, globals=None, locals=None, fromlist=(), level=0):
+        top_level = name.split('.')[0]
+        if top_level in {'cellpose', 'cellSAM'}:
+            attempted_imports.append(top_level)
+            raise AssertionError(f"unexpected optional import: {top_level}")
+        return real_import(name, globals, locals, fromlist, level)
+
+    def fake_find_spec(name, package=None):
+        if name in {'cellpose', 'cellSAM'}:
+            return None
+        return real_find_spec(name, package)
+
+    monkeypatch.setattr(builtins, "__import__", guarded_import)
+    monkeypatch.setattr(importlib.util, "find_spec", fake_find_spec)
+
+    importlib.reload(cli_module)
+
+    assert cli_module._HAVE_CELLPOSE is False
+    assert cli_module._HAVE_CELLSAM is False
+    assert attempted_imports == []

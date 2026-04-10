@@ -28,6 +28,11 @@ jobs:
         run: |
           echo "QT_QPA_PLATFORM=offscreen" >> "$GITHUB_ENV"
           echo "QT_QUICK_BACKEND=software" >> "$GITHUB_ENV"
+      - name: Normalize Qt scaling on macOS
+        if: runner.os == 'macOS'
+        run: |
+          echo "QT_AUTO_SCREEN_SCALE_FACTOR=0" >> "$GITHUB_ENV"
+          echo "QT_SCALE_FACTOR=1" >> "$GITHUB_ENV"
       - name: Install dependencies
         run: |
           python -m pip install --upgrade pip

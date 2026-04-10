@@ -58,6 +58,7 @@ Examples:
         openimc cluster features.csv clustered.csv --method leiden --resolution 1.0
 """
 import argparse
+import importlib.util
 import json
 import multiprocessing as mp
 import os
@@ -105,21 +106,17 @@ from openimc.core import (
     export_anndata
 )
 
-# Try to import Cellpose (optional)
-# Catch both ImportError and OSError (Windows DLL loading errors)
-try:
-    from cellpose import models
-    _HAVE_CELLPOSE = True
-except (ImportError, OSError):
-    _HAVE_CELLPOSE = False
+def _optional_dependency_available(module_name: str) -> bool:
+    """Check for an optional dependency without importing it."""
+    try:
+        return importlib.util.find_spec(module_name) is not None
+    except (ImportError, AttributeError, ValueError):
+        return False
 
-# Try to import CellSAM (optional)
-# Catch both ImportError and OSError (Windows DLL loading errors)
-try:
-    from cellSAM import get_model, cellsam_pipeline
-    _HAVE_CELLSAM = True
-except (ImportError, OSError):
-    _HAVE_CELLSAM = False
+
+# Avoid importing optional Torch-backed dependencies at CLI import time.
+_HAVE_CELLPOSE = _optional_dependency_available("cellpose")
+_HAVE_CELLSAM = _optional_dependency_available("cellSAM")
 
 
 # Helper function to get default number of workers

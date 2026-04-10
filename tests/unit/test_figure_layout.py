@@ -21,7 +21,27 @@ import numpy as np
 from matplotlib.backends.backend_qt5agg import FigureCanvasQTAgg as FigureCanvas
 from matplotlib.figure import Figure
 
-from openimc.ui.figure_layout import fit_canvas_and_draw, measure_figure_text_overflow
+from openimc.ui.figure_layout import (
+    fit_canvas_and_draw,
+    measure_figure_text_overflow,
+    sync_figure_to_canvas,
+)
+
+
+class _FakeCanvas:
+    def __init__(self, width: int, height: int, *, device_pixel_ratio: float = 1.0):
+        self._width = width
+        self._height = height
+        self._device_pixel_ratio = device_pixel_ratio
+
+    def width(self):
+        return self._width
+
+    def height(self):
+        return self._height
+
+    def devicePixelRatioF(self):
+        return self._device_pixel_ratio
 
 
 def _build_canvas(qtbot, width: int, height: int):
@@ -51,11 +71,25 @@ def test_fit_canvas_and_draw_syncs_figure_size_and_keeps_heatmap_labels_visible(
     fit_canvas_and_draw(canvas, pad=0.95, allow_text_compaction=True)
     overflow = measure_figure_text_overflow(fig)
 
-    expected_width_in = canvas.width() / max(fig.get_dpi(), 1.0)
-    expected_height_in = canvas.height() / max(fig.get_dpi(), 1.0)
+    dpr = canvas.devicePixelRatioF() if hasattr(canvas, 'devicePixelRatioF') else 1.0
+    expected_width_in = (canvas.width() * dpr) / max(fig.get_dpi(), 1.0)
+    expected_height_in = (canvas.height() * dpr) / max(fig.get_dpi(), 1.0)
     assert abs(fig.get_size_inches()[0] - expected_width_in) < 0.2
     assert abs(fig.get_size_inches()[1] - expected_height_in) < 0.2
     assert max(overflow.values()) <= 0.02
+
+
+def test_sync_figure_to_canvas_accounts_for_hidpi_device_ratio():
+    fig = Figure(figsize=(3.0, 2.4), dpi=100.0)
+    canvas = _FakeCanvas(720, 520, device_pixel_ratio=2.0)
+
+    sync_figure_to_canvas(fig, canvas)
+
+    assert abs(fig.get_dpi() - 200.0) < 1e-6
+    assert abs(fig.get_size_inches()[0] - 7.2) < 1e-6
+    assert abs(fig.get_size_inches()[1] - 5.2) < 1e-6
+    assert abs(float(fig.bbox.width) - 1440.0) < 1e-6
+    assert abs(float(fig.bbox.height) - 1040.0) < 1e-6
 
 
 def test_fit_canvas_and_draw_keeps_external_legend_inside_reserved_space(qtbot):

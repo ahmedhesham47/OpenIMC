@@ -2944,7 +2944,7 @@ def dataframe_to_anndata(
     """
     try:
         import anndata as ad
-    except ImportError:
+    except (ImportError, OSError, RuntimeError):
         raise ImportError("anndata is required for AnnData-based spatial analysis. Install with: pip install anndata")
     
     try:
@@ -3067,7 +3067,7 @@ def build_spatial_graph_anndata(
         import anndata as ad
         from scipy.spatial import Delaunay
         from scipy import sparse as sp
-    except ImportError:
+    except (ImportError, OSError, RuntimeError):
         raise ImportError(
             "squidpy, anndata, and scipy are required for AnnData-based spatial analysis. "
             "Install with: pip install squidpy anndata scipy"
@@ -3241,7 +3241,7 @@ def spatial_neighborhood_enrichment(
         import anndata as ad
         from squidpy._utils import _get_n_cores, parallelize
         from squidpy.gr._nhood import _create_function, _nhood_enrichment_helper
-    except ImportError:
+    except (ImportError, OSError, RuntimeError):
         raise ImportError("squidpy and anndata are required for neighborhood enrichment")
 
     def _run_nhood_permutation_test(adata: 'ad.AnnData', *, seed: int = 0, n_perms: int = 1000) -> Dict[str, np.ndarray]:
@@ -3511,7 +3511,7 @@ def spatial_cooccurrence(
     """
     try:
         import squidpy as sq
-    except ImportError:
+    except (ImportError, OSError, RuntimeError):
         raise ImportError("squidpy is required for co-occurrence analysis")
     
     if len(interval) < 2:
@@ -3566,7 +3566,7 @@ def spatial_autocorrelation(
     """
     try:
         import squidpy as sq
-    except ImportError:
+    except (ImportError, OSError, RuntimeError):
         raise ImportError("squidpy is required for spatial autocorrelation")
 
     def _moran_to_dataframe(moran_data: Any) -> pd.DataFrame:
@@ -3804,7 +3804,7 @@ def spatial_ripley(
     """
     try:
         import squidpy as sq
-    except ImportError:
+    except (ImportError, OSError, RuntimeError):
         raise ImportError("squidpy is required for Ripley analysis")
     
     if mode not in ['F', 'G', 'L']:

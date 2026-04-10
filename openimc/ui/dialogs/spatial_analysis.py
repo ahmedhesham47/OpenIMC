@@ -29,7 +29,9 @@ The actual dialog implementations are in separate files:
 # CRITICAL: Configure dask BEFORE any imports that might trigger dask.dataframe import
 # This must be done at the very top, before any other imports
 # Use environment variable approach as it's more reliable
+import importlib
 import os
+import warnings
 # Set environment variable before importing dask
 os.environ.setdefault('DASK_DATAFRAME__QUERY_PLANNING', 'False')
 
@@ -78,25 +80,56 @@ try:
 except ImportError:
     _HAVE_SEABORN = False
 
-try:
-    # Dask should already be configured at the top of the file
-    # Suppress FutureWarning about anndata.read_text deprecation and squidpy __version__ deprecation
-    import warnings
-    with warnings.catch_warnings():
-        warnings.filterwarnings('ignore', category=FutureWarning, message='.*read_text.*')
-        warnings.filterwarnings('ignore', category=FutureWarning, message='.*__version__.*')
-        import squidpy as sq
-        import scanpy as sc
-        import anndata as ad
-    _HAVE_SQUIDPY = True
-except (ImportError, RuntimeError) as e:
-    _HAVE_SQUIDPY = False
-    sq = None
-    sc = None
-    ad = None
-    # Log the error for debugging but don't fail module import
-    import warnings
-    warnings.warn(f"Failed to import squidpy: {e}. Squidpy features will be disabled.", ImportWarning)
+_HAVE_SQUIDPY = False
+_SQUIDPY_IMPORT_ATTEMPTED = False
+_SQUIDPY_IMPORT_ERROR = None
+sq = None
+sc = None
+ad = None
+
+
+def _get_squidpy_modules():
+    """Import squidpy/scanpy/anndata lazily and cache the result."""
+    global sq, sc, ad, _HAVE_SQUIDPY, _SQUIDPY_IMPORT_ATTEMPTED, _SQUIDPY_IMPORT_ERROR
+
+    if _HAVE_SQUIDPY and sq is not None and sc is not None and ad is not None:
+        return sq, sc, ad
+
+    if _SQUIDPY_IMPORT_ATTEMPTED:
+        return None
+
+    _SQUIDPY_IMPORT_ATTEMPTED = True
+    try:
+        with warnings.catch_warnings():
+            warnings.filterwarnings('ignore', category=FutureWarning, message='.*read_text.*')
+            warnings.filterwarnings('ignore', category=FutureWarning, message='.*__version__.*')
+            sq = importlib.import_module("squidpy")
+            sc = importlib.import_module("scanpy")
+            ad = importlib.import_module("anndata")
+        _HAVE_SQUIDPY = True
+        _SQUIDPY_IMPORT_ERROR = None
+        return sq, sc, ad
+    except (ImportError, RuntimeError, OSError) as e:
+        sq = None
+        sc = None
+        ad = None
+        _HAVE_SQUIDPY = False
+        _SQUIDPY_IMPORT_ERROR = str(e)
+        warnings.warn(f"Failed to import squidpy: {e}. Squidpy features will be disabled.", ImportWarning)
+        return None
+    except Exception as e:
+        sq = None
+        sc = None
+        ad = None
+        _HAVE_SQUIDPY = False
+        _SQUIDPY_IMPORT_ERROR = str(e)
+        warnings.warn(f"Failed to import squidpy: {e}. Squidpy features will be disabled.", ImportWarning)
+        return None
+
+
+def squidpy_available() -> bool:
+    """Return True when squidpy and its dependencies can be imported."""
+    return _get_squidpy_modules() is not None
 
 
 def _get_vivid_colors(n):
@@ -161,8 +194,10 @@ def dataframe_to_anndata(
     Returns:
         AnnData object with spatial coordinates and features, or None if conversion fails
     """
-    if not _HAVE_SQUIDPY:
+    squidpy_modules = _get_squidpy_modules()
+    if squidpy_modules is None:
         return None
+    _, _, ad_module = squidpy_modules
     
     try:
         # Filter to specific ROI if provided
@@ -236,7 +271,7 @@ def dataframe_to_anndata(
         var = pd.DataFrame(index=feature_cols)
         
         # Create AnnData
-        adata = ad.AnnData(X=X, obs=obs, var=var, obsm=obsm)
+        adata = ad_module.AnnData(X=X, obs=obs, var=var, obsm=obsm)
         
         # Store cluster information in obs if available
         cluster_col = None
@@ -358,7 +393,7 @@ def SpatialAnalysisDialog(feature_dataframe: pd.DataFrame, batch_corrected_dataf
     """Factory function - returns Advanced if squidpy available, otherwise Simple."""
     # Lazy import to avoid circular dependencies
     from openimc.ui.dialogs.simple_spatial_analysis import SimpleSpatialAnalysisDialog
-    if _HAVE_SQUIDPY:
+    if squidpy_available():
         try:
             from openimc.ui.dialogs.advanced_spatial_analysis import AdvancedSpatialAnalysisDialog
             return AdvancedSpatialAnalysisDialog(feature_dataframe, batch_corrected_dataframe, parent)
@@ -374,7 +409,7 @@ def _get_SimpleSpatialAnalysisDialog():
 
 def _get_AdvancedSpatialAnalysisDialog():
     """Lazy getter for AdvancedSpatialAnalysisDialog to avoid circular imports."""
-    if _HAVE_SQUIDPY:
+    if squidpy_available():
         try:
             from openimc.ui.dialogs.advanced_spatial_analysis import AdvancedSpatialAnalysisDialog
             return AdvancedSpatialAnalysisDialog
@@ -397,7 +432,7 @@ def __getattr__(name):
     elif name == 'AdvancedSpatialAnalysisDialog':
         global AdvancedSpatialAnalysisDialog
         if AdvancedSpatialAnalysisDialog is None:
-            if _HAVE_SQUIDPY:
+            if squidpy_available():
                 try:
                     from openimc.ui.dialogs.advanced_spatial_analysis import AdvancedSpatialAnalysisDialog as _Advanced
                     AdvancedSpatialAnalysisDialog = _Advanced
@@ -414,6 +449,7 @@ __all__ = [
     'SourceFileFilterDialog',
     'dataframe_to_anndata',
     '_get_vivid_colors',
+    'squidpy_available',
     '_HAVE_SQUIDPY',
     '_HAVE_SPARSE',
     '_HAVE_IGRAPH',

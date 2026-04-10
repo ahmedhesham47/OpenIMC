@@ -30,8 +30,8 @@ import shutil
 
 
 # Ensure pytest-qt can create a QApplication in headless Linux sessions.
-# macOS CI has a native Qt backend available and should not be forced into
-# offscreen mode here.
+# On macOS GitHub Actions, keep the native Qt backend but normalize HiDPI
+# scaling so Retina metrics do not change figure layout during test execution.
 if (
     sys.platform.startswith("linux")
     and not os.environ.get("QT_QPA_PLATFORM")
@@ -39,6 +39,10 @@ if (
 ):
     os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
     os.environ.setdefault("QT_QUICK_BACKEND", "software")
+
+if sys.platform == "darwin" and os.environ.get("GITHUB_ACTIONS") == "true":
+    os.environ.setdefault("QT_AUTO_SCREEN_SCALE_FACTOR", "0")
+    os.environ.setdefault("QT_SCALE_FACTOR", "1")
 
 
 @pytest.fixture
