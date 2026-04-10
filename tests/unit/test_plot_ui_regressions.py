@@ -247,6 +247,25 @@ def test_differential_expression_axis_flip_transposes_labels_and_highlights(qtbo
     assert len(ax.texts) < text_count_with_values / 3
 
 
+def test_heatmap_and_cluster_map_default_to_zscore_scaling(qtbot, monkeypatch):
+    dialog = _build_clustering_dialog(qtbot, n_clusters=6, n_features=12)
+    scaling_calls = []
+
+    def _record_scaling(_self, data, scaling_method):
+        scaling_calls.append((_self._active_view_name, scaling_method))
+        return data.copy()
+
+    monkeypatch.setattr(CellClusteringDialog, "_apply_scaling", _record_scaling)
+
+    assert dialog.heatmap_scaling_combo.currentText() == "Z-score"
+
+    dialog._show_heatmap()
+    dialog._show_cluster_map()
+
+    assert ('Heatmap', 'zscore') in scaling_calls
+    assert ('Cluster Map', 'zscore') in scaling_calls
+
+
 def test_qc_snr_plot_uses_symlog_and_keeps_nonpositive_snr_points(qtbot):
     dialog = _build_qc_dialog(qtbot)
     dialog.qc_results_aggregated = pd.DataFrame(

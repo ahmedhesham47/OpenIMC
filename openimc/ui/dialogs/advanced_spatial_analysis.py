@@ -57,12 +57,13 @@ from scipy import stats
 import seaborn as sns
 from openimc.ui.cluster_utils import (
     canonicalize_cluster_id,
+    extract_cluster_annotation_map_from_dataframe,
     format_default_cluster_label,
     get_cluster_display_name,
     normalize_cluster_annotation_map,
     sort_cluster_values,
 )
-from openimc.ui.figure_layout import dense_heatmap_style, fit_canvas_and_draw
+from openimc.ui.figure_layout import dense_heatmap_style, fit_canvas_and_draw, refresh_canvas
 from openimc.ui.utils import (
     benjamini_hochberg_adjust,
     benjamini_hochberg_adjust_matrix,
@@ -849,20 +850,16 @@ class AdvancedSpatialAnalysisDialog(QtWidgets.QDialog):
             if label_source is not None and hasattr(label_source, 'feature_label_map'):
                 self.feature_label_map = dict(label_source.feature_label_map or {})
             
-            if self.feature_dataframe is not None and 'cluster_phenotype' in self.feature_dataframe.columns:
-                phenotype_map = {}
-                for cluster_id in self.feature_dataframe['cluster'].unique():
-                    if pd.notna(cluster_id):
-                        phenotype_rows = self.feature_dataframe[
-                            (self.feature_dataframe['cluster'] == cluster_id) & 
-                            (self.feature_dataframe['cluster_phenotype'].notna()) &
-                            (self.feature_dataframe['cluster_phenotype'] != '')
-                        ]
-                        if not phenotype_rows.empty:
-                            phenotype_map[canonicalize_cluster_id(cluster_id)] = phenotype_rows['cluster_phenotype'].iloc[0]
-                
-                if phenotype_map:
-                    self.cluster_annotation_map.update(normalize_cluster_annotation_map(phenotype_map))
+            loaded_annotations = {}
+            for dataframe in (
+                self.original_feature_dataframe,
+                self.batch_corrected_dataframe,
+                self.feature_dataframe,
+                self.clustered_cells_dataframe,
+            ):
+                loaded_annotations.update(extract_cluster_annotation_map_from_dataframe(dataframe))
+            if loaded_annotations:
+                self.cluster_annotation_map.update(loaded_annotations)
             
             self._apply_cluster_annotations_to_dataframes()
         except Exception:
@@ -879,7 +876,12 @@ class AdvancedSpatialAnalysisDialog(QtWidgets.QDialog):
 
     def _apply_cluster_annotations_to_dataframes(self):
         """Mirror cluster display names into dataframe and cached AnnData phenotype columns."""
-        for dataframe_attr in ('feature_dataframe', 'original_feature_dataframe', 'batch_corrected_dataframe'):
+        for dataframe_attr in (
+            'feature_dataframe',
+            'original_feature_dataframe',
+            'batch_corrected_dataframe',
+            'clustered_cells_dataframe',
+        ):
             df = getattr(self, dataframe_attr, None)
             if df is None or 'cluster' not in df.columns:
                 continue
@@ -1989,9 +1991,7 @@ class AdvancedSpatialAnalysisDialog(QtWidgets.QDialog):
         
         try:
             self._fit_canvas(self.sq_nhood_canvas, pad=0.95)
-            # Force update and repaint
-            self.sq_nhood_canvas.update()
-            self.sq_nhood_canvas.repaint()
+            refresh_canvas(self.sq_nhood_canvas, draw=False)
         except Exception as e:
             import traceback
             traceback.print_exc()

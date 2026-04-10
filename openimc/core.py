@@ -3030,6 +3030,24 @@ def dataframe_to_anndata(
         return None
 
 
+def _ordered_cluster_categorical(
+    values: pd.Series,
+    *,
+    canonicalize_ids: bool,
+) -> pd.Series:
+    """Return a stable ordered categorical series for spatial-analysis cluster columns."""
+    normalized = values.map(canonicalize_cluster_id) if canonicalize_ids else values.copy()
+    ordered_categories = sort_cluster_values(
+        pd.unique(normalized.dropna()),
+        canonical=canonicalize_ids,
+    )
+    return pd.Series(
+        pd.Categorical(normalized, categories=ordered_categories, ordered=True),
+        index=values.index,
+        name=values.name,
+    )
+
+
 def build_spatial_graph_anndata(
     features_df: pd.DataFrame,
     method: str = "kNN",
@@ -3120,12 +3138,10 @@ def build_spatial_graph_anndata(
         # Ensure cluster columns are categorical (required by squidpy)
         for col in ['cluster', 'cluster_phenotype', 'cluster_id']:
             if col in adata.obs.columns:
-                if col in {'cluster', 'cluster_id'}:
-                    adata.obs[col] = adata.obs[col].map(canonicalize_cluster_id)
-                if not hasattr(adata.obs[col], 'cat'):
-                    adata.obs[col] = adata.obs[col].astype('category')
-                ordered_categories = sort_cluster_values(adata.obs[col].cat.categories, canonical=True)
-                adata.obs[col] = adata.obs[col].cat.reorder_categories(ordered_categories, ordered=True)
+                adata.obs[col] = _ordered_cluster_categorical(
+                    adata.obs[col],
+                    canonicalize_ids=(col in {'cluster', 'cluster_id'}),
+                )
         
         # Build spatial graph
         coords = adata.obsm['spatial']
@@ -3319,12 +3335,11 @@ def spatial_neighborhood_enrichment(
             adata = adata[valid_mask].copy()
         
         # Ensure categorical
-        if cluster_key in {'cluster', 'cluster_id'}:
-            adata.obs[cluster_key] = adata.obs[cluster_key].map(canonicalize_cluster_id)
-        if not hasattr(adata.obs[cluster_key], 'cat'):
-            adata.obs[cluster_key] = adata.obs[cluster_key].astype('category')
-        ordered_categories = sort_cluster_values(adata.obs[cluster_key].cat.categories, canonical=True)
-        adata.obs[cluster_key] = adata.obs[cluster_key].cat.reorder_categories(ordered_categories, ordered=True)
+        canonicalize_cluster_ids = cluster_key in {'cluster', 'cluster_id'}
+        adata.obs[cluster_key] = _ordered_cluster_categorical(
+            adata.obs[cluster_key],
+            canonicalize_ids=canonicalize_cluster_ids,
+        )
         
         
         # Check graph connectivity
@@ -3338,9 +3353,12 @@ def spatial_neighborhood_enrichment(
         # Check clusters
         if hasattr(adata.obs[cluster_key], 'cat'):
             categories = list(adata.obs[cluster_key].cat.categories)
-            unique_vals = sort_cluster_values(adata.obs[cluster_key].unique(), canonical=True)
+            unique_vals = categories
         else:
-            categories = sort_cluster_values(adata.obs[cluster_key].unique(), canonical=True)
+            categories = sort_cluster_values(
+                adata.obs[cluster_key].unique(),
+                canonical=canonicalize_cluster_ids,
+            )
             unique_vals = categories
         
         if len(unique_vals) < 2:
@@ -3382,7 +3400,10 @@ def spatial_neighborhood_enrichment(
             if hasattr(adata.obs[cluster_key], 'cat'):
                 clusters = list(adata.obs[cluster_key].cat.categories)
             else:
-                clusters = sort_cluster_values(adata.obs[cluster_key].unique(), canonical=True)
+                clusters = sort_cluster_values(
+                    adata.obs[cluster_key].unique(),
+                    canonical=canonicalize_cluster_ids,
+                )
             roi_cluster_map[roi_id] = clusters
         else:
             if matrix is not None:
@@ -3399,7 +3420,10 @@ def spatial_neighborhood_enrichment(
         # Get union of all clusters
         all_cluster_sets = [set(clusters) for clusters in roi_cluster_map.values()]
         all_clusters_union = (
-            sort_cluster_values(set().union(*all_cluster_sets), canonical=True)
+            sort_cluster_values(
+                set().union(*all_cluster_sets),
+                canonical=(cluster_key in {'cluster', 'cluster_id'}),
+            )
             if all_cluster_sets
             else []
         )

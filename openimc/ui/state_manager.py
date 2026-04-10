@@ -56,6 +56,7 @@ class StateManager:
     """
     
     STATE_VERSION = "1.1"  # Incremented for improved state management
+    TEXT_ENCODING = "utf-8"
     # Heuristics for keeping analysis-state JSON reasonably sized
     _INLINE_NDARRAY_MAX_ELEMENTS = 10_000
     _INLINE_DF_MAX_CELLS = 50_000  # rows * cols; above this we save to CSV
@@ -152,7 +153,7 @@ class StateManager:
             
             # Save main state JSON
             state_json_path = state_path / "state.json"
-            with open(state_json_path, 'w') as f:
+            with open(state_json_path, 'w', encoding=self.TEXT_ENCODING) as f:
                 json.dump(state_data, f, indent=2, default=self._json_serializer)
             
             # Generate README for Zenodo submission
@@ -193,7 +194,7 @@ class StateManager:
             if not state_json_path.exists():
                 return None
             
-            with open(state_json_path, 'r') as f:
+            with open(state_json_path, 'r', encoding=self.TEXT_ENCODING) as f:
                 state_data = json.load(f)
             
             # Check version compatibility
@@ -484,7 +485,7 @@ class StateManager:
                 # Use standard name if available, otherwise use the provided name
                 filename = feature_names.get(name, f"{name}_features.csv")
                 feature_path = features_dir / filename
-                df.to_csv(feature_path, index=False)
+                df.to_csv(feature_path, index=False, encoding=self.TEXT_ENCODING)
                 saved_features[name] = str(feature_path.relative_to(features_dir.parent))
         
         return saved_features
@@ -509,7 +510,7 @@ class StateManager:
         for name, feature_path in features_info.items():
             full_path = features_dir.parent / feature_path
             if full_path.exists():
-                loaded_features[name] = pd.read_csv(full_path)
+                loaded_features[name] = pd.read_csv(full_path, encoding=self.TEXT_ENCODING)
         
         return loaded_features
     
@@ -543,7 +544,7 @@ class StateManager:
                     path_parts=(),
                 )
                 
-                with open(analysis_path, 'w') as f:
+                with open(analysis_path, 'w', encoding=self.TEXT_ENCODING) as f:
                     json.dump(json_state, f, indent=2, default=self._json_serializer)
                 
                 saved_analysis[module_name] = str(analysis_path.relative_to(analysis_dir.parent))
@@ -570,7 +571,7 @@ class StateManager:
         for module_name, analysis_path in analysis_info.items():
             full_path = analysis_dir.parent / analysis_path
             if full_path.exists():
-                with open(full_path, 'r') as f:
+                with open(full_path, 'r', encoding=self.TEXT_ENCODING) as f:
                     state = json.load(f)
                     # Restore DataFrames and other special types
                     loaded_analysis[module_name] = self._restore_analysis_state_from_json(state, analysis_dir)
@@ -617,7 +618,7 @@ class StateManager:
                 blob_dir.mkdir(parents=True, exist_ok=True)
                 safe_name = self._make_blob_name(module_name, path_parts, ext="csv")
                 df_path = blob_dir / safe_name
-                state.to_csv(df_path, index=False)
+                state.to_csv(df_path, index=False, encoding=self.TEXT_ENCODING)
                 return {
                     "__type__": "DataFrame_file",
                     "__path__": str(df_path.relative_to(analysis_dir.parent)),
@@ -699,7 +700,7 @@ class StateManager:
                     if state.get("__path__"):
                         full_path = analysis_dir.parent / state["__path__"]
                         if full_path.exists():
-                            return pd.read_csv(full_path)
+                            return pd.read_csv(full_path, encoding=self.TEXT_ENCODING)
                     return pd.DataFrame()
                 elif state["__type__"] == "Series":
                     # Restore Series from dict format
@@ -839,7 +840,7 @@ state_folder/
 For questions or issues, please refer to the OpenIMC documentation or GitHub repository.
 """
         
-        with open(readme_path, 'w') as f:
+        with open(readme_path, 'w', encoding=self.TEXT_ENCODING, newline='\n') as f:
             f.write(readme_content)
     
     def _generate_manifest(self, state_path: Path):
@@ -859,10 +860,9 @@ For questions or issues, please refer to the OpenIMC documentation or GitHub rep
                     size = file_path.stat().st_size
                     files_list.append(f"{rel_path}\t{size} bytes")
         
-        with open(manifest_path, 'w') as f:
+        with open(manifest_path, 'w', encoding=self.TEXT_ENCODING, newline='\n') as f:
             f.write("File Manifest\n")
             f.write("=" * 80 + "\n\n")
             f.write("This file lists all files in this state directory.\n\n")
             for line in sorted(files_list):
                 f.write(line + "\n")
-

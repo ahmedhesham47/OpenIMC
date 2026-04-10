@@ -19,10 +19,12 @@
 
 import json
 import shutil
+import builtins
 
 import numpy as np
 import pandas as pd
 
+import openimc.ui.state_manager as state_manager_module
 from openimc.ui.state_manager import StateManager
 
 
@@ -107,4 +109,30 @@ def test_state_manager_persists_large_arrays_and_dataframes(tmp_path):
     # CSV round-trip loses exact float formatting sometimes; compare numerically.
     np.testing.assert_allclose(restored_df.to_numpy(), df.to_numpy(), rtol=1e-6, atol=1e-6)
 
+
+def test_state_manager_save_state_uses_utf8_for_text_outputs(tmp_path, monkeypatch):
+    sm = StateManager()
+
+    state_dir = tmp_path / "utf8_state"
+    main_window_state = {
+        "main_state": {"openimc_version": "test"},
+        "images": {},
+        "masks": {},
+        "features": {},
+        "analysis": {},
+        "source_files": [],
+    }
+
+    real_open = builtins.open
+
+    def cp1252_default_open(file, mode="r", *args, **kwargs):
+        if "b" not in mode and "encoding" not in kwargs:
+            kwargs["encoding"] = "cp1252"
+        return real_open(file, mode, *args, **kwargs)
+
+    monkeypatch.setattr(state_manager_module, "open", cp1252_default_open, raising=False)
+
+    assert sm.save_state(state_dir, main_window_state, overwrite=True)
+    assert (state_dir / "README.md").exists()
+    assert (state_dir / "manifest.txt").exists()
 

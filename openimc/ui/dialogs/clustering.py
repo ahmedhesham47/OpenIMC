@@ -41,10 +41,16 @@ from openimc.utils.logger import get_logger
 from openimc.ui.dialogs.figure_save_dialog import save_figure_with_options
 from openimc.ui.dialogs.plot_config_dialog import PlotConfigDialog
 from openimc.ui.dialogs.progress_dialog import run_blocking_task_with_progress
-from openimc.ui.figure_layout import fit_figure_to_canvas, sync_figure_to_canvas
+from openimc.ui.figure_layout import (
+    fit_figure_to_canvas,
+    refresh_canvas,
+    should_use_nonblocking_canvas_refresh,
+    sync_figure_to_canvas,
+)
 from openimc.ui.cluster_utils import (
     canonicalize_cluster_id,
     cluster_sort_key,
+    extract_cluster_annotation_map_from_dataframe,
     format_default_cluster_label,
     get_cluster_display_name,
     normalize_cluster_annotation_map,
@@ -95,6 +101,13 @@ try:
     _HAVE_TSNE = True
 except ImportError:
     _HAVE_TSNE = False
+
+_HEATMAP_SCALING_DEFAULT_TEXT = "Z-score"
+_HEATMAP_SCALING_MAP = {
+    "None (no scaling)": "none",
+    "Z-score": "zscore",
+    "MAD (Median Absolute Deviation)": "mad",
+}
 
 
 def _get_vivid_colors(n):
@@ -243,7 +256,7 @@ class CellClusteringDialog(QtWidgets.QDialog):
         self.umap_embedding = None
         self.tsne_embedding = None
         self.cluster_annotation_map = {}
-        self.cluster_backend_names = {}  # Store normalized names for CSV export
+        self.cluster_backend_names = {}  # Kept in sync with persisted cluster phenotype names
         self.original_cluster_assignments = None  # Store original cluster assignments before merging
         self.clustering_scaling_method = None  # Store scaling method used for clustering
         self.actual_clustering_method = None  # Store the clustering method actually used when clustering was run
@@ -365,6 +378,23 @@ class CellClusteringDialog(QtWidgets.QDialog):
         if len(source_files) <= 3:
             return ", ".join(source_files)
         return ", ".join(source_files[:3]) + f" and {len(source_files) - 3} more"
+
+    def _load_cluster_annotations_from_dataframes(self):
+        """Recover persisted phenotype names from loaded clustered dataframes."""
+        loaded_annotations = {}
+        for dataframe in (self.feature_dataframe, self.clustered_data):
+            loaded_annotations.update(extract_cluster_annotation_map_from_dataframe(dataframe))
+
+        if not loaded_annotations:
+            return
+
+        self.cluster_annotation_map = normalize_cluster_annotation_map(
+            {
+                **self.cluster_annotation_map,
+                **loaded_annotations,
+            }
+        )
+        self.cluster_backend_names = dict(self.cluster_annotation_map)
     
     def _check_and_auto_draw_heatmap(self):
         """Check if cluster columns exist and auto-draw heatmap if they do.
@@ -378,6 +408,7 @@ class CellClusteringDialog(QtWidgets.QDialog):
             print(f"[_check_and_auto_draw_heatmap] Using pre-initialized clustered_data: {len(self.clustered_data)} cells")
             # clustered_data and clustered_data_unscaled should already be set
             # Just need to set display features and draw
+            self._load_cluster_annotations_from_dataframes()
             if hasattr(self, 'last_features_used') and self.last_features_used:
                 available_last_features = [f for f in self.last_features_used if f in self.clustered_data.columns]
                 if available_last_features:
@@ -484,6 +515,7 @@ class CellClusteringDialog(QtWidgets.QDialog):
         
         # Store unscaled data
         self.clustered_data_unscaled = self.clustered_data.copy()
+        self._load_cluster_annotations_from_dataframes()
         
         # Set selected display features to morphometric and mean features
         # Prioritize last_features_used if available (from previous clustering session)
@@ -934,7 +966,7 @@ class CellClusteringDialog(QtWidgets.QDialog):
         viz_layout.addWidget(self.heatmap_scaling_label)
         self.heatmap_scaling_combo = QtWidgets.QComboBox()
         self.heatmap_scaling_combo.addItems(["None (no scaling)", "Z-score", "MAD (Median Absolute Deviation)"])
-        self.heatmap_scaling_combo.setCurrentText("None (no scaling)")
+        self.heatmap_scaling_combo.setCurrentText(_HEATMAP_SCALING_DEFAULT_TEXT)
         self.heatmap_scaling_combo.setToolTip("Scaling method applied to features in the heatmap display")
         self.heatmap_scaling_combo.currentTextChanged.connect(self._on_heatmap_scaling_changed)
         viz_layout.addWidget(self.heatmap_scaling_combo)
@@ -1189,26 +1221,31 @@ class CellClusteringDialog(QtWidgets.QDialog):
         """
         if not hasattr(self, 'canvas'):
             return
-        self.canvas.draw()
+        nonblocking_refresh = should_use_nonblocking_canvas_refresh()
+        refresh_canvas(self.canvas, draw=True)
         if force_layout_refresh:
-            try:
-                old_w = max(2, int(self.canvas.width()))
-                old_h = max(2, int(self.canvas.height()))
-                # Nudge the canvas by 1px and back to force a full Qt repaint cycle.
-                self.canvas.resize(old_w + 1, old_h + 1)
-                QtWidgets.QApplication.processEvents(QtCore.QEventLoop.AllEvents, 20)
-                self.canvas.resize(old_w, old_h)
-                if hasattr(self.canvas, 'resize_event'):
-                    try:
-                        self.canvas.resize_event()
-                    except Exception:
-                        pass
-            except Exception:
-                # Best-effort fallback only.
-                pass
-            self.canvas.draw()
-        self.canvas.update()
-        self.canvas.repaint()
+            if nonblocking_refresh:
+                try:
+                    self.canvas.updateGeometry()
+                except Exception:
+                    pass
+            else:
+                try:
+                    old_w = max(2, int(self.canvas.width()))
+                    old_h = max(2, int(self.canvas.height()))
+                    # Nudge the canvas by 1px and back to force a full Qt repaint cycle.
+                    self.canvas.resize(old_w + 1, old_h + 1)
+                    QtWidgets.QApplication.processEvents(QtCore.QEventLoop.AllEvents, 20)
+                    self.canvas.resize(old_w, old_h)
+                    if hasattr(self.canvas, 'resize_event'):
+                        try:
+                            self.canvas.resize_event()
+                        except Exception:
+                            pass
+                except Exception:
+                    # Best-effort fallback only.
+                    pass
+                refresh_canvas(self.canvas, draw=True)
         QtWidgets.QApplication.processEvents(QtCore.QEventLoop.AllEvents, 20)
 
     def _fit_standard_figure_to_canvas(self, rect=None, pad: float = 0.8, allow_text_compaction: bool = True):
@@ -1699,14 +1736,9 @@ class CellClusteringDialog(QtWidgets.QDialog):
                 source_file=source_file
             )
             
-            # Store the scaling method used for clustering and set heatmap scaling default
+            # Store the scaling method used for clustering.
             clustering_scaling_text = self.clustering_scaling_combo.currentText()
             self.clustering_scaling_method = clustering_scaling_text
-            if hasattr(self, 'heatmap_scaling_combo'):
-                # Set heatmap scaling default to match clustering scaling (user can change it later)
-                self.heatmap_scaling_combo.blockSignals(True)
-                self.heatmap_scaling_combo.setCurrentText(clustering_scaling_text)
-                self.heatmap_scaling_combo.blockSignals(False)
             
             # Restore preserved view and selected features after clustering
             if saved_view and hasattr(self, 'view_combo'):
@@ -2138,6 +2170,13 @@ class CellClusteringDialog(QtWidgets.QDialog):
             pass
         
         return data_scaled
+
+    def _get_heatmap_scaling_method(self) -> str:
+        """Return the selected heatmap/cluster-map scaling method."""
+        scaling_text = _HEATMAP_SCALING_DEFAULT_TEXT
+        if hasattr(self, 'heatmap_scaling_combo'):
+            scaling_text = self.heatmap_scaling_combo.currentText()
+        return _HEATMAP_SCALING_MAP.get(scaling_text, "zscore")
     
     def _perform_clustering(self, data, n_clusters, method):
         """Perform clustering using specified method."""
@@ -2575,20 +2614,7 @@ class CellClusteringDialog(QtWidgets.QDialog):
             if 'cluster' in self.clustered_data.columns:
                 pass
             
-            # Get selected scaling method
-            scaling_text = "None (no scaling)"  # Default
-            if hasattr(self, 'heatmap_scaling_combo'):
-                scaling_text = self.heatmap_scaling_combo.currentText()
-            else:
-                pass
-            
-            # Map UI text to method string
-            scaling_map = {
-                "None (no scaling)": "none",
-                "Z-score": "zscore",
-                "MAD (Median Absolute Deviation)": "mad"
-            }
-            scaling_method = scaling_map.get(scaling_text, "none")
+            scaling_method = self._get_heatmap_scaling_method()
             
             # Use unscaled data if available, otherwise use clustered_data
             base_data = self.clustered_data_unscaled if self.clustered_data_unscaled is not None else self.clustered_data
@@ -3155,20 +3181,7 @@ class CellClusteringDialog(QtWidgets.QDialog):
                 return
             
             
-            # Get selected scaling method
-            scaling_text = "None (no scaling)"  # Default
-            if hasattr(self, 'heatmap_scaling_combo'):
-                scaling_text = self.heatmap_scaling_combo.currentText()
-            else:
-                pass
-            
-            # Map UI text to method string
-            scaling_map = {
-                "None (no scaling)": "none",
-                "Z-score": "zscore",
-                "MAD (Median Absolute Deviation)": "mad"
-            }
-            scaling_method = scaling_map.get(scaling_text, "none")
+            scaling_method = self._get_heatmap_scaling_method()
             
             # Use unscaled data if available, otherwise use clustered_data
             base_data = self.clustered_data_unscaled if self.clustered_data_unscaled is not None else self.clustered_data
@@ -3903,18 +3916,7 @@ class CellClusteringDialog(QtWidgets.QDialog):
             if self.clustered_data is None:
                 self._create_matplotlib_heatmap()
                 return
-            # Get selected scaling method
-            scaling_text = "None (no scaling)"  # Default
-            if hasattr(self, 'heatmap_scaling_combo'):
-                scaling_text = self.heatmap_scaling_combo.currentText()
-            
-            # Map UI text to method string
-            scaling_map = {
-                "Z-score": "zscore",
-                "MAD (Median Absolute Deviation)": "mad",
-                "None (no scaling)": "none"
-            }
-            scaling_method = scaling_map.get(scaling_text, "none")
+            scaling_method = self._get_heatmap_scaling_method()
             
             # Use unscaled data if available, otherwise use clustered_data
             base_data = self.clustered_data_unscaled if self.clustered_data_unscaled is not None else self.clustered_data
@@ -4069,18 +4071,7 @@ class CellClusteringDialog(QtWidgets.QDialog):
             self.canvas.draw()
             return
         
-        # Get selected scaling method
-        scaling_text = "None (no scaling)"  # Default
-        if hasattr(self, 'heatmap_scaling_combo'):
-            scaling_text = self.heatmap_scaling_combo.currentText()
-        
-        # Map UI text to method string
-        scaling_map = {
-            "Z-score": "zscore",
-            "MAD (Median Absolute Deviation)": "mad",
-            "None (no scaling)": "none"
-        }
-        scaling_method = scaling_map.get(scaling_text, "none")
+        scaling_method = self._get_heatmap_scaling_method()
         
         # Use unscaled data if available, otherwise use clustered_data
         base_data = self.clustered_data_unscaled if self.clustered_data_unscaled is not None else self.clustered_data
@@ -8159,6 +8150,7 @@ class CellClusteringDialog(QtWidgets.QDialog):
             self.cluster_annotation_map = normalize_cluster_annotation_map({
                 cid: editors[cid].text().strip() for cid in unique_clusters if editors[cid].text().strip()
             })
+            self.cluster_backend_names = dict(self.cluster_annotation_map)
             self._apply_cluster_annotations()
             
             # Log annotation operation
@@ -8876,12 +8868,14 @@ class CellClusteringDialog(QtWidgets.QDialog):
         """Apply current annotation map to clustered_data and feature_dataframe as 'cluster_phenotype'."""
         if not self.clustered_data is None and self.cluster_annotation_map:
             self.cluster_annotation_map = normalize_cluster_annotation_map(self.cluster_annotation_map)
-            self.cluster_backend_names = normalize_cluster_annotation_map(self.cluster_backend_names)
-            # Use backend names for CSV export if available, otherwise use display names
-            export_name_map = self.cluster_backend_names if self.cluster_backend_names else self.cluster_annotation_map
+            # Persist the current user-visible names into exported phenotype columns.
+            self.cluster_backend_names = dict(self.cluster_annotation_map)
             
-            # Map on clustered_data using backend names for CSV export
-            self.clustered_data['cluster_phenotype'] = self.clustered_data['cluster'].map(export_name_map).fillna('')
+            self.clustered_data['cluster_phenotype'] = self.clustered_data['cluster'].map(self.cluster_annotation_map).fillna('')
+            if self.clustered_data_unscaled is not None and 'cluster' in self.clustered_data_unscaled.columns:
+                self.clustered_data_unscaled['cluster_phenotype'] = self.clustered_data_unscaled['cluster'].map(
+                    self.cluster_annotation_map
+                ).fillna('')
             # Write back to feature_dataframe aligned by index
             aligned = self.feature_dataframe.reindex(self.clustered_data.index)
             if 'cluster_phenotype' not in self.feature_dataframe.columns:

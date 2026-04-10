@@ -34,9 +34,67 @@ from openimc.core import (
     segment,
     extract_features,
     cluster,
+    build_spatial_graph_anndata,
     qc_analysis,
     pixel_correlation
 )
+
+
+def test_build_spatial_graph_anndata_normalizes_preclustered_categorical_labels(monkeypatch):
+    pytest.importorskip("anndata")
+
+    import sys
+    import types
+    from scipy import sparse as sp
+
+    def _fake_spatial_neighbors(adata, **_kwargs):
+        n_cells = adata.n_obs
+        rows = np.arange(max(0, n_cells - 1), dtype=int)
+        cols = rows + 1
+        data = np.ones(len(rows) * 2, dtype=float)
+        connectivities = sp.csr_matrix(
+            (data, (np.concatenate([rows, cols]), np.concatenate([cols, rows]))),
+            shape=(n_cells, n_cells),
+        )
+        adata.obsp["spatial_connectivities"] = connectivities
+        adata.obsp["spatial_distances"] = connectivities.copy()
+
+    fake_squidpy = types.ModuleType("squidpy")
+    fake_squidpy.gr = types.SimpleNamespace(spatial_neighbors=_fake_spatial_neighbors)
+    monkeypatch.setitem(sys.modules, "squidpy", fake_squidpy)
+
+    features_df = pd.DataFrame(
+        {
+            "cell_id": [1, 2, 3],
+            "acquisition_id": ["ROI_1", "ROI_1", "ROI_1"],
+            "centroid_x": [0.0, 10.0, 20.0],
+            "centroid_y": [0.0, 10.0, 20.0],
+            "cluster_phenotype": pd.Categorical(
+                ["Cluster 10", "Cluster 2", "Cluster 1"],
+                categories=["Cluster 10", "Cluster 2", "Cluster 1"],
+            ),
+            "cluster_id": pd.Categorical(
+                ["10", "2", "Cluster 1"],
+                categories=["10", "2", "Cluster 1"],
+            ),
+        }
+    )
+
+    anndata_dict = build_spatial_graph_anndata(
+        features_df,
+        method="kNN",
+        k_neighbors=1,
+        roi_column="acquisition_id",
+    )
+
+    adata = anndata_dict["ROI_1"]
+    assert list(adata.obs["cluster"].cat.categories) == [1, 2, 10]
+    assert list(adata.obs["cluster_id"].cat.categories) == [1, 2, 10]
+    assert list(adata.obs["cluster_phenotype"].cat.categories) == [
+        "Cluster 1",
+        "Cluster 2",
+        "Cluster 10",
+    ]
 
 
 @pytest.mark.unit
@@ -790,4 +848,3 @@ class TestPixelCorrelation:
             # Check that p-values are in valid range [0, 1]
             assert (corr_df['p_value'] >= 0.0).all(), "P-values should be >= 0"
             assert (corr_df['p_value'] <= 1.0).all(), "P-values should be <= 1"
-

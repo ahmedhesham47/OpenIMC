@@ -18,8 +18,10 @@
 # along with this program.  If not, see <https://www.gnu.org/licenses/>.
 
 import numpy as np
+import pandas as pd
 
 from openimc.ui.cluster_utils import (
+    extract_cluster_annotation_map_from_dataframe,
     get_cluster_display_name,
     normalize_cluster_annotation_map,
     sort_cluster_values,
@@ -57,3 +59,17 @@ def test_sort_cluster_values_remains_stable_for_overlay_style_mixed_types():
     )
 
     assert ordered == [1, 2, 10, "Unassigned"]
+
+
+def test_extract_cluster_annotation_map_from_dataframe_uses_persisted_cluster_phenotypes():
+    df = pd.DataFrame(
+        {
+            "cluster": ["1", "1", 2, 2],
+            "cluster_phenotype": ["Edited T cells", "", "Edited B cells", "Edited B cells"],
+        }
+    )
+
+    assert extract_cluster_annotation_map_from_dataframe(df) == {
+        1: "Edited T cells",
+        2: "Edited B cells",
+    }

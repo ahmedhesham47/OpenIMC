@@ -145,6 +145,33 @@ def canonicalize_cluster_id(value: Any, annotation_map: Optional[Dict[Any, Any]]
     return canonical_value
 
 
+def extract_cluster_annotation_map_from_dataframe(dataframe: Optional[pd.DataFrame]) -> Dict[Any, str]:
+    """Recover persisted cluster display names from a dataframe when available."""
+    if dataframe is None or dataframe.empty or "cluster_phenotype" not in dataframe.columns:
+        return {}
+
+    cluster_col = None
+    for candidate in ("cluster", "cluster_id"):
+        if candidate in dataframe.columns:
+            cluster_col = candidate
+            break
+    if cluster_col is None:
+        return {}
+
+    phenotype_map: Dict[Any, str] = {}
+    subset = dataframe.loc[:, [cluster_col, "cluster_phenotype"]]
+    for cluster_value, phenotype_value in subset.itertuples(index=False, name=None):
+        phenotype_name = _normalize_text(phenotype_value)
+        if not phenotype_name:
+            continue
+        canonical_cluster = canonicalize_cluster_id(cluster_value)
+        if canonical_cluster is None or canonical_cluster in phenotype_map:
+            continue
+        phenotype_map[canonical_cluster] = phenotype_name
+
+    return normalize_cluster_annotation_map(phenotype_map)
+
+
 def format_default_cluster_label(cluster_id: Any) -> str:
     """Return the default label for a cluster id."""
     canonical_id = canonicalize_cluster_id(cluster_id)

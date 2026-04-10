@@ -17,6 +17,8 @@
 # You should have received a copy of the GNU General Public License
 # along with this program.  If not, see <https://www.gnu.org/licenses/>.
 
+import os
+import sys
 from typing import Dict, Iterable, Optional, Sequence
 import warnings
 
@@ -78,6 +80,37 @@ def sync_figure_to_canvas(figure: Figure, canvas) -> None:
         figure.set_size_inches(width_px / target_dpi, height_px / target_dpi, forward=False)
     except Exception:
         # Best-effort only.
+        pass
+
+
+def should_use_nonblocking_canvas_refresh() -> bool:
+    """Avoid synchronous Qt repaints in environments where they can deadlock."""
+    return sys.platform == "darwin" and os.environ.get("GITHUB_ACTIONS") == "true"
+
+
+def refresh_canvas(canvas, *, draw: bool = True) -> None:
+    """Redraw a Qt-backed canvas without forcing unsafe native repaints."""
+    if canvas is None:
+        return
+
+    try:
+        if draw:
+            canvas.draw()
+    except Exception:
+        pass
+
+    try:
+        canvas.update()
+    except Exception:
+        pass
+
+    try:
+        if should_use_nonblocking_canvas_refresh():
+            if hasattr(canvas, 'draw_idle'):
+                canvas.draw_idle()
+        else:
+            canvas.repaint()
+    except Exception:
         pass
 
 
@@ -261,12 +294,7 @@ def fit_canvas_and_draw(
         max_passes=max_passes,
         allow_text_compaction=allow_text_compaction,
     )
-    try:
-        canvas.draw()
-        canvas.update()
-        canvas.repaint()
-    except Exception:
-        pass
+    refresh_canvas(canvas, draw=True)
     return overflow
 
 

@@ -21,9 +21,11 @@ import numpy as np
 from matplotlib.backends.backend_qt5agg import FigureCanvasQTAgg as FigureCanvas
 from matplotlib.figure import Figure
 
+import openimc.ui.figure_layout as figure_layout
 from openimc.ui.figure_layout import (
     fit_canvas_and_draw,
     measure_figure_text_overflow,
+    refresh_canvas,
     sync_figure_to_canvas,
 )
 
@@ -42,6 +44,23 @@ class _FakeCanvas:
 
     def devicePixelRatioF(self):
         return self._device_pixel_ratio
+
+
+class _FakeRefreshCanvas:
+    def __init__(self):
+        self.calls = []
+
+    def draw(self):
+        self.calls.append("draw")
+
+    def draw_idle(self):
+        self.calls.append("draw_idle")
+
+    def update(self):
+        self.calls.append("update")
+
+    def repaint(self):
+        self.calls.append("repaint")
 
 
 def _build_canvas(qtbot, width: int, height: int):
@@ -90,6 +109,28 @@ def test_sync_figure_to_canvas_accounts_for_hidpi_device_ratio():
     assert abs(fig.get_size_inches()[1] - 5.2) < 1e-6
     assert abs(float(fig.bbox.width) - 1440.0) < 1e-6
     assert abs(float(fig.bbox.height) - 1040.0) < 1e-6
+
+
+def test_refresh_canvas_avoids_blocking_repaint_on_macos_github_actions(monkeypatch):
+    canvas = _FakeRefreshCanvas()
+
+    monkeypatch.setattr(figure_layout.sys, "platform", "darwin", raising=False)
+    monkeypatch.setenv("GITHUB_ACTIONS", "true")
+
+    refresh_canvas(canvas)
+
+    assert canvas.calls == ["draw", "update", "draw_idle"]
+
+
+def test_refresh_canvas_uses_repaint_outside_macos_github_actions(monkeypatch):
+    canvas = _FakeRefreshCanvas()
+
+    monkeypatch.setattr(figure_layout.sys, "platform", "linux", raising=False)
+    monkeypatch.delenv("GITHUB_ACTIONS", raising=False)
+
+    refresh_canvas(canvas)
+
+    assert canvas.calls == ["draw", "update", "repaint"]
 
 
 def test_fit_canvas_and_draw_keeps_external_legend_inside_reserved_space(qtbot):
