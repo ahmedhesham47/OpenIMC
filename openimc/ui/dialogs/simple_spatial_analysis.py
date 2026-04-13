@@ -51,6 +51,7 @@ from openimc.ui.cluster_utils import (
     format_default_cluster_label,
     get_cluster_display_name,
     is_cluster_column,
+    map_cluster_series_to_display_names,
     normalize_cluster_annotation_map,
     sort_cluster_values,
 )
@@ -1255,8 +1256,9 @@ class SimpleSpatialAnalysisDialog(QtWidgets.QDialog):
             df = getattr(self, dataframe_attr, None)
             if df is None or 'cluster' not in df.columns:
                 continue
-            phenotype_series = df['cluster'].map(
-                lambda cluster_id: self._get_cluster_display_name(cluster_id)
+            phenotype_series = map_cluster_series_to_display_names(
+                df['cluster'],
+                annotation_map=self.cluster_annotation_map,
             )
             df.loc[:, 'cluster_phenotype'] = phenotype_series
 
@@ -1397,6 +1399,12 @@ class SimpleSpatialAnalysisDialog(QtWidgets.QDialog):
 
     def _get_cluster_display_name(self, cluster_id):
         """Return display label for a cluster id, using annotation if available."""
+        local_map = self.cluster_annotation_map or {}
+        if local_map:
+            canonical_cluster_id = canonicalize_cluster_id(cluster_id, annotation_map=local_map)
+            if canonical_cluster_id in local_map:
+                return get_cluster_display_name(cluster_id, annotation_map=local_map)
+
         try:
             parent = self.parent()
             if parent is not None and hasattr(parent, '_get_cluster_display_name'):
@@ -1404,7 +1412,7 @@ class SimpleSpatialAnalysisDialog(QtWidgets.QDialog):
         except Exception:
             pass
 
-        return get_cluster_display_name(cluster_id, annotation_map=self.cluster_annotation_map)
+        return get_cluster_display_name(cluster_id, annotation_map=local_map)
 
     def _check_annotation_updates(self):
         """Periodically pull shared label maps from the clustering dialog."""

@@ -189,6 +189,25 @@ def build_cluster_annotation_map(
     return merged_map
 
 
+def map_cluster_series_to_display_names(
+    cluster_series: Optional[pd.Series],
+    annotation_map: Optional[Dict[Any, Any]] = None,
+) -> pd.Series:
+    """Map cluster values to display names while resolving each distinct value only once."""
+    if cluster_series is None:
+        return pd.Series(dtype=object)
+
+    if cluster_series.empty:
+        return cluster_series.astype(object, copy=False)
+
+    normalized_map = normalize_cluster_annotation_map(annotation_map)
+    display_lookup = {
+        cluster_value: get_cluster_display_name(cluster_value, annotation_map=normalized_map)
+        for cluster_value in pd.unique(cluster_series.dropna())
+    }
+    return cluster_series.map(display_lookup)
+
+
 def format_default_cluster_label(cluster_id: Any) -> str:
     """Return the default label for a cluster id."""
     canonical_id = canonicalize_cluster_id(cluster_id)

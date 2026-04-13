@@ -124,3 +124,26 @@ def test_loaded_feature_dataframe_cluster_phenotypes_are_available_for_display()
         2: "Edited B cells",
     }
     assert get_cluster_display_name(1, annotation_map=annotation_map) == "Edited T cells"
+
+
+def test_simple_spatial_uses_local_cluster_names_without_parent_round_trip(qtbot):
+    _, clustered_df = _build_clustered_features()
+
+    class _FailingParent(QtWidgets.QWidget):
+        def _get_cluster_display_name(self, cluster_id):
+            raise AssertionError("Simple spatial dialog should not ask the parent for each cluster label.")
+
+    parent = _FailingParent()
+    qtbot.addWidget(parent)
+
+    dialog = SimpleSpatialAnalysisDialog(
+        clustered_df.copy(),
+        clustered_cells_dataframe=clustered_df.copy(),
+        parent=parent,
+    )
+    qtbot.addWidget(dialog)
+
+    assert set(dialog.feature_dataframe["cluster_phenotype"]) == {
+        "Edited T cells",
+        "Edited B cells",
+    }

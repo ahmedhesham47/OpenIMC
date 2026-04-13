@@ -60,6 +60,7 @@ from openimc.ui.cluster_utils import (
     extract_cluster_annotation_map_from_dataframe,
     format_default_cluster_label,
     get_cluster_display_name,
+    map_cluster_series_to_display_names,
     normalize_cluster_annotation_map,
     sort_cluster_values,
 )
@@ -893,16 +894,18 @@ class AdvancedSpatialAnalysisDialog(QtWidgets.QDialog):
             df = getattr(self, dataframe_attr, None)
             if df is None or 'cluster' not in df.columns:
                 continue
-            phenotype_series = df['cluster'].map(
-                lambda cluster_id: self._get_cluster_display_name(cluster_id)
+            phenotype_series = map_cluster_series_to_display_names(
+                df['cluster'],
+                annotation_map=self.cluster_annotation_map,
             )
             df.loc[:, 'cluster_phenotype'] = phenotype_series
 
         for adata in self.anndata_cache.values():
             if 'cluster' not in adata.obs.columns:
                 continue
-            phenotype_series = adata.obs['cluster'].map(
-                lambda cluster_id: self._get_cluster_display_name(cluster_id)
+            phenotype_series = map_cluster_series_to_display_names(
+                adata.obs['cluster'],
+                annotation_map=self.cluster_annotation_map,
             )
             adata.obs['cluster_phenotype'] = phenotype_series
             adata.obs['cluster_phenotype'] = adata.obs['cluster_phenotype'].astype('category')
@@ -910,8 +913,9 @@ class AdvancedSpatialAnalysisDialog(QtWidgets.QDialog):
         for result in self.aggregated_results.values():
             if not hasattr(result, 'obs') or 'cluster' not in result.obs.columns:
                 continue
-            phenotype_series = result.obs['cluster'].map(
-                lambda cluster_id: self._get_cluster_display_name(cluster_id)
+            phenotype_series = map_cluster_series_to_display_names(
+                result.obs['cluster'],
+                annotation_map=self.cluster_annotation_map,
             )
             result.obs['cluster_phenotype'] = phenotype_series
             try:
@@ -1040,6 +1044,12 @@ class AdvancedSpatialAnalysisDialog(QtWidgets.QDialog):
     
     def _get_cluster_display_name(self, cluster_id):
         """Return display label for a cluster id, using annotation if available."""
+        local_map = self.cluster_annotation_map or {}
+        if local_map:
+            canonical_cluster_id = canonicalize_cluster_id(cluster_id, annotation_map=local_map)
+            if canonical_cluster_id in local_map:
+                return get_cluster_display_name(cluster_id, annotation_map=local_map)
+
         try:
             parent = self.parent()
             if parent is not None and hasattr(parent, '_get_cluster_display_name'):
@@ -1047,7 +1057,7 @@ class AdvancedSpatialAnalysisDialog(QtWidgets.QDialog):
         except Exception:
             pass
 
-        return get_cluster_display_name(cluster_id, annotation_map=self.cluster_annotation_map)
+        return get_cluster_display_name(cluster_id, annotation_map=local_map)
     
     def _on_feature_set_changed(self):
         """Handle feature set change - invalidate cache and refresh."""
