@@ -172,6 +172,23 @@ def extract_cluster_annotation_map_from_dataframe(dataframe: Optional[pd.DataFra
     return normalize_cluster_annotation_map(phenotype_map)
 
 
+def build_cluster_annotation_map(
+    annotation_map: Optional[Dict[Any, Any]] = None,
+    *dataframes: Optional[pd.DataFrame],
+) -> Dict[Any, str]:
+    """Merge a base annotation map with persisted cluster phenotypes from dataframes."""
+    merged_map = normalize_cluster_annotation_map(annotation_map)
+    loaded_annotations: Dict[Any, str] = {}
+
+    for dataframe in dataframes:
+        loaded_annotations.update(extract_cluster_annotation_map_from_dataframe(dataframe))
+
+    for cluster_id, display_name in normalize_cluster_annotation_map(loaded_annotations).items():
+        merged_map.setdefault(cluster_id, display_name)
+
+    return merged_map
+
+
 def format_default_cluster_label(cluster_id: Any) -> str:
     """Return the default label for a cluster id."""
     canonical_id = canonicalize_cluster_id(cluster_id)

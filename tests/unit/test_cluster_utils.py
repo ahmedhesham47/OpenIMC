@@ -21,6 +21,7 @@ import numpy as np
 import pandas as pd
 
 from openimc.ui.cluster_utils import (
+    build_cluster_annotation_map,
     extract_cluster_annotation_map_from_dataframe,
     get_cluster_display_name,
     normalize_cluster_annotation_map,
@@ -73,3 +74,24 @@ def test_extract_cluster_annotation_map_from_dataframe_uses_persisted_cluster_ph
         1: "Edited T cells",
         2: "Edited B cells",
     }
+
+
+def test_build_cluster_annotation_map_merges_loaded_dataframe_annotations_without_overriding_existing_names():
+    df = pd.DataFrame(
+        {
+            "cluster": [1, 1, 2, 2],
+            "cluster_phenotype": ["Loaded T cells", "Loaded T cells", "Loaded B cells", "Loaded B cells"],
+        }
+    )
+
+    annotation_map = build_cluster_annotation_map(
+        {1: "Saved T cells"},
+        df,
+    )
+
+    assert annotation_map == {
+        1: "Saved T cells",
+        2: "Loaded B cells",
+    }
+    assert get_cluster_display_name(1, annotation_map=annotation_map) == "Saved T cells"
+    assert get_cluster_display_name(2, annotation_map=annotation_map) == "Loaded B cells"

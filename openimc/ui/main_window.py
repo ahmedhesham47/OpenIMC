@@ -175,8 +175,8 @@ from openimc.ui.dialogs.ometiff_format_dialog import OMETIFFFormatDialog
 from openimc.ui.dialogs.deconvolution_dialog import DeconvolutionDialog
 from openimc.ui.dialogs.pixel_correlation_dialog import PixelCorrelationDialog, ConditionROIWidget
 from openimc.ui.cluster_utils import (
+    build_cluster_annotation_map,
     canonicalize_cluster_id,
-    extract_cluster_annotation_map_from_dataframe,
     get_cluster_display_name,
     normalize_cluster_annotation_map,
     sort_cluster_values,
@@ -7537,18 +7537,12 @@ class MainWindow(QtWidgets.QMainWindow):
             saved_state = getattr(self, '_saved_clustering_state', {}) or {}
             annotation_map = normalize_cluster_annotation_map(saved_state.get('cluster_annotation_map', {}) or {})
 
-        loaded_annotations: Dict[Any, str] = {}
-        for dataframe in (
+        return build_cluster_annotation_map(
+            annotation_map,
             getattr(self, 'feature_dataframe', None),
             getattr(self, 'batch_corrected_dataframe', None),
             getattr(self, 'clustered_cells_dataframe', None),
-        ):
-            loaded_annotations.update(extract_cluster_annotation_map_from_dataframe(dataframe))
-
-        for cluster_id, display_name in normalize_cluster_annotation_map(loaded_annotations).items():
-            annotation_map.setdefault(cluster_id, display_name)
-
-        return annotation_map
+        )
 
     def _get_cluster_display_name(self, cluster_id):
         """Return the current display name for a cluster id."""
