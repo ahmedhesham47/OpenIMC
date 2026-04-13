@@ -20,14 +20,10 @@
 from contextlib import contextmanager
 from typing import Dict, List, Optional, Tuple
 
+import matplotlib.pyplot as plt
 import numpy as np
 from PyQt5 import QtWidgets
 from PyQt5.QtCore import Qt
-
-import matplotlib
-
-matplotlib.use("Qt5Agg")
-import matplotlib.pyplot as plt
 
 from openimc.data.mcd_loader import AcquisitionInfo, MCDLoader  # noqa: F401
 from openimc.ui.mpl_canvas import MplCanvas

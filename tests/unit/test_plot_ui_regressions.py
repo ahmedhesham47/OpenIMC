@@ -920,6 +920,86 @@ def test_advanced_cooccurrence_heatmap_preserves_typed_distance_selection(qtbot)
     assert dialog.sq_cooccur_heatmap_distance == pytest.approx(20.0)
 
 
+def test_advanced_cooccurrence_reference_cluster_defaults_to_one_without_extra_plot(qtbot, monkeypatch):
+    dialog = _build_advanced_dialog(qtbot, n_clusters=4)
+    categories = [1, 2, 3, 4]
+    adata = _TempAnnData(
+        {'co_occurrence': {'occ': _build_cooccurrence_array(4, 3), 'interval': [0.0, 10.0, 20.0, 30.0]}},
+        categories,
+    )
+    dialog.anndata_cache = {'ROI_1': adata}
+
+    plot_calls = []
+    monkeypatch.setattr(dialog, '_plot_sq_cooccurrence', lambda _adata: plot_calls.append(_adata))
+
+    dialog._update_cooccur_ref_cluster_combo(adata, preserve_selection=True)
+
+    assert plot_calls == []
+    assert dialog.sq_cooccur_ref_cluster_combo.currentData() == 1
+
+
+@pytest.mark.parametrize(
+    ("plot_type", "selected_cluster", "expected_reference_cluster"),
+    [
+        ("Heatmap", 2, None),
+        ("Curves", 2, 2),
+        ("Curves", None, None),
+    ],
+)
+def test_advanced_cooccurrence_run_respects_plot_type_and_cluster_selection(
+    qtbot,
+    monkeypatch,
+    plot_type,
+    selected_cluster,
+    expected_reference_cluster,
+):
+    from openimc.ui.dialogs import advanced_spatial_analysis as advanced_module
+
+    dialog = _build_advanced_dialog(qtbot, n_clusters=4)
+    categories = [1, 2, 3, 4]
+    base_adata = _TempAnnData(
+        {},
+        categories,
+        obsp={'spatial_connectivities': np.eye(4, dtype=float)},
+    )
+    dialog.spatial_graph_built = True
+    dialog.anndata_cache = {'ROI_1': base_adata}
+    dialog._update_cooccur_ref_cluster_combo(base_adata, preserve_selection=False)
+    dialog.sq_cooccur_plot_type_combo.setCurrentText(plot_type)
+
+    if selected_cluster is None:
+        dialog.sq_cooccur_ref_cluster_combo.setCurrentIndex(0)
+    else:
+        for idx in range(dialog.sq_cooccur_ref_cluster_combo.count()):
+            if dialog.sq_cooccur_ref_cluster_combo.itemData(idx) == selected_cluster:
+                dialog.sq_cooccur_ref_cluster_combo.setCurrentIndex(idx)
+                break
+
+    captured = {}
+
+    def _fake_cooccurrence(*, anndata_dict, cluster_key, interval, reference_cluster):
+        captured['reference_cluster'] = reference_cluster
+        result_adata = base_adata.copy()
+        result_adata.uns['co_occurrence'] = {
+            'occ': _build_cooccurrence_array(len(categories), len(interval)),
+            'interval': [0.0, *interval],
+        }
+        return {'ROI_1': result_adata}
+
+    monkeypatch.setattr(advanced_module, 'spatial_cooccurrence', _fake_cooccurrence)
+    monkeypatch.setattr(
+        advanced_module,
+        'run_blocking_task_with_progress',
+        lambda **kwargs: kwargs['task'](),
+    )
+    monkeypatch.setattr(advanced_module.QtWidgets.QMessageBox, 'information', lambda *args, **kwargs: None)
+    monkeypatch.setattr(dialog, '_plot_sq_cooccurrence', lambda _adata: None)
+
+    dialog._run_sq_cooccurrence()
+
+    assert captured['reference_cluster'] == expected_reference_cluster
+
+
 def test_advanced_cooccurrence_export_dataframe_is_long_form(qtbot):
     dialog = _build_advanced_dialog(qtbot, n_clusters=4)
     categories = [1, 2]

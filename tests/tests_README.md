@@ -80,6 +80,9 @@ pytest -m unit
 # Skip slow tests
 pytest -m "not slow"
 
+# Skip slow and Qt/UI tests
+pytest -m "not slow and not ui"
+
 # Run tests that require GPU (if available)
 pytest -m requires_gpu
 ```
@@ -110,6 +113,9 @@ Tests are marked with the following markers:
 - `requires_readimc`: Tests that require readimc library
 - `ui`: Tests that require UI/Qt
 - `data`: Tests that require test data files
+
+Tests that use the `qtbot` or `qapp` fixtures are auto-marked as `ui` during collection.
+If a test drives Qt widgets without using either fixture, mark it explicitly with `@pytest.mark.ui`.
 
 ## Writing Tests
 
@@ -142,6 +148,7 @@ Integration tests should:
    - Test individual functions
    - Use fixtures from `conftest.py`
    - Mark with `@pytest.mark.unit`
+   - If the test exercises Qt widgets and does not use `qtbot` or `qapp`, add `@pytest.mark.ui`
 
 2. **Integration Tests**: Add to `tests/integration/test_<workflow>.py`
    - Test complete workflows
@@ -197,10 +204,12 @@ Some tests may be skipped if optional dependencies are not installed:
 
 ### Qt/UI Tests
 UI tests require PyQt5 and may need a display. Use `pytest-qt` for Qt-specific testing.
+Tests using `qtbot` or `qapp` are auto-marked as `ui`; other Qt-driven tests should be marked manually.
 
 ## Continuous Integration
 
 The test suite is designed to work in CI/CD environments. Some tests will be automatically skipped if dependencies are unavailable.
+On macOS GitHub Actions, Qt/UI tests are excluded with `not ui` to avoid known hangs in hosted runners.
 
 ## Coverage
 
@@ -211,4 +220,3 @@ Aim for high test coverage of core functionality:
 - CLI commands
 
 UI components may have lower coverage due to Qt dependencies.
-

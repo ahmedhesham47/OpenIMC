@@ -24,14 +24,11 @@ import numpy as np
 
 from PyQt5 import QtWidgets, QtCore
 from PyQt5.QtCore import Qt
-import matplotlib
-matplotlib.use('Qt5Agg')
 import matplotlib.cm as cm
 from matplotlib.backends.backend_qt5agg import FigureCanvasQTAgg as FigureCanvas
 from matplotlib.figure import Figure
 from matplotlib.patches import Circle, PathPatch
 from scipy.optimize import curve_fit
-import numpy as np
 from skimage.measure import label, regionprops
 from scipy.ndimage import distance_transform_edt
 
@@ -1994,4 +1991,3 @@ class DeconvolutionDialog(QtWidgets.QDialog):
             self.deconv_passes_arr, self.deconv_contribs_arr, self.deconv_kernel_dim,
             self.deconv_region_data_full, self.deconv_sigmoidal_params
         )
-

@@ -17,6 +17,8 @@
 # You should have received a copy of the GNU General Public License
 # along with this program.  If not, see <https://www.gnu.org/licenses/>.
 
+from types import SimpleNamespace
+
 import pandas as pd
 from PyQt5 import QtWidgets
 
@@ -108,3 +110,29 @@ def test_simple_spatial_uses_cluster_phenotypes_from_loaded_clustered_dataframe(
         "Edited T cells",
         "Edited B cells",
     }
+
+
+def test_main_window_uses_cluster_phenotypes_from_loaded_feature_dataframe():
+    _, clustered_df = _build_clustered_features()
+    from openimc.ui.main_window import MainWindow
+
+    class _FakeMainWindow(SimpleNamespace):
+        def _get_cluster_annotation_map(self):
+            return MainWindow._get_cluster_annotation_map(self)
+
+        def _get_cluster_display_name(self, cluster_id):
+            return MainWindow._get_cluster_display_name(self, cluster_id)
+
+    window = _FakeMainWindow(
+        clustering_dialog=None,
+        _saved_clustering_state={},
+        feature_dataframe=clustered_df.copy(),
+        batch_corrected_dataframe=None,
+        clustered_cells_dataframe=None,
+    )
+
+    assert window._get_cluster_annotation_map() == {
+        1: "Edited T cells",
+        2: "Edited B cells",
+    }
+    assert window._get_cluster_display_name(1) == "Edited T cells"

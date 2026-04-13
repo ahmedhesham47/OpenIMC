@@ -1312,6 +1312,9 @@ class AdvancedSpatialAnalysisDialog(QtWidgets.QDialog):
     
     def _on_sq_cooccur_ref_cluster_changed(self):
         """Handle reference cluster change in co-occurrence tab."""
+        if self.sq_cooccur_plot_type_combo.currentText() != "Curves":
+            return
+
         adata = self._get_sq_cooccur_plot_adata()
         if adata is None:
             return
@@ -1338,6 +1341,7 @@ class AdvancedSpatialAnalysisDialog(QtWidgets.QDialog):
         plot_type = self.sq_cooccur_plot_type_combo.currentText()
         # Enable/disable distance input based on plot type
         self.sq_cooccur_distance_spin.setEnabled(plot_type == "Heatmap")
+        self.sq_cooccur_ref_cluster_combo.setEnabled(plot_type == "Curves")
         
         adata = self._get_sq_cooccur_plot_adata()
         if adata is None:
@@ -1391,9 +1395,7 @@ class AdvancedSpatialAnalysisDialog(QtWidgets.QDialog):
         if preserve_selection:
             current_selection = self.sq_cooccur_ref_cluster_combo.currentData()
         
-        self.sq_cooccur_ref_cluster_combo.clear()
-        self.sq_cooccur_ref_cluster_combo.addItem("All clusters", None)
-        
+        categories = []
         if cluster_key in adata.obs.columns:
             if hasattr(adata.obs[cluster_key], 'cat'):
                 categories = list(adata.obs[cluster_key].cat.categories)
@@ -1403,38 +1405,37 @@ class AdvancedSpatialAnalysisDialog(QtWidgets.QDialog):
                     annotation_map=self.cluster_annotation_map,
                     canonical=False,
                 )
-            
+
+        target_selection = None
+        if preserve_selection and current_selection is not None and current_selection in categories:
+            target_selection = current_selection
+        else:
+            # Default to cluster "1" when available, otherwise the first cluster.
+            for cat in categories:
+                if str(cat) == "1" or cat == 1:
+                    target_selection = cat
+                    break
+            if target_selection is None and categories:
+                target_selection = categories[0]
+
+        blocker = QtCore.QSignalBlocker(self.sq_cooccur_ref_cluster_combo)
+        self.sq_cooccur_ref_cluster_combo.clear()
+        self.sq_cooccur_ref_cluster_combo.addItem("All clusters", None)
+
+        if categories:
             for cat in categories:
                 self.sq_cooccur_ref_cluster_combo.addItem(
                     self._get_cluster_display_name(cat), cat
                 )
-            
-            # Restore previous selection if it still exists, otherwise set default
-            if preserve_selection and current_selection is not None:
-                # Try to restore the previous selection
-                for i in range(self.sq_cooccur_ref_cluster_combo.count()):
-                    if self.sq_cooccur_ref_cluster_combo.itemData(i) == current_selection:
-                        self.sq_cooccur_ref_cluster_combo.setCurrentIndex(i)
-                        return
-            
-            # Set default to "1" if it exists, otherwise use first cluster
-            default_cluster = None
-            # Try to find cluster "1" (as string or int)
-            for cat in categories:
-                if str(cat) == "1" or cat == 1:
-                    default_cluster = cat
+
+        if target_selection is None:
+            self.sq_cooccur_ref_cluster_combo.setCurrentIndex(0)
+        else:
+            for i in range(self.sq_cooccur_ref_cluster_combo.count()):
+                if self.sq_cooccur_ref_cluster_combo.itemData(i) == target_selection:
+                    self.sq_cooccur_ref_cluster_combo.setCurrentIndex(i)
                     break
-            
-            # If "1" not found, use first cluster
-            if default_cluster is None and len(categories) > 0:
-                default_cluster = categories[0]
-            
-            # Set the default selection
-            if default_cluster is not None:
-                for i in range(self.sq_cooccur_ref_cluster_combo.count()):
-                    if self.sq_cooccur_ref_cluster_combo.itemData(i) == default_cluster:
-                        self.sq_cooccur_ref_cluster_combo.setCurrentIndex(i)
-                        break
+        del blocker
     
     def _on_sq_autocorr_roi_changed(self):
         """Handle ROI change in autocorrelation tab."""
@@ -2120,6 +2121,7 @@ class AdvancedSpatialAnalysisDialog(QtWidgets.QDialog):
         try:
             cluster_key = self.sq_cooccur_cluster_combo.currentText()
             roi_id = self._get_selected_roi(self.sq_cooccur_roi_combo)
+            plot_type = self.sq_cooccur_plot_type_combo.currentText()
             
             # Parse neighborhood sizes
             sizes_str = self.sq_cooccur_sizes_edit.text().strip()
@@ -2182,7 +2184,7 @@ class AdvancedSpatialAnalysisDialog(QtWidgets.QDialog):
                     anndata_dict=anndata_dict,
                     cluster_key=cluster_key,
                     interval=nhood_sizes,
-                    reference_cluster=self.sq_cooccur_ref_cluster_combo.currentData(),
+                    reference_cluster=self.sq_cooccur_ref_cluster_combo.currentData() if plot_type == "Curves" else None,
                 )
 
             results = run_blocking_task_with_progress(

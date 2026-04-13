@@ -45,6 +45,16 @@ if sys.platform == "darwin" and os.environ.get("GITHUB_ACTIONS") == "true":
     os.environ.setdefault("QT_SCALE_FACTOR", "1")
 
 
+def pytest_collection_modifyitems(items):
+    """Auto-mark tests that require a live Qt application."""
+    ui_fixtures = {"qtbot", "qapp"}
+    ui_marker = pytest.mark.ui
+
+    for item in items:
+        if ui_fixtures.intersection(getattr(item, "fixturenames", ())):
+            item.add_marker(ui_marker)
+
+
 @pytest.fixture
 def temp_dir():
     """Create a temporary directory for test outputs.

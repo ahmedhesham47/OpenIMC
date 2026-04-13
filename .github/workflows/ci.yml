@@ -39,11 +39,26 @@ jobs:
           pip install -r requirements.txt
           pip install pytest
       - name: Run fast tests
+        if: runner.os != 'macOS'
         run: |
           pytest -m "not slow"
+      - name: Run fast tests without Qt UI
+        if: runner.os == 'macOS'
+        run: |
+          pytest -m "not slow and not ui"
       - name: Run integration tests
+        if: runner.os != 'macOS'
         run: |
           pytest -m "integration"
+      - name: Run integration tests without Qt UI
+        if: runner.os == 'macOS'
+        run: |
+          pytest -m "integration and not ui"
       - name: Run regression tests
+        if: runner.os != 'macOS'
         run: |
           pytest -m "regression"
+      - name: Run regression tests without Qt UI
+        if: runner.os == 'macOS'
+        run: |
+          pytest -m "regression and not ui"
