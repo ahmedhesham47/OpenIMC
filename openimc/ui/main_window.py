@@ -143,14 +143,13 @@ from openimc.ui.dialogs.segmentation_dialog import SegmentationDialog
 from openimc.ui.dialogs.ilastik_segmentation_dialog import IlastikSegmentationDialog
 from openimc.ui.dialogs.export import ExportDialog
 from openimc.ui.dialogs.feature_extraction import FeatureExtractionDialog
+from openimc.utils.optional_dependencies import (
+    get_torch_module,
+    optional_dependency_available,
+)
 
 # Optional runtime flags for GPU/TIFF
-_HAVE_TORCH = False
-try:
-    import torch  # type: ignore
-    _HAVE_TORCH = True
-except Exception:
-    _HAVE_TORCH = False
+_HAVE_TORCH = optional_dependency_available("torch")
 
 _HAVE_TIFFFILE = False
 try:
@@ -210,20 +209,46 @@ else:
     # Import models under the expected name when available
     from cellpose import models  # type: ignore
 
-# Optional CellSAM - use our custom implementation
-_HAVE_CELLSAM = False
+# Optional CellSAM - import lazily so torch-backed dependencies do not run
+# during module import in headless or partially provisioned environments.
+_HAVE_CELLSAM = optional_dependency_available("cellSAM")
+_CELLSAM_IMPORT_ATTEMPTED = False
+_CELLSAM_IMPORT_ERROR: Optional[BaseException] = None
 cellsam_pipeline = None
 cellsam_pipeline_subprocess = None
-try:
-    from openimc.processing.custom_cellsam import (
-        cellsam_pipeline_custom,
-        run_cellsam_pipeline_subprocess,
-    )
+
+
+def _load_cellsam_helpers() -> bool:
+    """Import CellSAM helpers only when the feature is actually used."""
+    global _HAVE_CELLSAM, _CELLSAM_IMPORT_ATTEMPTED, _CELLSAM_IMPORT_ERROR
+    global cellsam_pipeline, cellsam_pipeline_subprocess
+
+    if cellsam_pipeline is not None and cellsam_pipeline_subprocess is not None:
+        return True
+
+    if _CELLSAM_IMPORT_ATTEMPTED:
+        return False
+
+    _CELLSAM_IMPORT_ATTEMPTED = True
+    if not _HAVE_CELLSAM:
+        return False
+
+    try:
+        from openimc.processing.custom_cellsam import (
+            cellsam_pipeline_custom,
+            run_cellsam_pipeline_subprocess,
+        )
+    except Exception as exc:
+        _HAVE_CELLSAM = False
+        _CELLSAM_IMPORT_ERROR = exc
+        cellsam_pipeline = None
+        cellsam_pipeline_subprocess = None
+        return False
+
     cellsam_pipeline = cellsam_pipeline_custom
     cellsam_pipeline_subprocess = run_cellsam_pipeline_subprocess
-    _HAVE_CELLSAM = True
-except (ImportError, OSError):
-    _HAVE_CELLSAM = False
+    _CELLSAM_IMPORT_ERROR = None
+    return True
 
 # Optional image processing deps (scikit-image, scipy)
 _HAVE_SCIKIT_IMAGE = False
@@ -1629,10 +1654,9 @@ class MainWindow(QtWidgets.QMainWindow):
         metadata_text += f"Channels: {len(ai.channels)}\n\n"
         
         # Add GPU info if available
-        if _HAVE_TORCH:
-            gpu_info = self._get_gpu_info()
-            if gpu_info:
-                metadata_text += f"GPU: {gpu_info}\n\n"
+        gpu_info = self._get_gpu_info()
+        if gpu_info:
+            metadata_text += f"GPU: {gpu_info}\n\n"
         
         if ai.metadata:
             metadata_text += "Metadata:\n"
@@ -5069,11 +5093,13 @@ class MainWindow(QtWidgets.QMainWindow):
                 
                 # Check dependencies based on selected model
                 if model == "DeepCell CellSAM":
-                    if not _HAVE_CELLSAM:
+                    if not _load_cellsam_helpers():
+                        detail = f"\n\nDetails: {_CELLSAM_IMPORT_ERROR}" if _CELLSAM_IMPORT_ERROR else ""
                         QtWidgets.QMessageBox.critical(
                             self, "Missing dependency", 
                             "CellSAM library is required for segmentation.\n"
                             "Install it with: pip install git+https://github.com/vanvalenlab/cellSAM.git"
+                            f"{detail}"
                         )
                         return
                 elif model != "Classical Watershed" and not _HAVE_CELLPOSE:
@@ -5153,8 +5179,11 @@ class MainWindow(QtWidgets.QMainWindow):
                         )
                 except Exception as e:
                     # Check if this is a CUDA memory error
-                    from openimc.processing.custom_cellsam import CUDAMemoryError
-                    if isinstance(e, CUDAMemoryError):
+                    try:
+                        from openimc.processing.custom_cellsam import CUDAMemoryError
+                    except Exception:
+                        CUDAMemoryError = None
+                    if CUDAMemoryError is not None and isinstance(e, CUDAMemoryError):
                         # Show user-friendly CUDA memory error message
                         QtWidgets.QMessageBox.critical(
                             self, "CUDA Out of Memory", 
@@ -5490,9 +5519,10 @@ class MainWindow(QtWidgets.QMainWindow):
                     
                     # Determine GPU usage
                     if gpu_id == "auto":
-                        if _HAVE_TORCH and torch.cuda.is_available():
+                        torch = get_torch_module()
+                        if torch is not None and torch.cuda.is_available():
                             gpu_id = 0
-                        elif _HAVE_TORCH and hasattr(torch.backends, 'mps') and torch.backends.mps.is_available():
+                        elif torch is not None and hasattr(torch.backends, 'mps') and torch.backends.mps.is_available():
                             gpu_id = 'mps'
                         else:
                             gpu_id = None
@@ -5504,9 +5534,10 @@ class MainWindow(QtWidgets.QMainWindow):
                     
                     # Determine GPU usage
                     if gpu_id == "auto":
-                        if _HAVE_TORCH and torch.cuda.is_available():
+                        torch = get_torch_module()
+                        if torch is not None and torch.cuda.is_available():
                             gpu_id = 0
-                        elif _HAVE_TORCH and hasattr(torch.backends, 'mps') and torch.backends.mps.is_available():
+                        elif torch is not None and hasattr(torch.backends, 'mps') and torch.backends.mps.is_available():
                             gpu_id = 'mps'
                         else:
                             gpu_id = None
@@ -5761,10 +5792,11 @@ class MainWindow(QtWidgets.QMainWindow):
             gpu_device = None
             
             if gpu_id == "auto":
-                if _HAVE_TORCH and torch.cuda.is_available():
+                torch = get_torch_module()
+                if torch is not None and torch.cuda.is_available():
                     use_gpu = True
                     gpu_device = 0
-                elif _HAVE_TORCH and hasattr(torch.backends, 'mps') and torch.backends.mps.is_available():
+                elif torch is not None and hasattr(torch.backends, 'mps') and torch.backends.mps.is_available():
                     use_gpu = True
                     gpu_device = 'mps'
             elif gpu_id is not None:
@@ -5861,7 +5893,8 @@ class MainWindow(QtWidgets.QMainWindow):
                     del masks, flows, styles, diams
                     import gc
                     gc.collect()
-                    if _HAVE_TORCH and use_gpu:
+                    torch = get_torch_module()
+                    if torch is not None and use_gpu and hasattr(torch, "cuda"):
                         torch.cuda.empty_cache()
                     
                     # Update acquisition info cache
@@ -5995,12 +6028,14 @@ class MainWindow(QtWidgets.QMainWindow):
                 )
                 return
             
-            if not _HAVE_CELLSAM:
+            if not _load_cellsam_helpers():
                 progress_dlg.close()
+                detail = f"\n\nDetails: {_CELLSAM_IMPORT_ERROR}" if _CELLSAM_IMPORT_ERROR else ""
                 QtWidgets.QMessageBox.critical(
                     self, "CellSAM Not Available",
                     "CellSAM is not installed or failed to load.\n\n"
                     "Please install with: pip install git+https://github.com/vanvalenlab/cellSAM.git"
+                    f"{detail}"
                 )
                 return
             
@@ -6218,8 +6253,11 @@ class MainWindow(QtWidgets.QMainWindow):
             
         except Exception as e:
             # Check if this is a CUDA memory error
-            from openimc.processing.custom_cellsam import CUDAMemoryError
-            if isinstance(e, CUDAMemoryError):
+            try:
+                from openimc.processing.custom_cellsam import CUDAMemoryError
+            except Exception:
+                CUDAMemoryError = None
+            if CUDAMemoryError is not None and isinstance(e, CUDAMemoryError):
                 # Show user-friendly CUDA memory error message
                 QtWidgets.QMessageBox.critical(
                     self, "CUDA Out of Memory", 
@@ -7691,7 +7729,8 @@ class MainWindow(QtWidgets.QMainWindow):
 
     def _get_gpu_info(self):
         """Get GPU information for display."""
-        if not _HAVE_TORCH:
+        torch = get_torch_module()
+        if torch is None:
             return None
         
         try:

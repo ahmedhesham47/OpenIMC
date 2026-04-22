@@ -26,13 +26,6 @@ from PyQt5.QtCore import Qt
 from openimc.data.mcd_loader import AcquisitionInfo, MCDLoader  # noqa: F401
 from openimc.ui.utils import combine_channels
 
-# Optional GPU runtime
-try:
-    import torch  # type: ignore
-    _HAVE_TORCH = True
-except Exception:
-    _HAVE_TORCH = False
-
 
 class PreprocessingDialog(QtWidgets.QDialog):
     def __init__(self, channels: List[str], parent=None):
@@ -276,4 +269,3 @@ class PreprocessingDialog(QtWidgets.QDialog):
             item = self.cyto_list.item(i)
             channel_name = item.text().lower()
             item.setHidden(search_text not in channel_name)
-

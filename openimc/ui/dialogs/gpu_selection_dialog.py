@@ -20,12 +20,7 @@
 from PyQt5 import QtWidgets
 from PyQt5.QtCore import Qt
 
-# Optional GPU runtime
-try:
-    import torch  # type: ignore
-    _HAVE_TORCH = True
-except Exception:
-    _HAVE_TORCH = False
+from openimc.utils.optional_dependencies import get_torch_module
 
 class GPUSelectionDialog(QtWidgets.QDialog):
     def __init__(self, parent=None):
@@ -39,7 +34,8 @@ class GPUSelectionDialog(QtWidgets.QDialog):
 
     def _detect_gpus(self):
         gpus = []
-        if not _HAVE_TORCH:
+        torch = get_torch_module()
+        if torch is None:
             return gpus
         try:
             if torch.cuda.is_available():
@@ -113,4 +109,3 @@ class GPUSelectionDialog(QtWidgets.QDialog):
         if current_item:
             return current_item.data(Qt.UserRole)
         return None
-

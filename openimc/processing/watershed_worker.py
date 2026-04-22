@@ -33,7 +33,7 @@ from openimc.processing.denoising import apply_channel_denoise
 # Optional scikit-image imports
 try:
     from skimage import morphology, filters, segmentation
-    from skimage.filters import sobel, scharr
+    from skimage.filters import gaussian, sobel, scharr
     from skimage.morphology import disk, remove_small_objects, label
     from skimage.feature import peak_local_max
     from skimage.measure import regionprops

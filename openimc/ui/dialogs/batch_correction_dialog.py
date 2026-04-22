@@ -26,6 +26,7 @@ to correct for batch effects in feature data from multiple files.
 
 from typing import Optional, Dict, List
 import os
+import importlib.util
 from datetime import datetime
 import pandas as pd
 from PyQt5 import QtWidgets
@@ -40,18 +41,16 @@ from openimc.ui.dialogs.progress_dialog import run_blocking_task_with_progress
 from openimc.ui.dialogs.custom_grouping_dialog import CustomGroupingDialog
 from openimc.utils.logger import get_logger
 
-# Optional imports for batch correction methods
-try:
-    from combat.pycombat import pycombat
-    _HAVE_COMBAT = True
-except ImportError:
-    _HAVE_COMBAT = False
+def _optional_dependency_available(module_name: str) -> bool:
+    """Check for an optional dependency without importing it."""
+    try:
+        return importlib.util.find_spec(module_name) is not None
+    except (ImportError, AttributeError, ValueError):
+        return False
 
-try:
-    from harmonypy import run_harmony
-    _HAVE_HARMONY = True
-except ImportError:
-    _HAVE_HARMONY = False
+
+_HAVE_COMBAT = _optional_dependency_available("combat.pycombat")
+_HAVE_HARMONY = _optional_dependency_available("harmonypy")
 
 
 

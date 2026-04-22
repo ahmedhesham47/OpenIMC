@@ -1185,7 +1185,7 @@ class CellClusteringDialog(QtWidgets.QDialog):
         self.clustering_settings_dialog = QtWidgets.QDialog(self)
         self.clustering_settings_dialog.setWindowTitle("Clustering Settings")
         self.clustering_settings_dialog.setModal(True)
-        self.clustering_settings_dialog.setMinimumSize(560, 420)
+        self.clustering_settings_dialog.setMinimumSize(380, 260)
 
         if self.parent() is not None:
             parent_size = self.parent().size()

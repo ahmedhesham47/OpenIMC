@@ -30,13 +30,7 @@ import os
 from openimc.ui.utils import combine_channels
 from openimc.ui.dialogs.preprocessing_dialog import PreprocessingDialog
 from openimc.ui.dialogs.ilastik_segmentation_dialog import IlastikSegmentationDialog
-
-# Optional GPU runtime
-try:
-    import torch  # type: ignore
-    _HAVE_TORCH = True
-except Exception:
-    _HAVE_TORCH = False
+from openimc.utils.optional_dependencies import get_torch_module
 
 # Optional scikit-image for denoising
 try:
@@ -54,14 +48,6 @@ try:
 except ImportError:
     _HAVE_SCIKIT_IMAGE = False
     _HAVE_ROLLING_BALL = False
-
-# Optional CellSAM
-# Catch both ImportError and OSError (Windows DLL loading errors)
-try:
-    from cellSAM import get_model, cellsam_pipeline  # type: ignore
-    _HAVE_CELLSAM = True
-except (ImportError, OSError):
-    _HAVE_CELLSAM = False
 
 
 def _get_user_config_path() -> Path:
@@ -950,7 +936,8 @@ class SegmentationDialog(QtWidgets.QDialog):
     
     def _detect_and_populate_gpus(self):
         """Detect available GPUs and populate the combo box."""
-        if not _HAVE_TORCH:
+        torch = get_torch_module()
+        if torch is None:
             self.gpu_info_label.setText("PyTorch not available. Using CPU only.")
             return
         
