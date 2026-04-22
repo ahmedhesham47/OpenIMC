@@ -186,6 +186,11 @@ from openimc.utils.logger import get_logger
 from openimc.ui.mask_manager import DynamicMaskManager
 from openimc.ui.state_manager import StateManager
 from openimc.ui.analysis_steps_exporter import AnalysisStepsExporter
+from openimc.processing.denoising import (
+    apply_channel_denoise,
+    background_index_from_method,
+    background_method_from_index,
+)
 from openimc.ui.dialogs.display_settings_dialog import (
     get_masks_directory_preference, save_masks_directory_preference
 )
@@ -296,121 +301,8 @@ def _load_and_preprocess_acquisition_worker(task_data):
         
         # Helper function to apply custom denoising
         def apply_custom_denoise(img, channel, custom_denoise_settings):
-            # Check if scikit-image is available
-            try:
-                from skimage import morphology
-                from skimage.filters import median, gaussian
-                from skimage.morphology import disk, footprint_rectangle
-                from skimage.restoration import denoise_nl_means, estimate_sigma
-                try:
-                    from skimage.restoration import rolling_ball as _sk_rolling_ball_worker
-                    _HAVE_ROLLING_BALL_WORKER = True
-                except Exception:
-                    _HAVE_ROLLING_BALL_WORKER = False
-                import scipy.ndimage as ndi_worker
-                _HAVE_SCIKIT_IMAGE_WORKER = True
-            except Exception:
-                _HAVE_SCIKIT_IMAGE_WORKER = False
-                _HAVE_ROLLING_BALL_WORKER = False
-            
-            if not _HAVE_SCIKIT_IMAGE_WORKER:
-                return img
             cfg = custom_denoise_settings.get(channel) if custom_denoise_settings else None
-            if not cfg:
-                return img
-            
-            out = img.astype(np.float32, copy=False)
-            
-            # Hot pixel removal
-            hot = cfg.get("hot")
-            if hot:
-                method = hot.get("method")
-                if method == "median3":
-                    try:
-                        out = median(out, footprint=footprint_rectangle(3, 3).astype(bool))
-                    except Exception:
-                        out = ndi_worker.median_filter(out, size=3)
-                elif method == "n_sd_local_median":
-                    n_sd = float(hot.get("n_sd", 5.0))
-                    try:
-                        local_median = median(out, footprint=footprint_rectangle(3, 3).astype(bool))
-                    except Exception:
-                        local_median = ndi_worker.median_filter(out, size=3)
-                    diff = out - local_median
-                    local_var = ndi_worker.uniform_filter(diff * diff, size=3)
-                    local_std = np.sqrt(np.maximum(local_var, 1e-8))
-                    mask_hot = diff > (n_sd * local_std)
-                    out = np.where(mask_hot, local_median, out)
-            
-            # Speckle smoothing
-            speckle = cfg.get("speckle")
-            if speckle:
-                method = speckle.get("method")
-                if method == "gaussian":
-                    sigma = float(speckle.get("sigma", 0.8))
-                    out = gaussian(out, sigma=sigma, preserve_range=True)
-                elif method == "nl_means":
-                    mn, mx = float(np.min(out)), float(np.max(out))
-                    scale = mx - mn
-                    scaled = (out - mn) / scale if scale > 0 else out
-                    sigma_est = np.mean(estimate_sigma(scaled, channel_axis=None))
-                    out = denoise_nl_means(
-                        scaled,
-                        h=1.15 * sigma_est,
-                        fast_mode=True,
-                        patch_size=5,
-                        patch_distance=6,
-                        channel_axis=None,
-                    )
-                    out = out * scale + mn
-            
-            # Background subtraction
-            bg = cfg.get("background")
-            if bg:
-                method = bg.get("method")
-                radius = int(bg.get("radius", 15))
-                if method == "white_tophat":
-                    se = disk(radius)
-                    try:
-                        out = morphology.white_tophat(out, selem=se)
-                    except TypeError:
-                        out = morphology.white_tophat(out, footprint=se)
-                elif method == "black_tophat":
-                    se = disk(radius)
-                    try:
-                        out = morphology.black_tophat(out, selem=se)
-                    except TypeError:
-                        out = morphology.black_tophat(out, footprint=se)
-                elif method == "rolling_ball":
-                    if _HAVE_ROLLING_BALL_WORKER:
-                        background = _sk_rolling_ball_worker(out, radius=radius)
-                        out = out - background
-                        out = np.clip(out, 0, None)
-                    else:
-                        se = disk(radius)
-                        try:
-                            opened = morphology.opening(out, selem=se)
-                        except TypeError:
-                            opened = morphology.opening(out, footprint=se)
-                        out = out - opened
-                        out = np.clip(out, 0, None)
-            
-            # Rescale to preserve original max intensity
-            try:
-                orig_max = float(np.max(img))
-                new_max = float(np.max(out))
-                if new_max > 0 and orig_max > 0:
-                    out = out * (orig_max / new_max)
-            except Exception:
-                pass
-            
-            # Clip to dtype range if integer
-            if np.issubdtype(img.dtype, np.integer):
-                info = np.iinfo(img.dtype)
-                out = np.clip(out, info.min, info.max)
-            else:
-                out = np.clip(out, 0, None)
-            return out.astype(img.dtype, copy=False)
+            return apply_channel_denoise(img, cfg)
         
         # Load and normalize nuclear channels
         nuclear_imgs = []
@@ -957,6 +849,8 @@ class MainWindow(QtWidgets.QMainWindow):
         # Feature extraction state
         self.feature_dataframe = None  # Store extracted features in memory
         self.batch_corrected_dataframe = None  # Store batch-corrected features in memory
+        self.analysis_feature_set_preference = None
+        self._analysis_feature_sync_in_progress = False
         
         # Dialog instances for state retention
         self.clustering_dialog = None  # Store clustering dialog instance
@@ -2370,6 +2264,52 @@ class MainWindow(QtWidgets.QMainWindow):
         # Refresh view to apply new order
         self._view_selected()
 
+    def _build_current_denoise_config(self) -> dict:
+        """Capture the current denoise controls into a serializable config dict."""
+        cfg_hot = None
+        if self.hot_pixel_chk.isChecked():
+            cfg_hot = {
+                "method": "median3" if self.hot_pixel_method_combo.currentIndex() == 0 else "n_sd_local_median",
+                "n_sd": float(self.hot_pixel_n_spin.value()),
+            }
+
+        cfg_speckle = None
+        if self.speckle_chk.isChecked():
+            cfg_speckle = {
+                "method": "gaussian" if self.speckle_method_combo.currentIndex() == 0 else "nl_means",
+                "sigma": float(self.gaussian_sigma_spin.value()),
+            }
+
+        cfg_bg = None
+        if self.bg_subtract_chk.isChecked():
+            cfg_bg = {
+                "method": background_method_from_index(self.bg_method_combo.currentIndex()),
+                "radius": int(self.bg_radius_spin.value()),
+            }
+
+        return {
+            "hot": cfg_hot,
+            "speckle": cfg_speckle,
+            "background": cfg_bg,
+        }
+
+    def _get_denoise_step_order(self):
+        """Translate the UI order controls into pipeline step keys."""
+        order_map = {"Hot pixel": "hot", "Speckle": "speckle", "Background": "background"}
+        chosen_order = [
+            self.order_combo_1.currentText(),
+            self.order_combo_2.currentText(),
+            self.order_combo_3.currentText(),
+        ]
+        seen = set()
+        exec_steps = []
+        for name in chosen_order:
+            key = order_map.get(name)
+            if key and key not in seen:
+                exec_steps.append(key)
+                seen.add(key)
+        return exec_steps
+
     def _apply_denoise_settings_and_refresh(self):
         """Capture current denoise UI settings, assign to selected channels in denoise list, refresh view."""
         try:
@@ -2378,32 +2318,7 @@ class MainWindow(QtWidgets.QMainWindow):
             if not target_channel:
                 return
 
-            # Build config from UI
-            cfg_hot = None
-            if self.hot_pixel_chk.isChecked():
-                cfg_hot = {
-                    "method": "median3" if self.hot_pixel_method_combo.currentIndex() == 0 else "n_sd_local_median",
-                    "n_sd": float(self.hot_pixel_n_spin.value()),
-                }
-
-            cfg_speckle = None
-            if self.speckle_chk.isChecked():
-                cfg_speckle = {
-                    "method": "gaussian" if self.speckle_method_combo.currentIndex() == 0 else "nl_means",
-                    "sigma": float(self.gaussian_sigma_spin.value()),
-                }
-
-            cfg_bg = None
-            if self.bg_subtract_chk.isChecked():
-                cfg_bg = {
-                    "method": "white_tophat" if self.bg_method_combo.currentIndex() == 0 else "rolling_ball",
-                    "radius": int(self.bg_radius_spin.value()),
-                }
-
-            self.channel_denoise.setdefault(target_channel, {})
-            self.channel_denoise[target_channel]["hot"] = cfg_hot
-            self.channel_denoise[target_channel]["speckle"] = cfg_speckle
-            self.channel_denoise[target_channel]["background"] = cfg_bg
+            self.channel_denoise[target_channel] = self._build_current_denoise_config()
 
             # Refresh (preserve zoom)
             self.preserve_zoom = True
@@ -2418,207 +2333,14 @@ class MainWindow(QtWidgets.QMainWindow):
         cfg = self.channel_denoise.get(channel)
         if not cfg:
             return img
-        out = img.astype(np.float32, copy=False)
-
-        # Build ordered steps based on UI order selection
-        order_map = {"Hot pixel": "hot", "Speckle": "speckle", "Background": "background"}
-        chosen_order = [self.order_combo_1.currentText(), self.order_combo_2.currentText(), self.order_combo_3.currentText()]
-        seen = set()
-        exec_steps = []
-        for name in chosen_order:
-            key = order_map.get(name)
-            if key and key not in seen:
-                exec_steps.append(key)
-                seen.add(key)
-
-        for step in exec_steps:
-            if step == "hot":
-                hot = cfg.get("hot")
-                if hot:
-                    method = hot.get("method")
-                    if method == "median3":
-                        try:
-                            out = median(out, footprint=footprint_rectangle(3, 3).astype(bool))
-                        except Exception:
-                            out = ndi.median_filter(out, size=3)
-                    elif method == "n_sd_local_median":
-                        n_sd = float(hot.get("n_sd", 5.0))
-                        try:
-                            local_median = median(out, footprint=footprint_rectangle(3, 3).astype(bool))
-                        except Exception:
-                            local_median = ndi.median_filter(out, size=3)
-                        diff = out - local_median
-                        local_var = ndi.uniform_filter(diff * diff, size=3)
-                        local_std = np.sqrt(np.maximum(local_var, 1e-8))
-                        mask_hot = diff > (n_sd * local_std)
-                        out = np.where(mask_hot, local_median, out)
-            elif step == "speckle":
-                speckle = cfg.get("speckle")
-                if speckle:
-                    method = speckle.get("method")
-                    if method == "gaussian":
-                        sigma = float(speckle.get("sigma", 0.8))
-                        out = gaussian(out, sigma=sigma, preserve_range=True)
-                    elif method == "nl_means":
-                        mn, mx = float(np.min(out)), float(np.max(out))
-                        scale = mx - mn
-                        scaled = (out - mn) / scale if scale > 0 else out
-                        sigma_est = np.mean(estimate_sigma(scaled, channel_axis=None))
-                        out = denoise_nl_means(
-                            scaled,
-                            h=1.15 * sigma_est,
-                            fast_mode=True,
-                            patch_size=5,
-                            patch_distance=6,
-                            channel_axis=None,
-                        )
-                        out = out * scale + mn
-            elif step == "background":
-                bg = cfg.get("background")
-                if bg:
-                    method = bg.get("method")
-                    radius = int(bg.get("radius", 15))
-                    if method == "white_tophat":
-                        se = disk(radius)
-                        try:
-                            out = morphology.white_tophat(out, selem=se)
-                        except TypeError:
-                            out = morphology.white_tophat(out, footprint=se)
-                    elif method == "black_tophat":
-                        se = disk(radius)
-                        try:
-                            out = morphology.black_tophat(out, selem=se)
-                        except TypeError:
-                            out = morphology.black_tophat(out, footprint=se)
-                    elif method == "rolling_ball":
-                        if _HAVE_ROLLING_BALL:
-                            background = _sk_rolling_ball(out, radius=radius)
-                            out = out - background
-                            out = np.clip(out, 0, None)
-                        else:
-                            se = disk(radius)
-                            try:
-                                opened = morphology.opening(out, selem=se)
-                            except TypeError:
-                                opened = morphology.opening(out, footprint=se)
-                            out = out - opened
-                            out = np.clip(out, 0, None)
-        # Rescale to preserve original max intensity of this channel
-        try:
-            orig_max = float(np.max(img))
-            new_max = float(np.max(out))
-            if new_max > 0 and orig_max > 0:
-                out = out * (orig_max / new_max)
-        except Exception:
-            pass
-        # Clip to dtype range if integer
-        if np.issubdtype(img.dtype, np.integer):
-            info = np.iinfo(img.dtype)
-            out = np.clip(out, info.min, info.max)
-        else:
-            out = np.clip(out, 0, None)
-        return out.astype(img.dtype, copy=False)
+        return apply_channel_denoise(img, cfg, step_order=self._get_denoise_step_order())
 
     def _apply_custom_denoise(self, channel: str, img: np.ndarray, custom_denoise_settings: dict) -> np.ndarray:
         """Apply custom denoise steps for a channel in raw domain."""
         if not _HAVE_SCIKIT_IMAGE:
             return img
         cfg = custom_denoise_settings.get(channel)
-        if not cfg:
-            return img
-        out = img.astype(np.float32, copy=False)
-
-        # Apply denoising steps in order: hot pixel -> speckle -> background
-        # Hot pixel removal
-        hot = cfg.get("hot")
-        if hot:
-            method = hot.get("method")
-            if method == "median3":
-                try:
-                    out = median(out, footprint=footprint_rectangle(3, 3).astype(bool))
-                except Exception:
-                    out = ndi.median_filter(out, size=3)
-            elif method == "n_sd_local_median":
-                n_sd = float(hot.get("n_sd", 5.0))
-                try:
-                    local_median = median(out, footprint=footprint_rectangle(3, 3).astype(bool))
-                except Exception:
-                    local_median = ndi.median_filter(out, size=3)
-                diff = out - local_median
-                local_var = ndi.uniform_filter(diff * diff, size=3)
-                local_std = np.sqrt(np.maximum(local_var, 1e-8))
-                mask_hot = diff > (n_sd * local_std)
-                out = np.where(mask_hot, local_median, out)
-        
-        # Speckle smoothing
-        speckle = cfg.get("speckle")
-        if speckle:
-            method = speckle.get("method")
-            if method == "gaussian":
-                sigma = float(speckle.get("sigma", 0.8))
-                out = gaussian(out, sigma=sigma, preserve_range=True)
-            elif method == "nl_means":
-                mn, mx = float(np.min(out)), float(np.max(out))
-                scale = mx - mn
-                scaled = (out - mn) / scale if scale > 0 else out
-                sigma_est = np.mean(estimate_sigma(scaled, channel_axis=None))
-                out = denoise_nl_means(
-                    scaled,
-                    h=1.15 * sigma_est,
-                    fast_mode=True,
-                    patch_size=5,
-                    patch_distance=6,
-                    channel_axis=None,
-                )
-                out = out * scale + mn
-        
-        # Background subtraction
-        bg = cfg.get("background")
-        if bg:
-            method = bg.get("method")
-            radius = int(bg.get("radius", 15))
-            if method == "white_tophat":
-                se = disk(radius)
-                try:
-                    out = morphology.white_tophat(out, selem=se)
-                except TypeError:
-                    out = morphology.white_tophat(out, footprint=se)
-            elif method == "black_tophat":
-                se = disk(radius)
-                try:
-                    out = morphology.black_tophat(out, selem=se)
-                except TypeError:
-                    out = morphology.black_tophat(out, footprint=se)
-            elif method == "rolling_ball":
-                if _HAVE_ROLLING_BALL:
-                    background = _sk_rolling_ball(out, radius=radius)
-                    out = out - background
-                    out = np.clip(out, 0, None)
-                else:
-                    se = disk(radius)
-                    try:
-                        opened = morphology.opening(out, selem=se)
-                    except TypeError:
-                        opened = morphology.opening(out, footprint=se)
-                    out = out - opened
-                    out = np.clip(out, 0, None)
-        
-        # Rescale to preserve original max intensity of this channel
-        try:
-            orig_max = float(np.max(img))
-            new_max = float(np.max(out))
-            if new_max > 0 and orig_max > 0:
-                out = out * (orig_max / new_max)
-        except Exception:
-            pass
-        
-        # Clip to dtype range if integer
-        if np.issubdtype(img.dtype, np.integer):
-            info = np.iinfo(img.dtype)
-            out = np.clip(out, info.min, info.max)
-        else:
-            out = np.clip(out, 0, None)
-        return out.astype(img.dtype, copy=False)
+        return apply_channel_denoise(img, cfg)
 
     def _on_hot_method_changed(self):
         self._sync_hot_controls_visibility()
@@ -2645,35 +2367,15 @@ class MainWindow(QtWidgets.QMainWindow):
             
             if not all_channels:
                 return
-            
-            # Build config from current UI settings
-            cfg_hot = None
-            if self.hot_pixel_chk.isChecked():
-                cfg_hot = {
-                    "method": "median3" if self.hot_pixel_method_combo.currentIndex() == 0 else "n_sd_local_median",
-                    "n_sd": float(self.hot_pixel_n_spin.value()),
-                }
-
-            cfg_speckle = None
-            if self.speckle_chk.isChecked():
-                cfg_speckle = {
-                    "method": "gaussian" if self.speckle_method_combo.currentIndex() == 0 else "nl_means",
-                    "sigma": float(self.gaussian_sigma_spin.value()),
-                }
-
-            cfg_bg = None
-            if self.bg_subtract_chk.isChecked():
-                cfg_bg = {
-                    "method": "white_tophat" if self.bg_method_combo.currentIndex() == 0 else "rolling_ball",
-                    "radius": int(self.bg_radius_spin.value()),
-                }
 
             # Apply the same configuration to all channels
+            config = self._build_current_denoise_config()
             for channel in all_channels:
-                self.channel_denoise.setdefault(channel, {})
-                self.channel_denoise[channel]["hot"] = cfg_hot
-                self.channel_denoise[channel]["speckle"] = cfg_speckle
-                self.channel_denoise[channel]["background"] = cfg_bg
+                self.channel_denoise[channel] = {
+                    "hot": dict(config["hot"]) if config["hot"] else None,
+                    "speckle": dict(config["speckle"]) if config["speckle"] else None,
+                    "background": dict(config["background"]) if config["background"] else None,
+                }
 
             # Show visual confirmation
             self.apply_all_channels_btn.setText("✓ Applied to All Channels")
@@ -2733,14 +2435,7 @@ class MainWindow(QtWidgets.QMainWindow):
                 self.gaussian_sigma_spin.setValue(0.8)
             if bg:
                 self.bg_subtract_chk.setChecked(True)
-                # 0 white_tophat, 1 black_tophat, 2 rolling_ball (approx)
-                method = bg.get("method")
-                if method == "white_tophat":
-                    self.bg_method_combo.setCurrentIndex(0)
-                elif method == "black_tophat":
-                    self.bg_method_combo.setCurrentIndex(1)
-                else:
-                    self.bg_method_combo.setCurrentIndex(2)
+                self.bg_method_combo.setCurrentIndex(background_index_from_method(bg.get("method")))
                 self.bg_radius_spin.setValue(int(bg.get("radius", 15)))
             else:
                 self.bg_subtract_chk.setChecked(False)
@@ -9098,6 +8793,65 @@ class MainWindow(QtWidgets.QMainWindow):
                 pass
         event.accept()
 
+    def _has_batch_corrected_feature_source(self) -> bool:
+        """Return whether a batch-corrected feature table is available in memory."""
+        return isinstance(self.batch_corrected_dataframe, pd.DataFrame) and not self.batch_corrected_dataframe.empty
+
+    def _normalize_analysis_feature_set_preference(self, feature_set) -> str:
+        """Normalize a feature-set label or key to the internal preference key."""
+        if feature_set in ("batch_corrected", "Batch-Corrected Features"):
+            return "batch_corrected"
+        return "original"
+
+    def _get_default_analysis_feature_set_preference(self) -> str:
+        """Return the default feature-set preference for the current session."""
+        return "batch_corrected" if self._has_batch_corrected_feature_source() else "original"
+
+    def _get_effective_analysis_feature_set_preference(self, feature_set=None) -> str:
+        """Return the requested feature-set preference with availability fallback applied."""
+        if feature_set is None and getattr(self, 'analysis_feature_set_preference', None) is None:
+            return self._get_default_analysis_feature_set_preference()
+
+        normalized = self._normalize_analysis_feature_set_preference(
+            feature_set if feature_set is not None else self.analysis_feature_set_preference
+        )
+        if normalized == "batch_corrected" and not self._has_batch_corrected_feature_source():
+            return "original"
+        return normalized
+
+    def _apply_analysis_feature_set_to_dialog(self, dialog):
+        """Refresh a dialog's feature sources and apply the shared selection."""
+        if dialog is None:
+            return
+
+        try:
+            if hasattr(dialog, 'refresh_dataframe'):
+                dialog.refresh_dataframe()
+            if hasattr(dialog, 'apply_feature_set_preference'):
+                dialog.apply_feature_set_preference(self._get_effective_analysis_feature_set_preference())
+        except (RuntimeError, AttributeError):
+            pass
+
+    def _sync_analysis_feature_source_dialogs(self, source_dialog=None):
+        """Push the shared feature-set selection to any open analysis dialogs."""
+        for attr in ('clustering_dialog', 'simple_spatial_dialog', 'advanced_spatial_dialog'):
+            dialog = getattr(self, attr, None)
+            if dialog is None or dialog is source_dialog:
+                continue
+            self._apply_analysis_feature_set_to_dialog(dialog)
+
+    def _set_analysis_feature_set_preference(self, feature_set, source_dialog=None, sync_dialogs=True):
+        """Update the shared analysis feature-set preference and propagate it."""
+        self.analysis_feature_set_preference = self._get_effective_analysis_feature_set_preference(feature_set)
+        if not sync_dialogs or self._analysis_feature_sync_in_progress:
+            return
+
+        self._analysis_feature_sync_in_progress = True
+        try:
+            self._sync_analysis_feature_source_dialogs(source_dialog=source_dialog)
+        finally:
+            self._analysis_feature_sync_in_progress = False
+
     def _open_clustering_dialog(self):
         """Open the cell clustering analysis dialog."""
         if self.feature_dataframe is None or self.feature_dataframe.empty:
@@ -9113,6 +8867,7 @@ class MainWindow(QtWidgets.QMainWindow):
         # Check if dialog already exists and is still valid
         if self.clustering_dialog is not None:
             try:
+                self._apply_analysis_feature_set_to_dialog(self.clustering_dialog)
                 # Check if dialog still exists (hasn't been deleted)
                 # If dialog is visible, just bring it to front
                 # If dialog is not visible, show it
@@ -9149,6 +8904,8 @@ class MainWindow(QtWidgets.QMainWindow):
         # Restore saved clustering state if available
         if hasattr(self, '_saved_clustering_state') and self._saved_clustering_state:
             self._restore_clustering_state(self.clustering_dialog, self._saved_clustering_state)
+
+        self._apply_analysis_feature_set_to_dialog(self.clustering_dialog)
         
         # Ensure llm_phenotype_cache is always initialized as a dict
         if not hasattr(self.clustering_dialog, 'llm_phenotype_cache') or not isinstance(self.clustering_dialog.llm_phenotype_cache, dict):
@@ -9263,6 +9020,7 @@ class MainWindow(QtWidgets.QMainWindow):
         # Check if dialog already exists and is still valid
         if hasattr(self, 'simple_spatial_dialog') and self.simple_spatial_dialog is not None:
             try:
+                self._apply_analysis_feature_set_to_dialog(self.simple_spatial_dialog)
                 if self.simple_spatial_dialog.isVisible():
                     self.simple_spatial_dialog.raise_()
                     self.simple_spatial_dialog.activateWindow()
@@ -9287,6 +9045,8 @@ class MainWindow(QtWidgets.QMainWindow):
         # Restore saved spatial state if available
         if hasattr(self, '_saved_spatial_state') and self._saved_spatial_state:
             self._restore_spatial_state(self.simple_spatial_dialog, self._saved_spatial_state)
+
+        self._apply_analysis_feature_set_to_dialog(self.simple_spatial_dialog)
         
         self.simple_spatial_dialog.show()
     
@@ -9336,6 +9096,7 @@ class MainWindow(QtWidgets.QMainWindow):
         # Check if dialog already exists and is still valid
         if hasattr(self, 'advanced_spatial_dialog') and self.advanced_spatial_dialog is not None:
             try:
+                self._apply_analysis_feature_set_to_dialog(self.advanced_spatial_dialog)
                 if self.advanced_spatial_dialog.isVisible():
                     self.advanced_spatial_dialog.raise_()
                     self.advanced_spatial_dialog.activateWindow()
@@ -9377,6 +9138,8 @@ class MainWindow(QtWidgets.QMainWindow):
         # Restore saved spatial state if available
         if hasattr(self, '_saved_spatial_state') and self._saved_spatial_state:
             self._restore_spatial_state(self.advanced_spatial_dialog, self._saved_spatial_state)
+
+        self._apply_analysis_feature_set_to_dialog(self.advanced_spatial_dialog)
         
         self.advanced_spatial_dialog.show()
     
@@ -10222,6 +9985,7 @@ class MainWindow(QtWidgets.QMainWindow):
             
             # Store in memory
             self.feature_dataframe = df
+            self._set_analysis_feature_set_preference(self.analysis_feature_set_preference)
             
             # Update cluster mode availability after loading features
             self._update_cluster_mode_availability()
@@ -10272,6 +10036,7 @@ class MainWindow(QtWidgets.QMainWindow):
                 except Exception as e:
                     print(f"Warning: Could not update metadata list in dialog: {e}")
         if dlg.exec_() == QtWidgets.QDialog.Accepted:
+            had_batch_corrected = self._has_batch_corrected_feature_source()
             # Get combined dataframe (from loaded files or current)
             combined_df = dlg.get_combined_dataframe()
             if combined_df is not None and not combined_df.empty:
@@ -10291,6 +10056,10 @@ class MainWindow(QtWidgets.QMainWindow):
             if corrected_df is not None and not corrected_df.empty:
                 # Store batch-corrected features separately (keep original)
                 self.batch_corrected_dataframe = corrected_df
+                if not had_batch_corrected:
+                    self._set_analysis_feature_set_preference("batch_corrected")
+                else:
+                    self._sync_analysis_feature_source_dialogs()
                 
                 # Store custom grouping and metadata files for state saving
                 if hasattr(dlg, 'custom_grouping') and dlg.custom_grouping:
@@ -10586,6 +10355,7 @@ class MainWindow(QtWidgets.QMainWindow):
         
         # Collect analysis module states
         analysis_state = {}
+        analysis_state["feature_set_preference"] = self._get_effective_analysis_feature_set_preference()
         
         # Feature extraction parameters
         if hasattr(self, 'feature_extraction_config') and self.feature_extraction_config:
@@ -10608,6 +10378,8 @@ class MainWindow(QtWidgets.QMainWindow):
                 qc_ui_state["selected_acquisition"] = dlg.acq_combo.currentText()
             if hasattr(dlg, 'workers_spin'):
                 qc_ui_state["num_workers"] = dlg.workers_spin.value()
+            if hasattr(dlg, 'snr_threshold_spin'):
+                qc_ui_state["snr_threshold"] = dlg.snr_threshold_spin.value()
             if hasattr(dlg, 'denoise_source_combo'):
                 qc_ui_state["denoise_source"] = dlg.denoise_source_combo.currentText()
             if hasattr(dlg, 'custom_denoise_settings') and dlg.custom_denoise_settings:
@@ -11273,6 +11045,8 @@ class MainWindow(QtWidgets.QMainWindow):
             # Restore number of workers
             if "num_workers" in ui_state and hasattr(dialog, 'workers_spin'):
                 dialog.workers_spin.setValue(ui_state["num_workers"])
+            if "snr_threshold" in ui_state and hasattr(dialog, 'snr_threshold_spin'):
+                dialog.snr_threshold_spin.setValue(float(ui_state["snr_threshold"]))
 
             if "denoise_source" in ui_state and hasattr(dialog, 'denoise_source_combo'):
                 index = dialog.denoise_source_combo.findText(ui_state["denoise_source"])
@@ -11604,6 +11378,13 @@ class MainWindow(QtWidgets.QMainWindow):
         
         # Restore analysis module states
         analysis = loaded_state.get("analysis", {})
+        restored_feature_set = analysis.get("feature_set_preference")
+        if restored_feature_set is None:
+            restored_feature_set = (
+                analysis.get("clustering", {})
+                .get("ui_state", {})
+                .get("feature_set")
+            )
         
         # Restore QC analysis state
         if "qc_analysis" in analysis:
@@ -11647,6 +11428,8 @@ class MainWindow(QtWidgets.QMainWindow):
             if not hasattr(self, '_saved_pixel_correlation_state'):
                 self._saved_pixel_correlation_state = {}
             self._saved_pixel_correlation_state = pixel_state
+
+        self.analysis_feature_set_preference = self._get_effective_analysis_feature_set_preference(restored_feature_set)
         
         # Update UI to reflect loaded state
         if self.feature_dataframe is not None:

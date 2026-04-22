@@ -655,9 +655,9 @@ class PixelCorrelationDialog(QtWidgets.QDialog):
         options_tab_layout.setSpacing(10)
         
         # Create scroll area for options tab
-        scroll_area = QtWidgets.QScrollArea()
-        scroll_area.setWidgetResizable(True)
-        scroll_area.setFrameShape(QtWidgets.QFrame.NoFrame)
+        self.options_scroll_area = QtWidgets.QScrollArea()
+        self.options_scroll_area.setWidgetResizable(True)
+        self.options_scroll_area.setFrameShape(QtWidgets.QFrame.NoFrame)
         
         scroll_content = QtWidgets.QWidget()
         scroll_layout = QtWidgets.QVBoxLayout(scroll_content)
@@ -800,8 +800,8 @@ class PixelCorrelationDialog(QtWidgets.QDialog):
         scroll_layout.addWidget(channel_group)
         
         scroll_content.setLayout(scroll_layout)
-        scroll_area.setWidget(scroll_content)
-        options_tab_layout.addWidget(scroll_area)
+        self.options_scroll_area.setWidget(scroll_content)
+        options_tab_layout.addWidget(self.options_scroll_area)
         
         # Run button (outside scroll area)
         run_layout = QtWidgets.QHBoxLayout()

@@ -113,6 +113,8 @@ CELL_SIGNAL_METHOD_OPTIONS = [
     ("All cell pixels (legacy)", "all_cell_mean"),
 ]
 
+DEFAULT_QC_SNR_THRESHOLD = 3.0
+
 
 def _cell_signal_method_label(method: Optional[str]) -> str:
     """Return the UI label for a QC cell signal method identifier."""
@@ -384,10 +386,12 @@ class QCAnalysisDialog(QtWidgets.QDialog):
         explanation_text = QtWidgets.QLabel(
             "<b>Pixel-level:</b> Uses Otsu thresholding to automatically separate signal (foreground) "
             "from background pixels. SNR is calculated as (signal_mean - background_mean) / background_std. "
+            "QC intensity plots use the foreground-only mean intensity, not the whole-image mean. "
             "This works on any image without requiring segmentation.<br>"
             "<b>Cell-level:</b> Uses segmentation masks to separate cell pixels from background pixels. "
             "You can define signal as positive in-cell pixels above background, the brightest cells by upper quantile, "
-            "or all cell pixels for legacy whole-cell averaging. Non-cell regions remain the background. "
+            "or all cell pixels for legacy whole-cell averaging. QC intensity plots use the selected in-cell signal only; "
+            "non-cell regions remain the background. "
             "Requires segmentation masks to be available."
         )
         explanation_text.setWordWrap(True)
@@ -417,6 +421,21 @@ class QCAnalysisDialog(QtWidgets.QDialog):
         workers_layout.addWidget(self.workers_spin)
         workers_layout.addStretch()
         options_layout.addLayout(workers_layout)
+
+        snr_threshold_layout = QtWidgets.QHBoxLayout()
+        snr_threshold_layout.addWidget(QtWidgets.QLabel("SNR threshold:"))
+        self.snr_threshold_spin = QtWidgets.QDoubleSpinBox()
+        self.snr_threshold_spin.setRange(0.1, 100.0)
+        self.snr_threshold_spin.setSingleStep(0.5)
+        self.snr_threshold_spin.setDecimals(1)
+        self.snr_threshold_spin.setValue(DEFAULT_QC_SNR_THRESHOLD)
+        self.snr_threshold_spin.setToolTip(
+            "Reference line used in QC SNR plots. "
+            "A value above 1.0 is typically more conservative than signal=noise."
+        )
+        snr_threshold_layout.addWidget(self.snr_threshold_spin)
+        snr_threshold_layout.addStretch()
+        options_layout.addLayout(snr_threshold_layout)
 
         self.cell_signal_group = QtWidgets.QGroupBox("Cell Signal Definition")
         cell_signal_layout = QtWidgets.QVBoxLayout(self.cell_signal_group)
@@ -714,11 +733,11 @@ class QCAnalysisDialog(QtWidgets.QDialog):
         help_label.setWordWrap(True)
         dialog_layout.addWidget(help_label)
 
-        scroll_area = QtWidgets.QScrollArea()
-        scroll_area.setWidgetResizable(True)
-        scroll_area.setFrameShape(QtWidgets.QFrame.NoFrame)
-        scroll_area.setWidget(self._settings_options_group)
-        dialog_layout.addWidget(scroll_area, 1)
+        self.qc_settings_scroll_area = QtWidgets.QScrollArea()
+        self.qc_settings_scroll_area.setWidgetResizable(True)
+        self.qc_settings_scroll_area.setFrameShape(QtWidgets.QFrame.NoFrame)
+        self.qc_settings_scroll_area.setWidget(self._settings_options_group)
+        dialog_layout.addWidget(self.qc_settings_scroll_area, 1)
 
         buttons_layout = QtWidgets.QHBoxLayout()
         buttons_layout.addStretch()
@@ -742,6 +761,7 @@ class QCAnalysisDialog(QtWidgets.QDialog):
             (self.mode_combo.currentIndexChanged, self._update_settings_summary),
             (self.acq_combo.currentIndexChanged, self._update_settings_summary),
             (self.workers_spin.valueChanged, self._update_settings_summary),
+            (self.snr_threshold_spin.valueChanged, self._update_settings_summary),
             (self.cell_signal_method_combo.currentIndexChanged, self._update_settings_summary),
             (self.positive_threshold_sd_spin.valueChanged, self._update_settings_summary),
             (self.upper_quantile_spin.valueChanged, self._update_settings_summary),
@@ -749,6 +769,7 @@ class QCAnalysisDialog(QtWidgets.QDialog):
         ]
         for signal, slot in signal_bindings:
             signal.connect(slot)
+        self.snr_threshold_spin.valueChanged.connect(self._refresh_existing_qc_plots)
 
     def _update_settings_summary(self):
         """Update the compact summary shown next to the settings button."""
@@ -758,9 +779,11 @@ class QCAnalysisDialog(QtWidgets.QDialog):
         acq_text = self.acq_combo.currentText() if hasattr(self, 'acq_combo') else ""
         mode_text = self.mode_combo.currentText() if hasattr(self, 'mode_combo') else ""
         workers = self.workers_spin.value() if hasattr(self, 'workers_spin') else None
+        snr_threshold = self.get_snr_threshold()
         denoise_text = self.denoise_source_combo.currentText() if hasattr(self, 'denoise_source_combo') else "None"
 
         parts = [part for part in [acq_text, mode_text] if part]
+        parts.append(f"SNR threshold: {snr_threshold:.1f}")
 
         if self.analysis_mode == "cell":
             method = self.get_cell_signal_method()
@@ -800,6 +823,12 @@ class QCAnalysisDialog(QtWidgets.QDialog):
             label = acq.well if acq.well else acq.name
             label += f" [{file_name}]"
             self.acq_combo.addItem(label, acq.id)
+            item_index = self.acq_combo.count() - 1
+            self.acq_combo.setItemData(
+                item_index,
+                f"Source data file: {file_name}\nFor MCD workflows, this is the source .mcd file.",
+                QtCore.Qt.ToolTipRole,
+            )
 
     def _populate_denoise_channel_list(self):
         """Populate the denoise channel combo with channels from the selected acquisition."""
@@ -1015,6 +1044,12 @@ class QCAnalysisDialog(QtWidgets.QDialog):
         method = self.cell_signal_method_combo.currentData()
         return method if isinstance(method, str) and method else "positive_pixels"
 
+    def get_snr_threshold(self) -> float:
+        """Return the user-configured SNR reference threshold for QC plots."""
+        if not hasattr(self, 'snr_threshold_spin'):
+            return DEFAULT_QC_SNR_THRESHOLD
+        return float(self.snr_threshold_spin.value())
+
     def _get_cell_signal_settings(self) -> Dict[str, Any]:
         """Return the current cell signal settings in core.qc_analysis format."""
         return {
@@ -1090,6 +1125,48 @@ class QCAnalysisDialog(QtWidgets.QDialog):
         """Append the QC cell-signal subtitle to plot titles when relevant."""
         subtitle = self._get_qc_method_subtitle()
         return f"{base_title}\n{subtitle}" if subtitle else base_title
+
+    def _get_plot_intensity_column(self) -> str:
+        """Return the best available intensity column used in QC plots."""
+        candidate_frames = [
+            getattr(self, 'qc_results_aggregated', None),
+            getattr(self, 'qc_results', None),
+        ]
+        for frame in candidate_frames:
+            if (
+                frame is not None
+                and not frame.empty
+                and 'signal_mean' in frame.columns
+                and frame['signal_mean'].notna().any()
+            ):
+                return 'signal_mean'
+        for frame in candidate_frames:
+            if (
+                frame is not None
+                and not frame.empty
+                and 'mean_intensity' in frame.columns
+                and frame['mean_intensity'].notna().any()
+            ):
+                return 'mean_intensity'
+        return 'signal_mean'
+
+    def _get_plot_intensity_label(self) -> str:
+        """Return a user-facing description of the foreground intensity used in plots."""
+        intensity_col = self._get_plot_intensity_column()
+        if intensity_col == 'signal_mean' and self.analysis_mode == "cell":
+            return 'Foreground Mean Intensity (selected in-cell signal only, log scale)'
+        if intensity_col == 'signal_mean':
+            return 'Foreground Mean Intensity (Otsu-positive pixels only, log scale)'
+        if self.analysis_mode == "cell":
+            return 'Mean Intensity (legacy whole-cell average, log scale)'
+        return 'Mean Intensity (log scale)'
+
+    def _refresh_existing_qc_plots(self):
+        """Refresh plot-only controls without rerunning QC analysis."""
+        if self.qc_results_aggregated is not None and not self.qc_results_aggregated.empty:
+            self._plot_snr_vs_intensity()
+        if self.qc_results is not None and not self.qc_results.empty:
+            self._plot_distributions()
 
     def _get_export_suffix(self) -> str:
         """Return a concise suffix describing the current cell-signal settings."""
@@ -1784,6 +1861,8 @@ class QCAnalysisDialog(QtWidgets.QDialog):
                     self.acq_combo.setCurrentIndex(index)
             if "num_workers" in ui_state and hasattr(self, 'workers_spin'):
                 self.workers_spin.setValue(ui_state["num_workers"])
+            if "snr_threshold" in ui_state and hasattr(self, 'snr_threshold_spin'):
+                self.snr_threshold_spin.setValue(float(ui_state["snr_threshold"]))
             if "denoise_source" in ui_state and hasattr(self, 'denoise_source_combo'):
                 index = self.denoise_source_combo.findText(ui_state["denoise_source"])
                 if index >= 0:
@@ -1883,8 +1962,10 @@ class QCAnalysisDialog(QtWidgets.QDialog):
         fig.clear()
         ax = fig.add_subplot(111)
         
+        intensity_col = self._get_plot_intensity_column()
+
         # Get aggregated intensities and SNR
-        intensities = self.qc_results_aggregated['mean_intensity'].values
+        intensities = self.qc_results_aggregated[intensity_col].values
         snr_values = self.qc_results_aggregated['snr'].values
         channels = self.qc_results_aggregated['channel'].values
         
@@ -1928,13 +2009,21 @@ class QCAnalysisDialog(QtWidgets.QDialog):
             ax.set_yscale('log')
             y_axis_label = 'SNR (Signal-to-Noise Ratio, log scale, averaged across ROIs)'
         
-        # Add dotted horizontal line at 10^0 = 1.0
-        ax.axhline(y=1.0, color='gray', linestyle='--', linewidth=1, alpha=0.5)
-        
-        ax.set_xlabel('Mean Intensity (log scale, averaged across ROIs)', fontsize=10)
+        snr_threshold = self.get_snr_threshold()
+        ax.axhline(
+            y=snr_threshold,
+            color='gray',
+            linestyle='--',
+            linewidth=1,
+            alpha=0.6,
+            label=f'SNR threshold: {snr_threshold:.1f}',
+        )
+
+        ax.set_xlabel(f'{self._get_plot_intensity_label()} (averaged across ROIs)', fontsize=10)
         ax.set_ylabel(y_axis_label, fontsize=10)
-        ax.set_title(self._compose_plot_title('SNR vs Mean Intensity by Channel (Mean across all ROIs)'), fontsize=12, fontweight='bold')
+        ax.set_title(self._compose_plot_title('SNR vs Foreground Mean Intensity by Channel (Mean across all ROIs)'), fontsize=12, fontweight='bold')
         ax.grid(False)  # Remove gridlines
+        ax.legend(fontsize=8, loc='best')
         
         fig.tight_layout()
         self.snr_intensity_canvas.draw()
@@ -2023,12 +2112,13 @@ class QCAnalysisDialog(QtWidgets.QDialog):
         snr_data = []
         intensity_data = []
         coverage_data = []
+        intensity_col = self._get_plot_intensity_column()
         
         for channel in channels:
             channel_data = self.qc_results[self.qc_results['channel'] == channel]
             # Filter valid values
             valid_snr = channel_data['snr'][np.isfinite(channel_data['snr'])].values
-            valid_intensity = channel_data['mean_intensity'][channel_data['mean_intensity'] > 0].values
+            valid_intensity = channel_data[intensity_col][channel_data[intensity_col] > 0].values
             valid_coverage = channel_data['coverage_pct'].values
             
             snr_data.append(valid_snr if len(valid_snr) > 0 else [0])
@@ -2047,18 +2137,28 @@ class QCAnalysisDialog(QtWidgets.QDialog):
         else:
             ax1.set_yscale('log')
             snr_ylabel = 'SNR (log scale)'
+        snr_threshold = self.get_snr_threshold()
+        ax1.axhline(
+            y=snr_threshold,
+            color='gray',
+            linestyle='--',
+            linewidth=1,
+            alpha=0.6,
+            label=f'Threshold: {snr_threshold:.1f}',
+        )
         ax1.set_ylabel(snr_ylabel, fontsize=10)
         ax1.set_title(self._compose_plot_title('SNR Distribution across ROIs'), fontsize=11, fontweight='bold')
         ax1.tick_params(axis='x', rotation=90, labelsize=xlabel_fontsize)  # Fully vertical text
         ax1.grid(True, alpha=0.3, axis='y')
+        ax1.legend(fontsize=8, loc='best')
         
         # Intensity boxplot
         bp2 = ax2.boxplot(intensity_data, labels=channels, patch_artist=True)
         for patch in bp2['boxes']:
             patch.set_facecolor('lightgreen')
         ax2.set_yscale('log')
-        ax2.set_ylabel('Mean Intensity (log scale)', fontsize=10)
-        ax2.set_title(self._compose_plot_title('Intensity Distribution across ROIs'), fontsize=11, fontweight='bold')
+        ax2.set_ylabel(self._get_plot_intensity_label(), fontsize=10)
+        ax2.set_title(self._compose_plot_title('Foreground Intensity Distribution across ROIs'), fontsize=11, fontweight='bold')
         ax2.tick_params(axis='x', rotation=90, labelsize=xlabel_fontsize)  # Fully vertical text
         ax2.grid(True, alpha=0.3, axis='y')
         

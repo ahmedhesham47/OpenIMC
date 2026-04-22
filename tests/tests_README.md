@@ -4,16 +4,20 @@ This directory contains the test suite for OpenIMC, including unit tests and int
 
 ## Installation
 
-First, install the testing dependencies:
+The preferred setup uses `uv`:
+
+```bash
+uv venv --python 3.11
+source .venv/bin/activate  # On Windows: .venv\Scripts\activate
+uv pip install -r requirements.txt
+uv pip install -e ".[dev]"
+```
+
+If you prefer not to use `uv`, you can install the project and test extras with `pip`:
 
 ```bash
 pip install -r requirements.txt
-```
-
-Or install just the testing packages:
-
-```bash
-pip install pytest>=7.4.0 pytest-cov>=4.1.0 pytest-mock>=3.11.0 pytest-qt>=4.2.0
+pip install -e ".[dev]"
 ```
 
 ## Structure

@@ -116,9 +116,16 @@ def _build_cooccurrence_array(n_clusters: int = 14, n_distances: int = 3) -> np.
     return occ
 
 
-def _build_clustering_dialog(qtbot, n_clusters: int = 6, n_features: int = 12) -> CellClusteringDialog:
+def _build_clustering_dialog(
+    qtbot,
+    n_clusters: int = 6,
+    n_features: int = 12,
+    parent: QtWidgets.QWidget | None = None,
+) -> CellClusteringDialog:
     df = _build_clustered_dataframe(n_clusters=n_clusters, n_features=n_features)
-    dialog = CellClusteringDialog(df, clustered_cells_dataframe=df.copy())
+    if parent is not None:
+        qtbot.addWidget(parent)
+    dialog = CellClusteringDialog(df, clustered_cells_dataframe=df.copy(), parent=parent)
     qtbot.addWidget(dialog)
     dialog.feature_label_map = {
         f'marker_{idx}_mean': f'Feature label {idx} with a deliberately long display name'
@@ -268,12 +275,47 @@ def test_heatmap_and_cluster_map_default_to_zscore_scaling(qtbot, monkeypatch):
     assert ('Cluster Map', 'zscore') in scaling_calls
 
 
+def test_heatmap_annotation_bars_show_cluster_and_custom_patient_labels(qtbot):
+    df = _build_clustered_dataframe(n_clusters=4, n_features=6)
+    df['source_file'] = [
+        f'/tmp/patient_{idx % 2}.ome.tiff'
+        for idx in range(len(df))
+    ]
+
+    dialog = CellClusteringDialog(df, clustered_cells_dataframe=df.copy())
+    qtbot.addWidget(dialog)
+    dialog.patient_annotation_enabled = True
+    dialog.patient_annotation_column = 'source_file'
+    dialog.patient_legend_label = 'Sample'
+    dialog.resize(1220, 900)
+    dialog.show()
+    qtbot.wait(120)
+
+    dialog._show_heatmap()
+
+    annotation_bar_texts = [
+        text
+        for axis in dialog.figure.axes
+        if axis.images and len(axis.get_xticks()) == 0 and len(axis.get_yticks()) == 0
+        for text in axis.texts
+        if text.get_text()
+    ]
+    annotation_bar_labels = {text.get_text() for text in annotation_bar_texts}
+    overflow = measure_figure_text_overflow(dialog.figure)
+
+    assert 'Cluster' in annotation_bar_labels
+    assert 'Sample' in annotation_bar_labels
+    assert all(text.get_rotation() == 0 for text in annotation_bar_texts)
+    assert max(overflow.values()) <= 0.04
+
+
 def test_qc_snr_plot_uses_symlog_and_keeps_nonpositive_snr_points(qtbot):
     dialog = _build_qc_dialog(qtbot)
     dialog.qc_results_aggregated = pd.DataFrame(
         {
             'channel': ['Marker A', 'Marker B', 'Marker C'],
-            'mean_intensity': [10.0, 25.0, 80.0],
+            'mean_intensity': [1.0, 2.0, 3.0],
+            'signal_mean': [10.0, 25.0, 80.0],
             'snr': [0.7, -0.2, 3.5],
         }
     )
@@ -285,7 +327,15 @@ def test_qc_snr_plot_uses_symlog_and_keeps_nonpositive_snr_points(qtbot):
     assert ax.get_yscale() == 'symlog'
     scatter_points = ax.collections[0].get_offsets()
     assert len(scatter_points) == 3
+    assert np.allclose(scatter_points[:, 0], [10.0, 25.0, 80.0])
     assert 'symlog' in ax.get_ylabel().lower()
+    assert 'foreground mean intensity' in ax.get_xlabel().lower()
+    assert 'foreground mean intensity' in ax.get_title().lower()
+    threshold_lines = [line for line in ax.lines if line.get_linestyle() == '--']
+    assert any(np.allclose(line.get_ydata(), [3.0, 3.0]) for line in threshold_lines)
+    legend = ax.get_legend()
+    assert legend is not None
+    assert any('3.0' in text.get_text() for text in legend.get_texts())
 
 
 def test_qc_cell_signal_controls_toggle_by_mode_and_method(qtbot):
@@ -315,6 +365,7 @@ def test_qc_restores_cell_signal_ui_state(qtbot):
     parent = _QCTestParent(with_masks=True)
     parent._saved_qc_ui_state = {
         "analysis_mode": "Cell-level",
+        "snr_threshold": 5.0,
         "cell_signal_method": "upper_quantile",
         "positive_threshold_sd": 3.0,
         "upper_quantile_percent": 95.0,
@@ -323,6 +374,7 @@ def test_qc_restores_cell_signal_ui_state(qtbot):
     dialog = _build_qc_dialog(qtbot, parent)
 
     assert dialog.analysis_mode == "cell"
+    assert dialog.snr_threshold_spin.value() == pytest.approx(5.0)
     assert dialog.get_cell_signal_method() == "upper_quantile"
     assert dialog.positive_threshold_sd_spin.value() == pytest.approx(3.0)
     assert dialog.upper_quantile_spin.value() == pytest.approx(95.0)
@@ -335,14 +387,17 @@ def test_qc_settings_summary_reflects_current_popup_state(qtbot):
     summary = dialog.settings_summary_label.text()
     assert "All Acquisitions" in summary
     assert "Cell-level" in summary
+    assert "SNR threshold: 3.0" in summary
     assert "Positive pixels" in summary
 
     dialog.cell_signal_method_combo.setCurrentIndex(dialog.cell_signal_method_combo.findData("upper_quantile"))
     dialog.upper_quantile_spin.setValue(95.0)
+    dialog.snr_threshold_spin.setValue(4.5)
     dialog.denoise_source_combo.setCurrentText("Viewer")
     qtbot.wait(50)
 
     summary = dialog.settings_summary_label.text()
+    assert "SNR threshold: 4.5" in summary
     assert "Top 95.0% cells" in summary
     assert "Denoising: Viewer" in summary
 
@@ -402,6 +457,85 @@ def test_qc_summary_and_titles_reflect_cell_signal_method(qtbot):
     assert 'signal_coverage_pct' in headers
     assert 'Positive pixels above background' in dialog.summary_method_label.text()
     assert 'Positive pixels above background' in ax.get_title()
+
+
+def test_qc_distribution_plot_uses_configured_snr_threshold(qtbot):
+    dialog = _build_qc_dialog(qtbot)
+    dialog.snr_threshold_spin.setValue(4.0)
+    dialog.qc_results = pd.DataFrame(
+        {
+            'channel': ['Marker A', 'Marker A', 'Marker B', 'Marker B'],
+            'snr': [0.5, 1.2, 4.5, 6.0],
+            'mean_intensity': [1.0, 1.5, 2.0, 2.5],
+            'signal_mean': [10.0, 11.0, 30.0, 32.0],
+            'coverage_pct': [20.0, 22.0, 35.0, 36.0],
+        }
+    )
+
+    dialog._plot_distributions()
+    ax = dialog.distribution_canvas.figure.axes[0]
+    intensity_ax = dialog.distribution_canvas.figure.axes[1]
+
+    threshold_lines = [line for line in ax.lines if line.get_linestyle() == '--']
+    assert any(np.allclose(line.get_ydata(), [4.0, 4.0]) for line in threshold_lines)
+    legend = ax.get_legend()
+    assert legend is not None
+    assert any('4.0' in text.get_text() for text in legend.get_texts())
+    assert 'foreground mean intensity' in intensity_ax.get_ylabel().lower()
+    assert 'foreground intensity distribution' in intensity_ax.get_title().lower()
+
+
+def test_qc_threshold_spin_repositions_reference_lines_without_rerun(qtbot):
+    dialog = _build_qc_dialog(qtbot)
+    dialog.qc_results = pd.DataFrame(
+        {
+            'channel': ['Marker A', 'Marker A', 'Marker B', 'Marker B'],
+            'snr': [1.0, 1.5, 4.0, 5.0],
+            'mean_intensity': [2.0, 2.5, 3.0, 3.5],
+            'signal_mean': [10.0, 12.0, 20.0, 24.0],
+            'coverage_pct': [20.0, 22.0, 35.0, 36.0],
+        }
+    )
+    dialog.qc_results_aggregated = pd.DataFrame(
+        {
+            'channel': ['Marker A', 'Marker B'],
+            'snr': [1.25, 4.5],
+            'mean_intensity': [2.25, 3.25],
+            'signal_mean': [11.0, 22.0],
+            'coverage_pct': [21.0, 35.5],
+        }
+    )
+
+    dialog._update_plots()
+    dialog.snr_threshold_spin.setValue(6.5)
+
+    snr_ax = dialog.snr_intensity_canvas.figure.axes[0]
+    distribution_ax = dialog.distribution_canvas.figure.axes[0]
+
+    snr_threshold_lines = [line for line in snr_ax.lines if line.get_linestyle() == '--']
+    distribution_threshold_lines = [line for line in distribution_ax.lines if line.get_linestyle() == '--']
+
+    assert any(np.allclose(line.get_ydata(), [6.5, 6.5]) for line in snr_threshold_lines)
+    assert any(np.allclose(line.get_ydata(), [6.5, 6.5]) for line in distribution_threshold_lines)
+
+
+def test_qc_cell_snr_plot_labels_selected_signal_intensity(qtbot):
+    parent = _QCTestParent(with_masks=True)
+    dialog = _build_qc_dialog(qtbot, parent)
+    dialog.qc_results_aggregated = pd.DataFrame(
+        {
+            'channel': ['Marker A'],
+            'mean_intensity': [1.0],
+            'signal_mean': [12.0],
+            'snr': [3.5],
+            'cell_signal_method': ['positive_pixels'],
+        }
+    )
+
+    dialog._plot_snr_vs_intensity()
+    ax = dialog.snr_intensity_canvas.figure.axes[0]
+
+    assert 'selected in-cell signal only' in ax.get_xlabel().lower()
 
 
 def test_differential_expression_deduplicates_markers_and_hides_boxes_on_toggle(qtbot):
@@ -1277,3 +1411,13 @@ def test_advanced_ripley_aggregation_combines_pvalues_across_rois(qtbot):
     assert combined[0, 0] == pytest.approx(expected_cluster_1_bin_10)
     assert combined[1, 1] == pytest.approx(expected_cluster_2_bin_20)
     assert 'pvalues_fdr_bh' in aggregated.uns['ripley']
+
+
+def test_explore_clusters_button_stays_disabled_without_masks(qtbot):
+    parent = _QCTestParent(with_masks=False)
+    dialog = _build_clustering_dialog(qtbot, n_clusters=4, n_features=6, parent=parent)
+
+    dialog._update_cluster_action_buttons()
+
+    assert not dialog.explore_btn.isEnabled()
+    assert "Load segmentation masks" in dialog.explore_btn.toolTip()

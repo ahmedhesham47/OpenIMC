@@ -99,6 +99,7 @@ def _compute_mean_intensity_manual(label_image: np.ndarray, intensity_image: np.
 
 from openimc.data.mcd_loader import MCDLoader
 from openimc.data.ometiff_loader import OMETIFFLoader
+from openimc.processing.denoising import apply_channel_denoise
 from openimc.ui.utils import arcsinh_normalize
 
 # Optional spillover correction
@@ -107,24 +108,6 @@ try:
     _HAVE_SPILLOVER = True
 except ImportError:
     _HAVE_SPILLOVER = False
-
-# Optional scikit-image for denoising
-try:
-    from skimage import morphology, filters
-    from skimage.filters import gaussian, median
-    from skimage.morphology import disk, footprint_rectangle
-    from skimage.restoration import denoise_nl_means, estimate_sigma
-    from scipy import ndimage as ndi
-    try:
-        from skimage.restoration import rolling_ball as _sk_rolling_ball  # type: ignore
-        _HAVE_ROLLING_BALL = True
-    except Exception:
-        _HAVE_ROLLING_BALL = False
-    _HAVE_SCIKIT_IMAGE = True
-except ImportError:
-    _HAVE_SCIKIT_IMAGE = False
-    _HAVE_ROLLING_BALL = False
-
 
 def _apply_denoise_to_channel(channel_img: np.ndarray, channel_name: str, denoise_settings: Dict) -> np.ndarray:
     """Apply denoising to a single channel image based on settings.
@@ -137,62 +120,7 @@ def _apply_denoise_to_channel(channel_img: np.ndarray, channel_name: str, denois
       }
     Any of the three keys may be missing or None.
     """
-    if not _HAVE_SCIKIT_IMAGE or not denoise_settings:
-        return channel_img
-
-    result = channel_img.copy()
-
-    # Hot pixel removal
-    hot_config = denoise_settings.get("hot")
-    if hot_config:
-        method = hot_config.get("method", "median3")
-        n_sd = float(hot_config.get("n_sd", 5.0))
-        if method == "median3":
-            # 3x3 median filter (use footprint_rectangle for consistency with GUI)
-            try:
-                result = median(result, footprint=footprint_rectangle(3, 3).astype(bool))
-            except Exception:
-                result = ndi.median_filter(result, size=3)
-        elif method == "n_sd_local_median":
-            # Replace pixels above N*local_std over local median
-            try:
-                local_median = median(result, footprint=footprint_rectangle(3, 3).astype(bool))
-            except Exception:
-                local_median = ndi.median_filter(result, size=3)
-            diff = result - local_median
-            local_var = ndi.uniform_filter(diff * diff, size=3)
-            local_std = np.sqrt(np.maximum(local_var, 1e-8))
-            mask_hot = diff > (n_sd * local_std)
-            result = np.where(mask_hot, local_median, result)
-
-    # Speckle noise reduction
-    speckle_config = denoise_settings.get("speckle")
-    if speckle_config:
-        method = speckle_config.get("method", "gaussian")
-        sigma = float(speckle_config.get("sigma", 0.8))
-        if method == "gaussian":
-            result = gaussian(result, sigma=sigma)
-        elif method == "nl_means":
-            est = estimate_sigma(result)
-            result = denoise_nl_means(result, h=est * sigma)
-
-    # Background subtraction
-    bg_config = denoise_settings.get("background")
-    if bg_config:
-        method = bg_config.get("method", "white_tophat")
-        radius = int(bg_config.get("radius", 15))
-        if method == "white_tophat":
-            selem = disk(radius)
-            result = morphology.white_tophat(result, selem)
-        elif method == "black_tophat":
-            selem = disk(radius)
-            result = morphology.black_tophat(result, selem)
-        elif method == "rolling_ball" and _HAVE_ROLLING_BALL:
-            # Use skimage rolling_ball to estimate and subtract background
-            background = _sk_rolling_ball(result, radius=radius)
-            result = np.clip(result - background, 0, None)
-
-    return result
+    return apply_channel_denoise(channel_img, denoise_settings)
 
 
 def extract_features_for_acquisition(
@@ -336,174 +264,168 @@ def extract_features_for_acquisition(
         else:
             channel_indices = list(range(len(channel_names)))
         
-        for filtered_idx, original_idx in enumerate(channel_indices):
-            ch_name = channel_names[filtered_idx]
-            ch_img = img_stack[..., original_idx]
-            # Mean intensity - use manual computation to avoid regionprops_table hangs
-            # regionprops_table can hang on large/complex images, so we compute manually
-            inten_df = _compute_mean_intensity_manual(label_image, ch_img)
-            inten_df.rename(columns={"mean_intensity": f"{ch_name}_mean"}, inplace=True)
+        selected_intensity_types = {
+            feature_type
+            for feature_type in INTENSITY_FEATURE_TYPES
+            if selected_features.get(feature_type, False)
+        }
 
-            # Compute std, median, mad, p10, p90, integrated, frac_pos using vectorized operations
-            # This is much faster than looping over labels
-            from scipy import ndimage as ndi
-            
-            labels = inten_df["label"].to_numpy()
-            num_labels = len(labels)
-            
-            # Convert to float64 for computations
-            ch_img_float = ch_img.astype(np.float64)
-            
-            # Use scipy.ndimage for efficient per-label statistics
-            # These operations are vectorized and much faster than per-label loops
-            try:
-                # Standard deviation: sqrt(mean(x^2) - mean(x)^2)
-                label_sums_sq = ndi.labeled_comprehension(
-                    ch_img_float ** 2, label_image, labels, np.sum, float, 0.0
-                )
-                label_counts = ndi.labeled_comprehension(
-                    np.ones_like(ch_img_float), label_image, labels, np.sum, float, 0.0
-                )
-                label_sums = ndi.labeled_comprehension(
-                    ch_img_float, label_image, labels, np.sum, float, 0.0
-                )
-                
-                # Avoid division by zero
-                mean_vals = np.divide(label_sums, label_counts, out=np.zeros_like(label_sums), where=(label_counts > 0))
-                mean_sq_vals = np.divide(label_sums_sq, label_counts, out=np.zeros_like(label_sums_sq), where=(label_counts > 0))
-                std_vals = np.sqrt(np.maximum(mean_sq_vals - mean_vals ** 2, 0.0))
-                
-                # For median, percentiles, and MAD, we still need to extract pixels per label
-                # But we can do this more efficiently by sorting labels first
-                # For now, use a more efficient approach: extract all pixels at once
-                median_vals = np.zeros(num_labels, dtype=np.float64)
-                mad_vals = np.zeros(num_labels, dtype=np.float64)
-                p10_vals = np.zeros(num_labels, dtype=np.float64)
-                p90_vals = np.zeros(num_labels, dtype=np.float64)
-                integrated_vals = mean_vals * label_counts  # mean * count = integrated
-                frac_pos_vals = np.zeros(num_labels, dtype=np.float64)
-                
-                # Compute frac_pos using vectorized operations (much faster)
-                # Count positive pixels per label
-                positive_mask = (ch_img_float > 0).astype(np.float64)
-                label_positive_counts = ndi.labeled_comprehension(
-                    positive_mask, label_image, labels, np.sum, float, 0.0
-                )
-                frac_pos_vals = np.divide(
-                    label_positive_counts,
-                    label_counts,
-                    out=np.zeros_like(label_positive_counts),
-                    where=(label_counts > 0)
-                )
-                
-                # For statistics that require sorted data (median, percentiles, MAD),
-                # use a single-pass grouping approach for much better performance
-                # Much more efficient: group all pixels by label in a single pass
-                # This avoids scanning the entire array for each label
-                label_flat = label_image.ravel()
-                img_flat = ch_img_float.ravel()
-                
-                # Create a mapping from label to index in labels array
-                label_to_idx = {lbl: i for i, lbl in enumerate(labels)}
-                
-                # Group pixels by label in a single pass
-                # Use a list of lists - much faster than repeated boolean indexing
-                pixels_by_label = {lbl: [] for lbl in labels}
-                
-                # Single pass through all pixels
-                for pixel_val, pixel_label in zip(img_flat, label_flat):
-                    if pixel_label in label_to_idx:
-                        pixels_by_label[pixel_label].append(pixel_val)
-                
-                # Convert to numpy arrays and compute statistics
-                # This is much faster because we only sort each group once
-                for i, lbl in enumerate(labels):
-                    if label_counts[i] == 0:
-                        median_vals[i] = 0.0
-                        mad_vals[i] = 0.0
-                        p10_vals[i] = 0.0
-                        p90_vals[i] = 0.0
-                        continue
-                    
-                    pix = np.array(pixels_by_label[lbl], dtype=np.float64)
-                    
-                    if pix.size == 0:
-                        continue
-                    
-                    try:
-                        # Sort once and use for all statistics
-                        pix_sorted = np.sort(pix)
-                        n = len(pix_sorted)
-                        
-                        # Median
-                        if n % 2 == 0:
-                            median_vals[i] = float((pix_sorted[n//2 - 1] + pix_sorted[n//2]) / 2.0)
-                        else:
-                            median_vals[i] = float(pix_sorted[n//2])
-                        
-                        # Percentiles (using sorted array)
-                        p10_vals[i] = float(pix_sorted[int(n * 0.10)])
-                        p90_vals[i] = float(pix_sorted[int(n * 0.90)])
-                        
-                        # MAD: median absolute deviation (reuse sorted array)
-                        abs_dev = np.abs(pix - median_vals[i])
-                        abs_dev_sorted = np.sort(abs_dev)
-                        if n % 2 == 0:
-                            mad_vals[i] = float((abs_dev_sorted[n//2 - 1] + abs_dev_sorted[n//2]) / 2.0)
-                        else:
-                            mad_vals[i] = float(abs_dev_sorted[n//2])
-                    except Exception as e:
-                        print(f"[feature_worker] [ERROR] Error processing label {lbl} for channel {ch_name}: {e}")
-                        median_vals[i] = np.nan
-                        mad_vals[i] = np.nan
-                        p10_vals[i] = np.nan
-                        p90_vals[i] = np.nan
-                
-            except Exception as e:
-                print(f"[feature_worker] [ERROR] Error in vectorized computation for channel {ch_name}: {e}")
-                import traceback
-                traceback.print_exc()
-                # Fallback to original method if vectorized approach fails
-                std_vals = np.zeros(num_labels, dtype=np.float64)
-                median_vals = np.zeros(num_labels, dtype=np.float64)
-                mad_vals = np.zeros(num_labels, dtype=np.float64)
-                p10_vals = np.zeros(num_labels, dtype=np.float64)
-                p90_vals = np.zeros(num_labels, dtype=np.float64)
-                integrated_vals = np.zeros(num_labels, dtype=np.float64)
-                frac_pos_vals = np.zeros(num_labels, dtype=np.float64)
-                
-                for i, lbl in enumerate(labels):
-                    mask_lbl = (label_image == lbl)
-                    pix = ch_img[mask_lbl]
-                    if pix.size == 0:
-                        continue
-                    try:
-                        std_vals[i] = float(np.std(pix))
-                        median_vals[i] = float(np.median(pix))
-                        mad_vals[i] = float(np.median(np.abs(pix - np.median(pix))))
-                        p10_vals[i] = float(np.percentile(pix, 10))
-                        p90_vals[i] = float(np.percentile(pix, 90))
-                        integrated_vals[i] = float(np.mean(pix) * pix.size)
-                        frac_pos_vals[i] = float(np.count_nonzero(pix > 0) / pix.size)
-                    except Exception:
-                        std_vals[i] = np.nan
-                        median_vals[i] = np.nan
-                        mad_vals[i] = np.nan
-                        p10_vals[i] = np.nan
-                        p90_vals[i] = np.nan
-                        integrated_vals[i] = np.nan
-                        frac_pos_vals[i] = np.nan
+        if selected_intensity_types:
+            for filtered_idx, original_idx in enumerate(channel_indices):
+                ch_name = channel_names[filtered_idx]
+                ch_img = img_stack[..., original_idx]
+                inten_df = _compute_mean_intensity_manual(label_image, ch_img)
 
-            inten_df[f"{ch_name}_std"] = std_vals
-            inten_df[f"{ch_name}_median"] = median_vals
-            inten_df[f"{ch_name}_mad"] = mad_vals
-            inten_df[f"{ch_name}_p10"] = p10_vals
-            inten_df[f"{ch_name}_p90"] = p90_vals
-            inten_df[f"{ch_name}_integrated"] = integrated_vals
-            inten_df[f"{ch_name}_frac_pos"] = frac_pos_vals
+                labels = inten_df["label"].to_numpy()
+                num_labels = len(labels)
+                ch_img_float = ch_img.astype(np.float64)
 
-            # Merge with morphology on label
-            morph_df = morph_df.merge(inten_df, on="label", how="left")
+                # Compute std, median, mad, p10, p90, integrated, frac_pos using
+                # vectorized operations wherever possible.
+                from scipy import ndimage as ndi
+
+                try:
+                    label_sums_sq = ndi.labeled_comprehension(
+                        ch_img_float ** 2, label_image, labels, np.sum, float, 0.0
+                    )
+                    label_counts = ndi.labeled_comprehension(
+                        np.ones_like(ch_img_float), label_image, labels, np.sum, float, 0.0
+                    )
+                    label_sums = ndi.labeled_comprehension(
+                        ch_img_float, label_image, labels, np.sum, float, 0.0
+                    )
+
+                    mean_vals = np.divide(
+                        label_sums,
+                        label_counts,
+                        out=np.zeros_like(label_sums),
+                        where=(label_counts > 0),
+                    )
+                    mean_sq_vals = np.divide(
+                        label_sums_sq,
+                        label_counts,
+                        out=np.zeros_like(label_sums_sq),
+                        where=(label_counts > 0),
+                    )
+                    std_vals = np.sqrt(np.maximum(mean_sq_vals - mean_vals ** 2, 0.0))
+
+                    median_vals = np.zeros(num_labels, dtype=np.float64)
+                    mad_vals = np.zeros(num_labels, dtype=np.float64)
+                    p10_vals = np.zeros(num_labels, dtype=np.float64)
+                    p90_vals = np.zeros(num_labels, dtype=np.float64)
+                    integrated_vals = mean_vals * label_counts
+
+                    positive_mask = (ch_img_float > 0).astype(np.float64)
+                    label_positive_counts = ndi.labeled_comprehension(
+                        positive_mask, label_image, labels, np.sum, float, 0.0
+                    )
+                    frac_pos_vals = np.divide(
+                        label_positive_counts,
+                        label_counts,
+                        out=np.zeros_like(label_positive_counts),
+                        where=(label_counts > 0),
+                    )
+
+                    label_flat = label_image.ravel()
+                    img_flat = ch_img_float.ravel()
+                    label_to_idx = {lbl: i for i, lbl in enumerate(labels)}
+                    pixels_by_label = {lbl: [] for lbl in labels}
+
+                    for pixel_val, pixel_label in zip(img_flat, label_flat):
+                        if pixel_label in label_to_idx:
+                            pixels_by_label[pixel_label].append(pixel_val)
+
+                    for i, lbl in enumerate(labels):
+                        if label_counts[i] == 0:
+                            median_vals[i] = 0.0
+                            mad_vals[i] = 0.0
+                            p10_vals[i] = 0.0
+                            p90_vals[i] = 0.0
+                            continue
+
+                        pix = np.array(pixels_by_label[lbl], dtype=np.float64)
+                        if pix.size == 0:
+                            continue
+
+                        try:
+                            pix_sorted = np.sort(pix)
+                            n = len(pix_sorted)
+
+                            if n % 2 == 0:
+                                median_vals[i] = float((pix_sorted[n // 2 - 1] + pix_sorted[n // 2]) / 2.0)
+                            else:
+                                median_vals[i] = float(pix_sorted[n // 2])
+
+                            p10_vals[i] = float(pix_sorted[int(n * 0.10)])
+                            p90_vals[i] = float(pix_sorted[int(n * 0.90)])
+
+                            abs_dev = np.abs(pix - median_vals[i])
+                            abs_dev_sorted = np.sort(abs_dev)
+                            if n % 2 == 0:
+                                mad_vals[i] = float((abs_dev_sorted[n // 2 - 1] + abs_dev_sorted[n // 2]) / 2.0)
+                            else:
+                                mad_vals[i] = float(abs_dev_sorted[n // 2])
+                        except Exception as e:
+                            print(f"[feature_worker] [ERROR] Error processing label {lbl} for channel {ch_name}: {e}")
+                            median_vals[i] = np.nan
+                            mad_vals[i] = np.nan
+                            p10_vals[i] = np.nan
+                            p90_vals[i] = np.nan
+
+                except Exception as e:
+                    print(f"[feature_worker] [ERROR] Error in vectorized computation for channel {ch_name}: {e}")
+                    import traceback
+                    traceback.print_exc()
+                    std_vals = np.zeros(num_labels, dtype=np.float64)
+                    median_vals = np.zeros(num_labels, dtype=np.float64)
+                    mad_vals = np.zeros(num_labels, dtype=np.float64)
+                    p10_vals = np.zeros(num_labels, dtype=np.float64)
+                    p90_vals = np.zeros(num_labels, dtype=np.float64)
+                    integrated_vals = np.zeros(num_labels, dtype=np.float64)
+                    frac_pos_vals = np.zeros(num_labels, dtype=np.float64)
+
+                    for i, lbl in enumerate(labels):
+                        mask_lbl = (label_image == lbl)
+                        pix = ch_img[mask_lbl]
+                        if pix.size == 0:
+                            continue
+                        try:
+                            std_vals[i] = float(np.std(pix))
+                            median_vals[i] = float(np.median(pix))
+                            mad_vals[i] = float(np.median(np.abs(pix - np.median(pix))))
+                            p10_vals[i] = float(np.percentile(pix, 10))
+                            p90_vals[i] = float(np.percentile(pix, 90))
+                            integrated_vals[i] = float(np.mean(pix) * pix.size)
+                            frac_pos_vals[i] = float(np.count_nonzero(pix > 0) / pix.size)
+                        except Exception:
+                            std_vals[i] = np.nan
+                            median_vals[i] = np.nan
+                            mad_vals[i] = np.nan
+                            p10_vals[i] = np.nan
+                            p90_vals[i] = np.nan
+                            integrated_vals[i] = np.nan
+                            frac_pos_vals[i] = np.nan
+
+                if "mean" in selected_intensity_types:
+                    inten_df.rename(columns={"mean_intensity": f"{ch_name}_mean"}, inplace=True)
+                else:
+                    inten_df = inten_df.drop(columns=["mean_intensity"])
+                if "std" in selected_intensity_types:
+                    inten_df[f"{ch_name}_std"] = std_vals
+                if "median" in selected_intensity_types:
+                    inten_df[f"{ch_name}_median"] = median_vals
+                if "mad" in selected_intensity_types:
+                    inten_df[f"{ch_name}_mad"] = mad_vals
+                if "p10" in selected_intensity_types:
+                    inten_df[f"{ch_name}_p10"] = p10_vals
+                if "p90" in selected_intensity_types:
+                    inten_df[f"{ch_name}_p90"] = p90_vals
+                if "integrated" in selected_intensity_types:
+                    inten_df[f"{ch_name}_integrated"] = integrated_vals
+                if "frac_pos" in selected_intensity_types:
+                    inten_df[f"{ch_name}_frac_pos"] = frac_pos_vals
+
+                morph_df = morph_df.merge(inten_df, on="label", how="left")
 
         # Apply spillover correction to extracted intensity features (after feature extraction, before arcsinh)
         # Spillover correction operates on raw intensity values (linear scale)

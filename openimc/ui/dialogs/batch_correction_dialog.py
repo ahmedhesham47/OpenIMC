@@ -89,9 +89,9 @@ class BatchCorrectionDialog(QtWidgets.QDialog):
         layout.setSpacing(8)
         
         # Create scroll area
-        scroll_area = QtWidgets.QScrollArea()
-        scroll_area.setWidgetResizable(True)
-        scroll_area.setFrameShape(QtWidgets.QFrame.NoFrame)
+        self.scroll_area = QtWidgets.QScrollArea()
+        self.scroll_area.setWidgetResizable(True)
+        self.scroll_area.setFrameShape(QtWidgets.QFrame.NoFrame)
         
         scroll_content = QtWidgets.QWidget()
         content_layout = QtWidgets.QVBoxLayout(scroll_content)
@@ -168,40 +168,54 @@ class BatchCorrectionDialog(QtWidgets.QDialog):
         metadata_layout = QtWidgets.QVBoxLayout(metadata_group)
         metadata_layout.setContentsMargins(8, 8, 8, 8)
         metadata_layout.setSpacing(4)
-        
+
+        metadata_header_layout = QtWidgets.QHBoxLayout()
+        self.metadata_summary_label = QtWidgets.QLabel("No metadata files configured.")
+        self.metadata_summary_label.setStyleSheet("QLabel { color: #666; font-size: 8pt; }")
+        metadata_header_layout.addWidget(self.metadata_summary_label, 1)
+        self.metadata_toggle_btn = QtWidgets.QPushButton("Show Details")
+        self.metadata_toggle_btn.setCheckable(True)
+        self.metadata_toggle_btn.toggled.connect(self._set_metadata_expanded)
+        metadata_header_layout.addWidget(self.metadata_toggle_btn)
+        metadata_layout.addLayout(metadata_header_layout)
+
+        self.metadata_content = QtWidgets.QWidget()
+        metadata_content_layout = QtWidgets.QVBoxLayout(self.metadata_content)
+        metadata_content_layout.setContentsMargins(0, 0, 0, 0)
+        metadata_content_layout.setSpacing(4)
+
         metadata_info = QtWidgets.QLabel(
-            "Upload metadata CSV files to attach additional information (e.g., patient ID, clinical data) "
-            "to single-cell features. Metadata will be merged based on filename matching. "
-            "You can upload multiple metadata files from different IMC facilities."
+            "Attach optional metadata CSVs by matching a filename column to the features "
+            "`source_file` field, which stores the source data file basename "
+            "(for MCD workflows, usually the source .mcd file)."
         )
         metadata_info.setWordWrap(True)
         metadata_info.setStyleSheet("QLabel { color: #666; font-size: 8pt; }")
-        metadata_layout.addWidget(metadata_info)
-        
-        # Metadata file list
-        metadata_list_label = QtWidgets.QLabel("Metadata files:")
-        metadata_layout.addWidget(metadata_list_label)
-        
+        metadata_content_layout.addWidget(metadata_info)
+
         self.metadata_list = QtWidgets.QListWidget()
-        self.metadata_list.setMaximumHeight(120)
-        self.metadata_list.setToolTip("Double-click a file to configure its filename column")
+        self.metadata_list.setMaximumHeight(110)
+        self.metadata_list.setToolTip("Double-click a file to configure which metadata column matches source_file.")
         self.metadata_list.itemDoubleClicked.connect(self._configure_metadata_file)
-        metadata_layout.addWidget(self.metadata_list)
-        
+        self.metadata_list.itemSelectionChanged.connect(self._update_metadata_controls)
+        metadata_content_layout.addWidget(self.metadata_list)
+
         metadata_buttons_layout = QtWidgets.QHBoxLayout()
-        self.add_metadata_btn = QtWidgets.QPushButton("Add Metadata File...")
+        self.add_metadata_btn = QtWidgets.QPushButton("Add Metadata...")
         self.add_metadata_btn.clicked.connect(self._add_metadata_file)
         metadata_buttons_layout.addWidget(self.add_metadata_btn)
-        
+
         self.configure_metadata_btn = QtWidgets.QPushButton("Configure Selected...")
         self.configure_metadata_btn.clicked.connect(self._configure_metadata_file)
         metadata_buttons_layout.addWidget(self.configure_metadata_btn)
-        
+
         self.remove_metadata_btn = QtWidgets.QPushButton("Remove Selected")
         self.remove_metadata_btn.clicked.connect(self._remove_metadata_file)
         metadata_buttons_layout.addWidget(self.remove_metadata_btn)
         metadata_buttons_layout.addStretch()
-        metadata_layout.addLayout(metadata_buttons_layout)
+        metadata_content_layout.addLayout(metadata_buttons_layout)
+
+        metadata_layout.addWidget(self.metadata_content)
         
         content_layout.addWidget(metadata_group)
         
@@ -271,7 +285,8 @@ class BatchCorrectionDialog(QtWidgets.QDialog):
         self.batch_var_combo.addItems(["source_file", "acquisition_id", "Custom grouping"])
         self.batch_var_combo.setToolTip(
             "Variable to use for batch identification.\n"
-            "'source_file' groups by file name, 'acquisition_id' groups by acquisition.\n"
+            "'source_file' groups by the source data file basename "
+            "(for MCD workflows, the source .mcd file), 'acquisition_id' groups by acquisition.\n"
             "'Custom grouping' allows you to create custom groups using source_well (recommended) or acquisition_id."
         )
         self.batch_var_combo.currentTextChanged.connect(self._on_batch_var_changed)
@@ -379,8 +394,8 @@ class BatchCorrectionDialog(QtWidgets.QDialog):
         
         content_layout.addWidget(output_group)
         
-        scroll_area.setWidget(scroll_content)
-        layout.addWidget(scroll_area)
+        self.scroll_area.setWidget(scroll_content)
+        layout.addWidget(self.scroll_area)
         
         # Buttons
         button_layout = QtWidgets.QHBoxLayout()
@@ -596,6 +611,8 @@ class BatchCorrectionDialog(QtWidgets.QDialog):
                         'dataframe': df
                     }
                     self._update_metadata_list()
+                    if not self.metadata_toggle_btn.isChecked():
+                        self.metadata_toggle_btn.setChecked(True)
             except Exception as e:
                 QtWidgets.QMessageBox.critical(
                     self,
@@ -613,8 +630,9 @@ class BatchCorrectionDialog(QtWidgets.QDialog):
         layout = QtWidgets.QVBoxLayout(dialog)
         
         info_label = QtWidgets.QLabel(
-            f"Select the column in '{os.path.basename(file_path)}' that contains the OME-TIFF filename "
-            f"(this will be matched against the 'source_file' column in features):"
+            f"Select the column in '{os.path.basename(file_path)}' that contains the source data filename "
+            f"(this will be matched against the 'source_file' column in features, which is typically the "
+            f"source .mcd filename basename for MCD workflows):"
         )
         info_label.setWordWrap(True)
         layout.addWidget(info_label)
@@ -671,8 +689,33 @@ class BatchCorrectionDialog(QtWidgets.QDialog):
         for file_path, info in self.metadata_files.items():
             item_text = self._format_metadata_item(file_path, info['filename_column'])
             self.metadata_list.addItem(item_text)
+        self._update_metadata_controls()
         # Update batch variable options to include metadata columns
         self._update_batch_var_options()
+
+    def _set_metadata_expanded(self, expanded: bool):
+        """Expand or collapse the optional metadata controls."""
+        self.metadata_content.setVisible(expanded)
+        self.metadata_toggle_btn.setText("Hide Details" if expanded else "Show Details")
+
+    def _update_metadata_controls(self):
+        """Refresh metadata summary text and button enabled state."""
+        file_count = len(self.metadata_files)
+        if file_count == 0:
+            self.metadata_summary_label.setText("No metadata files configured.")
+            if self.metadata_toggle_btn.isChecked():
+                self.metadata_toggle_btn.blockSignals(True)
+                self.metadata_toggle_btn.setChecked(False)
+                self.metadata_toggle_btn.blockSignals(False)
+            self._set_metadata_expanded(False)
+        else:
+            plural = "file" if file_count == 1 else "files"
+            self.metadata_summary_label.setText(
+                f"{file_count} metadata {plural} configured for source_file matching."
+            )
+        has_selection = self.metadata_list.currentItem() is not None
+        self.configure_metadata_btn.setEnabled(has_selection)
+        self.remove_metadata_btn.setEnabled(has_selection)
     
     def _remove_metadata_file(self):
         """Remove selected metadata file from the list."""
@@ -830,7 +873,8 @@ class BatchCorrectionDialog(QtWidgets.QDialog):
         """Merge metadata from all loaded metadata files into the features dataframe.
         
         Metadata is merged based on filename matching:
-        - Features have a 'source_file' column (basename of OME-TIFF file)
+        - Features have a 'source_file' column (basename of the source data file;
+          for MCD workflows this is typically the .mcd filename)
         - Metadata files have a user-specified filename column
         - Matching is done by comparing these columns (case-insensitive, ignoring extensions)
         - Columns with the same name in multiple metadata files are recognized as the same column
@@ -998,6 +1042,7 @@ class BatchCorrectionDialog(QtWidgets.QDialog):
         
         # Update batch variable options
         self._update_batch_var_options()
+        self._update_metadata_controls()
     
     def get_corrected_dataframe(self) -> Optional[pd.DataFrame]:
         """Get the batch-corrected dataframe."""

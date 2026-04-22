@@ -14,23 +14,26 @@ For complete documentation, installation instructions, and usage guides, please 
 
 ### Installation
 
-The most common installation pattern:
+The preferred installation pattern uses `uv`:
 
 ```bash
 # Clone the repository
 git clone https://github.com/dean-tessone/OpenIMC.git
 cd OpenIMC
 
-# Create conda environment
-conda create -n openimc python=3.11
-conda activate openimc
+# Create and activate a uv-managed virtual environment
+uv venv --python 3.11
+source .venv/bin/activate  # On Windows: .venv\Scripts\activate
 
 # Install dependencies
-pip install -r requirements.txt
+uv pip install -r requirements.txt
 
 # Install the package
-pip install .
+uv pip install -e .
 ```
+
+If you prefer Conda, that workflow is still supported in the
+[Installation documentation](https://dean-tessone.github.io/OpenIMC/installation.html).
 
 For detailed installation instructions, including alternative methods and troubleshooting, see the [Installation documentation](https://dean-tessone.github.io/OpenIMC/installation.html).
 

@@ -260,6 +260,49 @@ class AdvancedSpatialAnalysisDialog(QtWidgets.QDialog):
         if self.feature_dataframe is not None and 'source_well' in self.feature_dataframe.columns:
             return 'source_well'
         return 'acquisition_id'
+
+    def _has_batch_corrected_features(self) -> bool:
+        """Return whether a batch-corrected feature table is available."""
+        return isinstance(self.batch_corrected_dataframe, pd.DataFrame) and not self.batch_corrected_dataframe.empty
+
+    def get_active_feature_set_key(self) -> str:
+        """Return the active feature-set key used by the dialog."""
+        if hasattr(self, 'feature_set_combo') and self.feature_set_combo.currentText() == "Batch-Corrected Features":
+            return "batch_corrected"
+        return "original"
+
+    def _feature_set_text_for_key(self, feature_set_key: Optional[str] = None) -> str:
+        """Map an internal feature-set key to the current UI label."""
+        if feature_set_key == "batch_corrected" and self._has_batch_corrected_features():
+            return "Batch-Corrected Features"
+        return "Original Features" if self._has_batch_corrected_features() else "Loaded Features"
+
+    def _refresh_feature_set_combo(self, preferred_feature_set: Optional[str] = None):
+        """Rebuild feature-set options to match currently available data."""
+        if not hasattr(self, 'feature_set_combo'):
+            return
+
+        target_text = self._feature_set_text_for_key(preferred_feature_set or self.get_active_feature_set_key())
+        self.feature_set_combo.blockSignals(True)
+        self.feature_set_combo.clear()
+
+        if self._has_batch_corrected_features():
+            self.feature_set_combo.addItem("Original Features")
+            self.feature_set_combo.addItem("Batch-Corrected Features")
+            self.feature_set_combo.setToolTip("Choose between original or batch-corrected feature sets")
+        else:
+            self.feature_set_combo.addItem("Loaded Features")
+            self.feature_set_combo.setToolTip("Only one feature set is currently available (the loaded feature table)")
+
+        self.feature_set_combo.setCurrentText(target_text)
+        self.feature_set_combo.blockSignals(False)
+
+    def _update_active_feature_dataframe(self):
+        """Align the active feature dataframe to the current feature-set selection."""
+        if self.get_active_feature_set_key() == "batch_corrected" and self._has_batch_corrected_features():
+            self.feature_dataframe = self.batch_corrected_dataframe.copy()
+        else:
+            self.feature_dataframe = self.original_feature_dataframe.copy()
     
     def _get_filtered_dataframe(self):
         """Get the filtered dataframe based on selected source files and cell filters."""
@@ -369,17 +412,16 @@ class AdvancedSpatialAnalysisDialog(QtWidgets.QDialog):
         layout = QtWidgets.QVBoxLayout(self)
         
         # Feature set selector
-        if self.batch_corrected_dataframe is not None and not self.batch_corrected_dataframe.empty:
-            feature_set_layout = QtWidgets.QHBoxLayout()
-            feature_set_layout.addWidget(QtWidgets.QLabel("Feature Set:"))
-            self.feature_set_combo = QtWidgets.QComboBox()
-            self.feature_set_combo.addItem("Original Features")
-            self.feature_set_combo.addItem("Batch-Corrected Features")
-            self.feature_set_combo.setCurrentText("Batch-Corrected Features")
-            self.feature_set_combo.currentTextChanged.connect(self._on_feature_set_changed)
-            feature_set_layout.addWidget(self.feature_set_combo)
-            feature_set_layout.addStretch()
-            layout.addLayout(feature_set_layout)
+        feature_set_layout = QtWidgets.QHBoxLayout()
+        feature_set_layout.addWidget(QtWidgets.QLabel("Feature Set:"))
+        self.feature_set_combo = QtWidgets.QComboBox()
+        self._refresh_feature_set_combo(
+            preferred_feature_set="batch_corrected" if self._has_batch_corrected_features() else "original"
+        )
+        self.feature_set_combo.currentTextChanged.connect(self._on_feature_set_changed)
+        feature_set_layout.addWidget(self.feature_set_combo)
+        feature_set_layout.addStretch()
+        layout.addLayout(feature_set_layout)
         
         # Source file filter
         if 'source_file' in self.feature_dataframe.columns:
@@ -1061,17 +1103,7 @@ class AdvancedSpatialAnalysisDialog(QtWidgets.QDialog):
     
     def _on_feature_set_changed(self):
         """Handle feature set change - invalidate cache and refresh."""
-        # Update feature dataframe
-        if self.feature_set_combo.currentText() == "Batch-Corrected Features":
-            if self.batch_corrected_dataframe is not None and not self.batch_corrected_dataframe.empty:
-                self.feature_dataframe = self.batch_corrected_dataframe.copy()
-            else:
-                QtWidgets.QMessageBox.warning(self, "No Batch-Corrected Data", 
-                    "Batch-corrected features are not available. Using original features.")
-                self.feature_set_combo.setCurrentText("Original Features")
-                return
-        else:
-            self.feature_dataframe = self.original_feature_dataframe.copy()
+        self._update_active_feature_dataframe()
         
         # Reload cluster annotations since dataframe may have changed
         self._load_cluster_annotations()
@@ -1082,6 +1114,10 @@ class AdvancedSpatialAnalysisDialog(QtWidgets.QDialog):
         self.analysis_status = {}
         self.aggregated_results = {}
         self.spatial_graph_built = False
+
+        parent = self.parent()
+        if parent is not None and hasattr(parent, '_set_analysis_feature_set_preference'):
+            parent._set_analysis_feature_set_preference(self.get_active_feature_set_key(), source_dialog=self)
         
         # Refresh UI
         self._populate_roi_combo()
@@ -4189,14 +4225,12 @@ class AdvancedSpatialAnalysisDialog(QtWidgets.QDialog):
             # Update feature_dataframe based on batch correction preference
             if hasattr(parent, 'batch_corrected_dataframe') and parent.batch_corrected_dataframe is not None and not parent.batch_corrected_dataframe.empty:
                 self.batch_corrected_dataframe = parent.batch_corrected_dataframe.copy()
-                if hasattr(self, 'feature_set_combo') and self.feature_set_combo.currentText() == "Batch-Corrected Features":
-                    self.feature_dataframe = self.batch_corrected_dataframe.copy()
-                else:
-                    self.feature_dataframe = self.original_feature_dataframe.copy()
             else:
                 self.batch_corrected_dataframe = None
-                self.feature_dataframe = self.original_feature_dataframe.copy()
-        
+
+        self._refresh_feature_set_combo(preferred_feature_set=self.get_active_feature_set_key())
+        self._update_active_feature_dataframe()
+
         label_source = self._get_label_source_dialog()
         if label_source is not None and hasattr(label_source, 'cluster_annotation_map'):
             self.cluster_annotation_map = normalize_cluster_annotation_map(label_source.cluster_annotation_map or {})
@@ -4210,6 +4244,16 @@ class AdvancedSpatialAnalysisDialog(QtWidgets.QDialog):
         # Refresh ROI combo boxes and other UI elements that depend on dataframe
         self._populate_roi_combo()
         self._update_autocorr_var_combo()
+
+    def apply_feature_set_preference(self, feature_set_key: Optional[str]):
+        """Apply a shared feature-set preference without forcing unnecessary resets."""
+        target_text = self._feature_set_text_for_key(feature_set_key)
+        if hasattr(self, 'feature_set_combo'):
+            if self.feature_set_combo.currentText() != target_text:
+                self.feature_set_combo.setCurrentText(target_text)
+                return
+
+        self._update_active_feature_dataframe()
     
     def on_clusters_changed(self):
         """Handle cluster changes - reset analysis and refresh dataframe."""

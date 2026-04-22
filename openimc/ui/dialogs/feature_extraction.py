@@ -25,6 +25,7 @@ from PyQt5 import QtWidgets
 from PyQt5.QtCore import Qt, QTimer
 
 from openimc.data.mcd_loader import AcquisitionInfo
+from openimc.processing.denoising import background_index_from_method, background_method_from_index
 
 # Optional scikit-image for denoising
 try:
@@ -78,9 +79,9 @@ class FeatureExtractionDialog(QtWidgets.QDialog):
         main_layout.setSpacing(8)
         
         # Create scroll area
-        scroll_area = QtWidgets.QScrollArea()
-        scroll_area.setWidgetResizable(True)
-        scroll_area.setFrameShape(QtWidgets.QFrame.NoFrame)
+        self.scroll_area = QtWidgets.QScrollArea()
+        self.scroll_area.setWidgetResizable(True)
+        self.scroll_area.setFrameShape(QtWidgets.QFrame.NoFrame)
         
         # Create scrollable content widget
         scroll_content = QtWidgets.QWidget()
@@ -102,6 +103,14 @@ class FeatureExtractionDialog(QtWidgets.QDialog):
         self.all_with_masks_chk.setChecked(True)
         self.all_with_masks_chk.toggled.connect(self._on_all_with_masks_toggled)
         acq_layout.addWidget(self.all_with_masks_chk)
+
+        acq_info_label = QtWidgets.QLabel(
+            "Acquisition labels include the source data file in brackets. "
+            "For MCD workflows, this corresponds to the source .mcd file."
+        )
+        acq_info_label.setWordWrap(True)
+        acq_info_label.setStyleSheet("QLabel { color: #666; font-size: 8pt; }")
+        acq_layout.addWidget(acq_info_label)
         
         self.acq_list = QtWidgets.QListWidget()
         self.acq_list.setSelectionMode(QtWidgets.QAbstractItemView.MultiSelection)
@@ -317,6 +326,7 @@ class FeatureExtractionDialog(QtWidgets.QDialog):
         
         # Initialize custom denoising settings storage
         self.custom_denoise_settings = {}
+        self._current_denoise_channel = None
         
         # Disable custom denoising panel if scikit-image is missing
         if not _HAVE_SCIKIT_IMAGE:
@@ -333,13 +343,23 @@ class FeatureExtractionDialog(QtWidgets.QDialog):
         
         # Create tab widget for features
         self.feature_tabs = QtWidgets.QTabWidget()
-        self.feature_tabs.setMaximumHeight(140)  # Limit height of feature tabs
+        self.feature_tabs.setMaximumHeight(170)  # Limit height of feature tabs
         
         # Morphology features tab
         morph_tab = QtWidgets.QWidget()
         morph_layout = QtWidgets.QVBoxLayout(morph_tab)
         morph_layout.setContentsMargins(4, 4, 4, 4)
         morph_layout.setSpacing(2)
+
+        morph_button_row = QtWidgets.QHBoxLayout()
+        self.select_all_morph_btn = QtWidgets.QPushButton("Select All")
+        self.select_all_morph_btn.clicked.connect(lambda: self._set_feature_group_checked(self.morph_features, True))
+        morph_button_row.addWidget(self.select_all_morph_btn)
+        self.select_none_morph_btn = QtWidgets.QPushButton("Select None")
+        self.select_none_morph_btn.clicked.connect(lambda: self._set_feature_group_checked(self.morph_features, False))
+        morph_button_row.addWidget(self.select_none_morph_btn)
+        morph_button_row.addStretch()
+        morph_layout.addLayout(morph_button_row)
         
         self.morph_features = {
             'area_um2': QtWidgets.QCheckBox("Area (μm²)"),
@@ -389,6 +409,16 @@ class FeatureExtractionDialog(QtWidgets.QDialog):
         intensity_layout = QtWidgets.QVBoxLayout(intensity_tab)
         intensity_layout.setContentsMargins(4, 4, 4, 4)
         intensity_layout.setSpacing(2)
+
+        intensity_button_row = QtWidgets.QHBoxLayout()
+        self.select_all_intensity_btn = QtWidgets.QPushButton("Select All")
+        self.select_all_intensity_btn.clicked.connect(lambda: self._set_feature_group_checked(self.intensity_features, True))
+        intensity_button_row.addWidget(self.select_all_intensity_btn)
+        self.select_none_intensity_btn = QtWidgets.QPushButton("Select None")
+        self.select_none_intensity_btn.clicked.connect(lambda: self._set_feature_group_checked(self.intensity_features, False))
+        intensity_button_row.addWidget(self.select_none_intensity_btn)
+        intensity_button_row.addStretch()
+        intensity_layout.addLayout(intensity_button_row)
         
         self.intensity_features = {
             'mean': QtWidgets.QCheckBox("Mean intensity"),
@@ -459,10 +489,10 @@ class FeatureExtractionDialog(QtWidgets.QDialog):
         self.excluded_channels = set()
         
         # Set scroll content widget
-        scroll_area.setWidget(scroll_content)
+        self.scroll_area.setWidget(scroll_content)
         
         # Add scroll area to main layout
-        main_layout.addWidget(scroll_area)
+        main_layout.addWidget(self.scroll_area)
         
         # Buttons (outside scroll area)
         button_layout = QtWidgets.QHBoxLayout()
@@ -488,7 +518,16 @@ class FeatureExtractionDialog(QtWidgets.QDialog):
                 label += f" [{file_name}]"
                 item = QtWidgets.QListWidgetItem(label)
                 item.setData(Qt.UserRole, acq.id)
+                item.setToolTip(
+                    f"Source data file: {file_name}\n"
+                    "For MCD workflows, this is the source .mcd file."
+                )
                 self.acq_list.addItem(item)
+
+    def _set_feature_group_checked(self, feature_group, checked: bool):
+        """Set all checkboxes in a feature group to the same checked state."""
+        for checkbox in feature_group.values():
+            checkbox.setChecked(checked)
     
     def _on_all_with_masks_toggled(self):
         """Handle toggle of 'all with masks' checkbox."""
@@ -589,13 +628,58 @@ class FeatureExtractionDialog(QtWidgets.QDialog):
     
     def _on_denoise_channel_changed(self):
         """Handle changes to the denoise channel selection."""
+        self._save_current_denoise_settings(self._current_denoise_channel)
         self._load_denoise_settings()
+
+    def _current_custom_denoise_config(self):
+        """Capture the currently displayed custom denoise settings."""
+        cfg_hot = None
+        if self.hot_pixel_chk.isChecked():
+            cfg_hot = {
+                "method": "median3" if self.hot_pixel_method_combo.currentIndex() == 0 else "n_sd_local_median",
+                "n_sd": float(self.hot_pixel_n_spin.value()),
+            }
+
+        cfg_speckle = None
+        if self.speckle_chk.isChecked():
+            cfg_speckle = {
+                "method": "gaussian" if self.speckle_method_combo.currentIndex() == 0 else "nl_means",
+                "sigma": float(self.gaussian_sigma_spin.value()),
+            }
+
+        cfg_bg = None
+        if self.bg_subtract_chk.isChecked():
+            cfg_bg = {
+                "method": background_method_from_index(self.bg_method_combo.currentIndex()),
+                "radius": int(self.bg_radius_spin.value()),
+            }
+
+        return {
+            "hot": cfg_hot,
+            "speckle": cfg_speckle,
+            "background": cfg_bg,
+        }
+
+    def _save_current_denoise_settings(self, channel_name=None):
+        """Persist the currently visible denoise controls for the selected channel."""
+        if self.denoise_source_combo.currentText() != "Custom":
+            return
+        channel = channel_name or self.denoise_channel_combo.currentText()
+        if not channel:
+            return
+        config = self._current_custom_denoise_config()
+        self.custom_denoise_settings[channel] = {
+            "hot": dict(config["hot"]) if config["hot"] else None,
+            "speckle": dict(config["speckle"]) if config["speckle"] else None,
+            "background": dict(config["background"]) if config["background"] else None,
+        }
     
     def _load_denoise_settings(self):
         """Load saved denoise settings for the currently selected denoise channel into the UI."""
         ch = self.denoise_channel_combo.currentText()
         if not ch:
             return
+        self._current_denoise_channel = ch
         cfg = self.custom_denoise_settings.get(ch, {})
         hot = cfg.get("hot")
         speckle = cfg.get("speckle")
@@ -633,14 +717,7 @@ class FeatureExtractionDialog(QtWidgets.QDialog):
                 
             if bg:
                 self.bg_subtract_chk.setChecked(True)
-                # 0 white_tophat, 1 black_tophat, 2 rolling_ball (approx)
-                method = bg.get("method")
-                if method == "white_tophat":
-                    self.bg_method_combo.setCurrentIndex(0)
-                elif method == "black_tophat":
-                    self.bg_method_combo.setCurrentIndex(1)
-                else:
-                    self.bg_method_combo.setCurrentIndex(2)
+                self.bg_method_combo.setCurrentIndex(background_index_from_method(bg.get("method")))
                 self.bg_radius_spin.setValue(int(bg.get("radius", 15)))
             else:
                 self.bg_subtract_chk.setChecked(False)
@@ -663,34 +740,8 @@ class FeatureExtractionDialog(QtWidgets.QDialog):
     def _apply_denoise_to_all_channels(self):
         """Apply current denoising parameters to all channels."""
         try:
-            # Build config from current UI settings
-            cfg_hot = None
-            if self.hot_pixel_chk.isChecked():
-                cfg_hot = {
-                    "method": "median3" if self.hot_pixel_method_combo.currentIndex() == 0 else "n_sd_local_median",
-                    "n_sd": float(self.hot_pixel_n_spin.value()),
-                }
-
-            cfg_speckle = None
-            if self.speckle_chk.isChecked():
-                cfg_speckle = {
-                    "method": "gaussian" if self.speckle_method_combo.currentIndex() == 0 else "nl_means",
-                    "sigma": float(self.gaussian_sigma_spin.value()),
-                }
-
-            cfg_bg = None
-            if self.bg_subtract_chk.isChecked():
-                bg_idx = self.bg_method_combo.currentIndex()
-                if bg_idx == 0:
-                    bg_method = "white_tophat"
-                elif bg_idx == 1:
-                    bg_method = "black_tophat"
-                else:
-                    bg_method = "rolling_ball"
-                cfg_bg = {
-                    "method": bg_method,
-                    "radius": int(self.bg_radius_spin.value()),
-                }
+            self._save_current_denoise_settings()
+            config = self._current_custom_denoise_config()
 
             # Get all available channels
             channels = []
@@ -699,11 +750,11 @@ class FeatureExtractionDialog(QtWidgets.QDialog):
 
             # Apply the same configuration to all channels
             for channel in channels:
-                self.custom_denoise_settings.setdefault(channel, {})
-                # Store copies per channel to avoid shared references
-                self.custom_denoise_settings[channel]["hot"] = dict(cfg_hot) if cfg_hot else None
-                self.custom_denoise_settings[channel]["speckle"] = dict(cfg_speckle) if cfg_speckle else None
-                self.custom_denoise_settings[channel]["background"] = dict(cfg_bg) if cfg_bg else None
+                self.custom_denoise_settings[channel] = {
+                    "hot": dict(config["hot"]) if config["hot"] else None,
+                    "speckle": dict(config["speckle"]) if config["speckle"] else None,
+                    "background": dict(config["background"]) if config["background"] else None,
+                }
             
             # Show visual confirmation
             self.apply_all_channels_btn.setText("✓ Applied to All Channels")
@@ -797,6 +848,7 @@ class FeatureExtractionDialog(QtWidgets.QDialog):
     
     def get_custom_denoise_settings(self):
         """Get the custom denoising settings."""
+        self._save_current_denoise_settings()
         return self.custom_denoise_settings
     
     def get_spillover_config(self):

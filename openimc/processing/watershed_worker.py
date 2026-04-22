@@ -28,15 +28,15 @@ from typing import Dict, List, Optional, Tuple, Union
 import numpy as np
 from scipy import ndimage as ndi
 from scipy.ndimage import distance_transform_edt
+from openimc.processing.denoising import apply_channel_denoise
 
 # Optional scikit-image imports
 try:
     from skimage import morphology, filters, segmentation
-    from skimage.filters import gaussian, median, sobel, scharr
-    from skimage.morphology import disk, remove_small_objects, label, footprint_rectangle
+    from skimage.filters import sobel, scharr
+    from skimage.morphology import disk, remove_small_objects, label
     from skimage.feature import peak_local_max
     from skimage.measure import regionprops
-    from skimage.restoration import denoise_nl_means, estimate_sigma
     from skimage.filters import meijering, sato
     _HAVE_SCIKIT_IMAGE = True
 except ImportError:
@@ -77,38 +77,7 @@ def _apply_preprocessing_pipeline(
     
     # Apply denoising if settings provided
     if denoise_settings:
-        # Hot pixel removal
-        hot_config = denoise_settings.get("hot")
-        if hot_config:
-            method = hot_config.get("method", "median3")
-            n_sd = float(hot_config.get("n_sd", 5.0))
-            if method == "median3":
-                # Use footprint_rectangle for consistency with GUI
-                try:
-                    result = median(result, footprint=footprint_rectangle(3, 3).astype(bool))
-                except Exception:
-                    result = ndi.median_filter(result, size=3)
-            elif method == "n_sd_local_median":
-                try:
-                    local_median = median(result, footprint=footprint_rectangle(3, 3).astype(bool))
-                except Exception:
-                    local_median = ndi.median_filter(result, size=3)
-                diff = result - local_median
-                local_var = ndi.uniform_filter(diff * diff, size=3)
-                local_std = np.sqrt(np.maximum(local_var, 1e-8))
-                mask_hot = diff > (n_sd * local_std)
-                result = np.where(mask_hot, local_median, result)
-        
-        # Light denoising
-        speckle_config = denoise_settings.get("speckle")
-        if speckle_config:
-            method = speckle_config.get("method", "gaussian")
-            sigma = float(speckle_config.get("sigma", 0.8))
-            if method == "gaussian":
-                result = gaussian(result, sigma=sigma)
-            elif method == "nl_means":
-                est = estimate_sigma(result)
-                result = denoise_nl_means(result, h=est * sigma)
+        result = apply_channel_denoise(result, denoise_settings).astype(np.float32, copy=False)
     
     # Optional top-hat filtering
     if enable_tophat:

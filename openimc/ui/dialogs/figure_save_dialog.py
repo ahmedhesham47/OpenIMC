@@ -27,9 +27,53 @@ This dialog allows users to configure save options for matplotlib figures:
 - Image size (width and height in inches)
 """
 
-from typing import Optional, Tuple
+from typing import List, Optional, Tuple
 from PyQt5 import QtWidgets
 from PyQt5.QtCore import Qt
+
+
+def _draw_figure_if_possible(figure) -> None:
+    """Realize pending artists so text sizing can be captured and restored reliably."""
+    canvas = getattr(figure, "canvas", None)
+    if canvas is None or not hasattr(canvas, "draw"):
+        return
+    try:
+        canvas.draw()
+    except Exception:
+        pass
+
+
+def _collect_figure_text_states(figure) -> List[Tuple[object, float]]:
+    """Return all current matplotlib Text objects with their original font sizes."""
+    import matplotlib.text as mtext
+
+    states = []
+    seen = set()
+    for text in figure.findobj(mtext.Text):
+        if not hasattr(text, "get_fontsize") or not hasattr(text, "set_fontsize"):
+            continue
+        text_id = id(text)
+        if text_id in seen:
+            continue
+        seen.add(text_id)
+        states.append((text, text.get_fontsize()))
+    return states
+
+
+def _apply_fontsize_override(figure, fontsize: float) -> List[Tuple[object, float]]:
+    """Apply a temporary font-size override to all visible figure text."""
+    _draw_figure_if_possible(figure)
+    text_states = _collect_figure_text_states(figure)
+    for text, _original_size in text_states:
+        text.set_fontsize(fontsize)
+    return text_states
+
+
+def _restore_figure_text_states(text_states: List[Tuple[object, float]]) -> None:
+    """Restore text objects to their original font sizes."""
+    for text, original_size in text_states:
+        if hasattr(text, "set_fontsize"):
+            text.set_fontsize(original_size)
 
 
 class FigureSaveDialog(QtWidgets.QDialog):
@@ -261,8 +305,6 @@ def save_figure_with_options(figure, default_filename: str = "figure.png", paren
     Returns:
         True if figure was saved, False if cancelled
     """
-    import matplotlib.pyplot as plt
-    
     dialog = FigureSaveDialog(default_filename, parent)
     dialog.set_figure_properties(figure)
     
@@ -283,44 +325,20 @@ def save_figure_with_options(figure, default_filename: str = "figure.png", paren
         base = filename.rsplit('.', 1)[0] if '.' in filename else filename
         filename = base + expected_ext
     
+    original_size = None
+    original_text_states: List[Tuple[object, float]] = []
     try:
-        # Temporarily adjust figure properties if needed
-        original_size = None
-        original_fontsize = None
-        
         if 'figsize' in save_kwargs:
-            original_size = figure.get_size_inches()
+            original_size = tuple(figure.get_size_inches())
             figure.set_size_inches(save_kwargs.pop('figsize'))
-        
+
         if 'fontsize' in save_kwargs:
             fontsize = save_kwargs.pop('fontsize')
-            # Apply font size to all text elements
-            import matplotlib.text as mtext
-            for text in figure.findobj(mtext.Text):
-                if hasattr(text, 'set_fontsize'):
-                    text.set_fontsize(fontsize)
-            # Also set default font size for axes
-            for ax in figure.get_axes():
-                ax.tick_params(labelsize=fontsize)
-                if hasattr(ax, 'xaxis'):
-                    ax.xaxis.label.set_fontsize(fontsize)
-                if hasattr(ax, 'yaxis'):
-                    ax.yaxis.label.set_fontsize(fontsize)
-                if hasattr(ax, 'title'):
-                    ax.title.set_fontsize(fontsize)
-        
-        # Save the figure
+            original_text_states = _apply_fontsize_override(figure, fontsize)
+
         figure.savefig(filename, bbox_inches='tight', **save_kwargs)
-        
-        # Restore original size if changed
-        if original_size is not None:
-            figure.set_size_inches(original_size)
-        
-        # Note: Font sizes are not restored as they're harder to track
-        # This is acceptable as the figure is typically being saved at the end
-        
         return True
-        
+
     except Exception as e:
         QtWidgets.QMessageBox.critical(
             parent, 
@@ -328,4 +346,14 @@ def save_figure_with_options(figure, default_filename: str = "figure.png", paren
             f"Failed to save figure: {str(e)}"
         )
         return False
-
+    finally:
+        if original_text_states:
+            _restore_figure_text_states(original_text_states)
+        if original_size is not None:
+            figure.set_size_inches(original_size)
+        canvas = getattr(figure, "canvas", None)
+        if canvas is not None and hasattr(canvas, "draw_idle"):
+            try:
+                canvas.draw_idle()
+            except Exception:
+                pass
