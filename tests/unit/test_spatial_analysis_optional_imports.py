@@ -49,6 +49,7 @@ def test_spatial_analysis_module_import_defers_squidpy_stack(monkeypatch):
 @pytest.mark.unit
 def test_squidpy_available_handles_broken_optional_import(monkeypatch):
     importlib.reload(spatial_analysis_module)
+    monkeypatch.setattr(spatial_analysis_module, "_should_probe_squidpy_import", lambda: False)
 
     real_import_module = importlib.import_module
 
