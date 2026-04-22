@@ -151,9 +151,23 @@ def _get_squidpy_modules():
     if _SQUIDPY_IMPORT_ATTEMPTED:
         return None
 
-    if _should_probe_squidpy_import() and not _probe_squidpy_import_in_subprocess():
+    if _should_probe_squidpy_import():
         _SQUIDPY_IMPORT_ATTEMPTED = True
-        _SQUIDPY_IMPORT_ERROR = _SQUIDPY_PROBE_ERROR
+        if not _probe_squidpy_import_in_subprocess():
+            _SQUIDPY_IMPORT_ERROR = _SQUIDPY_PROBE_ERROR
+            warnings.warn(
+                f"Failed to import squidpy: {_SQUIDPY_IMPORT_ERROR}. Squidpy features will be disabled.",
+                ImportWarning,
+            )
+            return None
+
+        # Keep squidpy imports out of the Windows main process. The probe tells
+        # us whether the dependency stack exists, but importing it in-process can
+        # still terminate the interpreter on GitHub Actions.
+        _SQUIDPY_IMPORT_ERROR = (
+            "Squidpy runtime imports are disabled in-process when a subprocess "
+            "probe is required. Use Linux or macOS for advanced squidpy analyses."
+        )
         warnings.warn(
             f"Failed to import squidpy: {_SQUIDPY_IMPORT_ERROR}. Squidpy features will be disabled.",
             ImportWarning,

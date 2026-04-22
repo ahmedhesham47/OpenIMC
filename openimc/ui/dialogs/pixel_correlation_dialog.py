@@ -388,7 +388,7 @@ class PixelCorrelationDialog(QtWidgets.QDialog):
     def __init__(self, parent=None):
         super().__init__(parent)
         self.setWindowTitle("Pixel-Level Correlation Analysis")
-        self.setMinimumSize(1000, 900)  # Make taller so analysis scope is visible
+        self.setMinimumSize(420, 320)
         self.resize(1000, 900)
         
         self.parent_window = parent

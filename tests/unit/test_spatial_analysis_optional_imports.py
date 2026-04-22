@@ -89,3 +89,24 @@ def test_squidpy_available_handles_failed_windows_probe(monkeypatch):
     assert spatial_analysis_module.squidpy_available() is False
     assert spatial_analysis_module._HAVE_SQUIDPY is False
     assert "3221225477" in str(spatial_analysis_module._SQUIDPY_IMPORT_ERROR)
+
+
+@pytest.mark.unit
+def test_squidpy_available_keeps_windows_imports_out_of_process(monkeypatch):
+    importlib.reload(spatial_analysis_module)
+
+    monkeypatch.setattr(spatial_analysis_module, "_should_probe_squidpy_import", lambda: True)
+    monkeypatch.setattr(
+        spatial_analysis_module.subprocess,
+        "run",
+        lambda *args, **kwargs: SimpleNamespace(returncode=0, stderr="", stdout=""),
+    )
+    monkeypatch.setattr(
+        importlib,
+        "import_module",
+        lambda *args, **kwargs: (_ for _ in ()).throw(AssertionError("direct import should not run")),
+    )
+
+    assert spatial_analysis_module.squidpy_available() is False
+    assert spatial_analysis_module._HAVE_SQUIDPY is False
+    assert "disabled in-process" in str(spatial_analysis_module._SQUIDPY_IMPORT_ERROR)

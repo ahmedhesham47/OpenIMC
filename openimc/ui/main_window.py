@@ -198,16 +198,43 @@ from openimc.ui.dialogs.display_settings_dialog import (
 
 
 # Optional runtime flags for extra deps
-_HAVE_CELLPOSE = False
-try:
-    from cellpose import models as _cp_models  # type: ignore  # noqa: F401
-    import skimage  # type: ignore  # noqa: F401
-    _HAVE_CELLPOSE = True
-except Exception:
-    _HAVE_CELLPOSE = False
-else:
-    # Import models under the expected name when available
-    from cellpose import models  # type: ignore
+_HAVE_CELLPOSE = optional_dependency_available("cellpose")
+_CELLPOSE_IMPORT_ATTEMPTED = False
+_CELLPOSE_IMPORT_ERROR: Optional[BaseException] = None
+cellpose_models = None
+
+
+def _load_cellpose_models():
+    """Import Cellpose only when segmentation actually needs it."""
+    global _HAVE_CELLPOSE, _CELLPOSE_IMPORT_ATTEMPTED, _CELLPOSE_IMPORT_ERROR
+    global cellpose_models
+
+    if cellpose_models is not None:
+        return cellpose_models
+
+    if _CELLPOSE_IMPORT_ATTEMPTED:
+        return None
+
+    _CELLPOSE_IMPORT_ATTEMPTED = True
+    if not _HAVE_CELLPOSE:
+        return None
+
+    # Avoid importing Cellpose when torch itself is unavailable or unsafe.
+    if get_torch_module() is None:
+        _CELLPOSE_IMPORT_ERROR = torch_import_error()
+        _HAVE_CELLPOSE = False
+        return None
+
+    try:
+        from cellpose import models as imported_cellpose_models  # type: ignore
+    except Exception as exc:
+        _CELLPOSE_IMPORT_ERROR = exc
+        _HAVE_CELLPOSE = False
+        return None
+
+    cellpose_models = imported_cellpose_models
+    _CELLPOSE_IMPORT_ERROR = None
+    return cellpose_models
 
 # Optional CellSAM - import lazily so torch-backed dependencies do not run
 # during module import in headless or partially provisioned environments.
@@ -5102,13 +5129,16 @@ class MainWindow(QtWidgets.QMainWindow):
                             f"{detail}"
                         )
                         return
-                elif model != "Classical Watershed" and not _HAVE_CELLPOSE:
-                    QtWidgets.QMessageBox.critical(
-                        self, "Missing dependency", 
-                        "Cellpose library is required for segmentation.\n"
-                        "Install it with: pip install cellpose"
-                    )
-                    return
+                elif model != "Classical Watershed":
+                    if _load_cellpose_models() is None:
+                        detail = f"\n\nDetails: {_CELLPOSE_IMPORT_ERROR}" if _CELLPOSE_IMPORT_ERROR else ""
+                        QtWidgets.QMessageBox.critical(
+                            self, "Missing dependency",
+                            "Cellpose library is required for segmentation.\n"
+                            "Install it with: pip install cellpose"
+                            f"{detail}"
+                        )
+                        return
                 
                 diameter = dlg.get_diameter()
                 flow_threshold = dlg.get_flow_threshold()
@@ -5804,10 +5834,23 @@ class MainWindow(QtWidgets.QMainWindow):
                 gpu_device = gpu_id
             
             # Initialize model
+            loaded_cellpose_models = _load_cellpose_models()
+            if loaded_cellpose_models is None:
+                detail = f"\n\nDetails: {_CELLPOSE_IMPORT_ERROR}" if _CELLPOSE_IMPORT_ERROR else ""
+                QtWidgets.QMessageBox.critical(
+                    self,
+                    "Missing dependency",
+                    "Cellpose library is required for batch segmentation.\n"
+                    "Install it with: pip install cellpose"
+                    f"{detail}"
+                )
+                progress_dlg.close()
+                return
+
             if model == "nuclei":
-                model_obj = models.Cellpose(gpu=use_gpu, model_type='nuclei')
+                model_obj = loaded_cellpose_models.Cellpose(gpu=use_gpu, model_type='nuclei')
             else:  # cyto3
-                model_obj = models.Cellpose(gpu=use_gpu, model_type='cyto3')
+                model_obj = loaded_cellpose_models.Cellpose(gpu=use_gpu, model_type='cyto3')
             
             # Process acquisitions sequentially
             successful_segmentations = 0
