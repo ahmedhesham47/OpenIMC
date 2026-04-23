@@ -37,6 +37,8 @@ If you prefer Conda, that workflow is still supported in the
 
 For detailed installation instructions, including alternative methods and troubleshooting, see the [Installation documentation](https://dean-tessone.github.io/OpenIMC/installation.html).
 
+A video tutorial is available here: [Video Tutorial](https://youtu.be/CKSwJE3jdi0?si=J9Eei4c2iC_D_VQc).
+
 ### Running OpenIMC
 
 After installation, you can run:
