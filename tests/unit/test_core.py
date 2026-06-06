@@ -590,6 +590,94 @@ class TestCluster:
         assert isinstance(clustered_df, pd.DataFrame)
         assert 'cluster' in clustered_df.columns
     
+    def test_cluster_pca_variance_metadata(self, sample_feature_dataframe):
+        """Test PCA variance mode records retained PCs and variance."""
+        features_df = sample_feature_dataframe.copy()
+        rng = np.random.default_rng(123)
+        feature_cols = []
+        for idx in range(6):
+            col = f"marker_{idx}_mean"
+            feature_cols.append(col)
+            features_df[col] = rng.normal(loc=idx, scale=1.0, size=len(features_df))
+
+        clustered_df = cluster(
+            features_df=features_df,
+            method="kmeans",
+            n_clusters=3,
+            columns=feature_cols,
+            scaling="zscore",
+            seed=7,
+            use_pca=True,
+            pca_mode="variance",
+            pca_variance=0.90,
+        )
+
+        metadata = clustered_df.attrs["pca_metadata"]
+        assert isinstance(clustered_df, pd.DataFrame)
+        assert len(clustered_df) == len(features_df)
+        assert 'cluster' in clustered_df.columns
+        assert metadata["feature_representation"] == "principal_components"
+        assert metadata["pca_selection_mode"] == "variance"
+        assert metadata["pca_requested_variance"] == pytest.approx(0.90)
+        assert 1 <= metadata["pca_n_components_retained"] <= len(feature_cols)
+        assert metadata["pca_variance_retained"] >= 0.90
+        assert metadata["pca_input_feature_count"] == len(feature_cols)
+
+    def test_cluster_pca_fixed_components_metadata(self, sample_feature_dataframe):
+        """Test fixed-PC mode records requested components and realized variance."""
+        features_df = sample_feature_dataframe.copy()
+        rng = np.random.default_rng(456)
+        feature_cols = []
+        for idx in range(5):
+            col = f"marker_{idx}_mean"
+            feature_cols.append(col)
+            features_df[col] = rng.normal(size=len(features_df))
+
+        clustered_df = cluster(
+            features_df=features_df,
+            method="kmeans",
+            n_clusters=3,
+            columns=feature_cols,
+            scaling="zscore",
+            seed=11,
+            use_pca=True,
+            pca_mode="components",
+            pca_n_components=2,
+        )
+
+        metadata = clustered_df.attrs["pca_metadata"]
+        assert len(clustered_df) == len(features_df)
+        assert metadata["pca_selection_mode"] == "components"
+        assert metadata["pca_requested_n_components"] == 2
+        assert metadata["pca_n_components_retained"] == 2
+        assert 0.0 < metadata["pca_variance_retained"] <= 1.0
+
+    @pytest.mark.parametrize(
+        "kwargs,match",
+        [
+            ({"pca_mode": "bad"}, "pca_mode"),
+            ({"pca_mode": "variance", "pca_variance": 0}, "pca_variance"),
+            ({"pca_mode": "variance", "pca_variance": 1.5}, "pca_variance"),
+            ({"pca_mode": "components", "pca_n_components": None}, "pca_n_components"),
+            ({"pca_mode": "components", "pca_n_components": 0}, "pca_n_components"),
+        ],
+    )
+    def test_cluster_pca_validation(self, sample_feature_dataframe, kwargs, match):
+        """Test invalid PCA settings fail with clear validation errors."""
+        features_df = sample_feature_dataframe.copy()
+        feature_cols = ['mean_DAPI', 'mean_CD45', 'mean_CD3']
+
+        with pytest.raises(ValueError, match=match):
+            cluster(
+                features_df=features_df,
+                method="kmeans",
+                n_clusters=3,
+                columns=feature_cols,
+                scaling="zscore",
+                use_pca=True,
+                **kwargs,
+            )
+    
     def test_cluster_invalid_method(self, sample_feature_dataframe):
         """Test clustering with invalid method raises error."""
         with pytest.raises(ValueError, match="Unknown clustering method"):

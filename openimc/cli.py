@@ -779,7 +779,12 @@ def cluster_command(args):
         min_cluster_size=args.min_cluster_size,
         min_samples=args.min_samples,
         cluster_selection_method=args.cluster_selection_method,
-        hdbscan_metric=args.hdbscan_metric
+        hdbscan_metric=args.hdbscan_metric,
+        # PCA representation parameters
+        use_pca=getattr(args, 'use_pca', False),
+        pca_mode=getattr(args, 'pca_mode', 'variance'),
+        pca_variance=getattr(args, 'pca_variance', 0.95),
+        pca_n_components=getattr(args, 'pca_n_components', None)
     )
     
     # Count clusters
@@ -2336,8 +2341,18 @@ def workflow_command(args):
         cluster_args.scaling = cluster_config.get('scaling', 'zscore')
         cluster_args.linkage = cluster_config.get('linkage', 'ward')
         cluster_args.resolution = cluster_config.get('resolution', 1.0)
+        cluster_args.n_neighbors = cluster_config.get('n_neighbors', 15)
+        cluster_args.metric = cluster_config.get('metric', 'euclidean')
+        cluster_args.use_jaccard = cluster_config.get('use_jaccard', False)
+        cluster_args.n_init = cluster_config.get('n_init', 10)
         cluster_args.min_cluster_size = cluster_config.get('min_cluster_size', 10)
         cluster_args.min_samples = cluster_config.get('min_samples', 5)
+        cluster_args.cluster_selection_method = cluster_config.get('cluster_selection_method', 'eom')
+        cluster_args.hdbscan_metric = cluster_config.get('hdbscan_metric', 'euclidean')
+        cluster_args.use_pca = cluster_config.get('use_pca', False)
+        cluster_args.pca_mode = cluster_config.get('pca_mode', 'variance')
+        cluster_args.pca_variance = cluster_config.get('pca_variance', 0.95)
+        cluster_args.pca_n_components = cluster_config.get('pca_n_components')
         cluster_args.seed = cluster_config.get('seed', 42)
         
         cluster_command(cluster_args)
@@ -2548,6 +2563,10 @@ Examples:
     cluster_parser.add_argument('--min-samples', type=int, default=5, help='Minimum samples (hdbscan, default: 5)')
     cluster_parser.add_argument('--cluster-selection-method', choices=['eom', 'leaf'], default='eom', help='Cluster selection method for HDBSCAN (default: eom)')
     cluster_parser.add_argument('--hdbscan-metric', choices=['euclidean', 'manhattan'], default='euclidean', help='Distance metric for HDBSCAN (default: euclidean)')
+    cluster_parser.add_argument('--use-pca', action='store_true', help='Cluster on principal components instead of selected raw/scaled features')
+    cluster_parser.add_argument('--pca-mode', choices=['variance', 'components'], default='variance', help='PCA selection mode when --use-pca is set (default: variance)')
+    cluster_parser.add_argument('--pca-variance', type=float, default=0.95, help='Proportion of variance to retain when --pca-mode=variance (default: 0.95)')
+    cluster_parser.add_argument('--pca-n-components', type=int, default=None, help='Number of PCs to retain when --pca-mode=components')
     cluster_parser.add_argument('--seed', type=int, default=42, help='Random seed for reproducibility (default: 42)')
     cluster_parser.add_argument('--workers', type=int, default=None, help=f'Number of parallel workers (default: {get_default_workers()})')
     cluster_parser.set_defaults(func=cluster_command)

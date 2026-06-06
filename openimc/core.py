@@ -1059,6 +1059,184 @@ def extract_features(
     return combined_features
 
 
+def _apply_pca_to_clustering_matrix(
+    data: pd.DataFrame,
+    *,
+    pca_mode: str = "variance",
+    pca_variance: float = 0.95,
+    pca_n_components: Optional[int] = None,
+    seed: int = 42
+) -> Tuple[pd.DataFrame, Dict[str, Any]]:
+    """Project a cleaned/scaled clustering matrix into PC space."""
+    try:
+        from sklearn.decomposition import PCA
+    except ImportError as e:
+        raise ImportError("scikit-learn is required for PCA clustering") from e
+
+    mode = (pca_mode or "variance").strip().lower()
+    if mode in {"n_components", "components", "component", "count", "number"}:
+        mode = "components"
+    elif mode not in {"variance", "components"}:
+        raise ValueError("pca_mode must be 'variance' or 'components'")
+
+    max_components = int(min(data.shape[0], data.shape[1]))
+    if max_components < 1:
+        raise ValueError("PCA requires at least one valid row and one valid feature")
+
+    requested_variance = None
+    requested_n_components = None
+    if mode == "variance":
+        if pca_variance is None:
+            raise ValueError("pca_variance is required when pca_mode='variance'")
+        requested_variance = float(pca_variance)
+        if not (0.0 < requested_variance <= 1.0):
+            raise ValueError("pca_variance must be greater than 0 and less than or equal to 1")
+        n_components = requested_variance if requested_variance < 1.0 else max_components
+    else:
+        if pca_n_components is None:
+            raise ValueError("pca_n_components is required when pca_mode='components'")
+        requested_n_components = int(pca_n_components)
+        if requested_n_components < 1:
+            raise ValueError("pca_n_components must be at least 1")
+        n_components = min(requested_n_components, max_components)
+
+    pca = PCA(n_components=n_components, svd_solver="full", random_state=seed)
+    transformed = pca.fit_transform(data.values)
+    retained_components = int(transformed.shape[1])
+    pc_columns = [f"PC{i}" for i in range(1, retained_components + 1)]
+    pca_df = pd.DataFrame(transformed, index=data.index, columns=pc_columns)
+
+    explained_ratios = np.nan_to_num(pca.explained_variance_ratio_, nan=0.0)
+    metadata = {
+        "feature_representation": "principal_components",
+        "use_pca": True,
+        "pca_selection_mode": mode,
+        "pca_requested_variance": requested_variance,
+        "pca_requested_n_components": requested_n_components,
+        "pca_n_components_retained": retained_components,
+        "pca_variance_retained": float(np.sum(explained_ratios)),
+        "pca_input_feature_count": int(data.shape[1]),
+        "pca_max_components": max_components,
+    }
+    return pca_df, metadata
+
+
+def _prepare_clustering_matrix(
+    features_df: pd.DataFrame,
+    columns: Optional[List[str]] = None,
+    scaling: str = "zscore",
+    *,
+    use_pca: bool = False,
+    pca_mode: str = "variance",
+    pca_variance: float = 0.95,
+    pca_n_components: Optional[int] = None,
+    seed: int = 42
+) -> Tuple[pd.DataFrame, List[str], Dict[str, Any]]:
+    """Build the numeric matrix used by clustering algorithms."""
+    import time
+
+    t0 = time.time()
+    if columns:
+        cluster_columns = columns
+    else:
+        exclude_cols = {'label', 'acquisition_id', 'acquisition_name', 'well', 'cluster', 'cell_id',
+                       'source_file', 'source_well', 'acquisition_label',
+                       'centroid_x', 'centroid_y', 'area', 'area_um2', 'perimeter', 'perimeter_um',
+                       'eccentricity', 'solidity', 'circularity', 'major_axis_length',
+                       'minor_axis_length', 'orientation', 'extent', 'convex_area', 'euler_number'}
+        cluster_columns = [col for col in features_df.columns if col not in exclude_cols]
+    print(f"[CORE.CLUSTER] Column selection: {len(cluster_columns)} columns, took {time.time() - t0:.3f}s")
+
+    missing = [col for col in cluster_columns if col not in features_df.columns]
+    if missing:
+        raise ValueError(f"Columns not found: {missing}")
+
+    t0 = time.time()
+    data = features_df[cluster_columns].copy()
+    print(f"[CORE.CLUSTER] Data copy: shape={data.shape}, took {time.time() - t0:.3f}s")
+
+    t0 = time.time()
+    data = data.replace([np.inf, -np.inf], np.nan).fillna(data.median(numeric_only=True))
+    print(f"[CORE.CLUSTER] Handle missing/infinite: took {time.time() - t0:.3f}s")
+
+    t0 = time.time()
+    if scaling == 'zscore':
+        data_means = data.mean()
+        data_stds = data.std(ddof=1)
+        zero_var_cols = (data_stds == 0) | data_stds.isna() | data_means.isna()
+        if zero_var_cols.any():
+            data.loc[:, zero_var_cols] = 0
+            non_zero_var_cols = ~zero_var_cols
+            if non_zero_var_cols.any():
+                normalized_data = (data.loc[:, non_zero_var_cols] - data_means[non_zero_var_cols]) / data_stds[non_zero_var_cols]
+                data.loc[:, non_zero_var_cols] = normalized_data
+        else:
+            data = (data - data_means) / data_stds
+    elif scaling == 'mad':
+        data_medians = data.median()
+        mad_values = {}
+        for col in data.columns:
+            col_data = data[col].values
+            median_val = data_medians[col]
+            if pd.isna(median_val):
+                mad_values[col] = 0.0
+            else:
+                mad = np.median(np.abs(col_data - median_val))
+                mad_values[col] = 0.0 if pd.isna(mad) else mad
+
+        mad_series = pd.Series(mad_values)
+        zero_mad_cols = (mad_series == 0) | mad_series.isna() | data_medians.isna()
+        if zero_mad_cols.any():
+            data.loc[:, zero_mad_cols] = 0
+            non_zero_mad_cols = ~zero_mad_cols
+            if non_zero_mad_cols.any():
+                for col in data.columns[non_zero_mad_cols]:
+                    data[col] = (data[col] - data_medians[col]) / mad_series[col]
+        else:
+            for col in data.columns:
+                data[col] = (data[col] - data_medians[col]) / mad_series[col]
+
+    data = data.replace([np.inf, -np.inf], np.nan)
+    print(f"[CORE.CLUSTER] Scaling complete: took {time.time() - t0:.3f}s")
+
+    t0 = time.time()
+    data = data.dropna(axis=0, how='any').dropna(axis=1, how='any')
+    print(f"[CORE.CLUSTER] Dropna: shape={data.shape}, took {time.time() - t0:.3f}s")
+
+    if data.shape[0] < 2 or data.shape[1] < 2:
+        raise ValueError("Insufficient data for clustering. Need at least 2 rows and 2 columns after cleaning.")
+
+    pca_metadata = {
+        "feature_representation": "raw_features",
+        "use_pca": False,
+        "pca_selection_mode": None,
+        "pca_requested_variance": None,
+        "pca_requested_n_components": None,
+        "pca_n_components_retained": None,
+        "pca_variance_retained": None,
+        "pca_input_feature_count": int(data.shape[1]),
+        "pca_max_components": int(min(data.shape[0], data.shape[1])),
+    }
+    if use_pca:
+        t0 = time.time()
+        data, pca_metadata = _apply_pca_to_clustering_matrix(
+            data,
+            pca_mode=pca_mode,
+            pca_variance=pca_variance,
+            pca_n_components=pca_n_components,
+            seed=seed,
+        )
+        print(
+            "[CORE.CLUSTER] PCA projection: "
+            f"{pca_metadata['pca_input_feature_count']} features -> "
+            f"{pca_metadata['pca_n_components_retained']} PCs "
+            f"({pca_metadata['pca_variance_retained']:.4f} variance), "
+            f"took {time.time() - t0:.3f}s"
+        )
+
+    return data, cluster_columns, pca_metadata
+
+
 def cluster(
     features_df: pd.DataFrame,
     method: str = "leiden",
@@ -1080,7 +1258,12 @@ def cluster(
     min_cluster_size: int = 10,
     min_samples: int = 5,
     cluster_selection_method: str = "eom",  # HDBSCAN cluster selection method
-    hdbscan_metric: str = "euclidean"  # HDBSCAN distance metric
+    hdbscan_metric: str = "euclidean",  # HDBSCAN distance metric
+    # PCA representation parameters
+    use_pca: bool = False,
+    pca_mode: str = "variance",
+    pca_variance: float = 0.95,
+    pca_n_components: Optional[int] = None
 ) -> pd.DataFrame:
     """Perform clustering on feature data.
     
@@ -1104,6 +1287,10 @@ def cluster(
         min_samples: Minimum samples for HDBSCAN (default: 5)
         cluster_selection_method: Cluster selection method for HDBSCAN ("eom" or "leaf", default: "eom")
         hdbscan_metric: Distance metric for HDBSCAN (default: "euclidean")
+        use_pca: If True, cluster on principal components instead of raw/scaled features
+        pca_mode: PCA selection mode ("variance" or "components")
+        pca_variance: Proportion of variance to retain when pca_mode="variance"
+        pca_n_components: Number of PCs to retain when pca_mode="components"
     
     Returns:
         DataFrame with cluster labels added in 'cluster' column
@@ -1119,96 +1306,16 @@ def cluster(
     random.seed(seed)
     np.random.seed(seed)
     
-    # Select columns for clustering
-    t0 = time.time()
-    if columns:
-        cluster_columns = columns
-    else:
-        # Auto-detect: exclude non-feature columns (matching GUI)
-        exclude_cols = {'label', 'acquisition_id', 'acquisition_name', 'well', 'cluster', 'cell_id',
-                       'source_file', 'source_well', 'acquisition_label',
-                       'centroid_x', 'centroid_y', 'area', 'area_um2', 'perimeter', 'perimeter_um',
-                       'eccentricity', 'solidity', 'circularity', 'major_axis_length',
-                       'minor_axis_length', 'orientation', 'extent', 'convex_area', 'euler_number'}
-        cluster_columns = [col for col in features_df.columns if col not in exclude_cols]
-    print(f"[CORE.CLUSTER] Column selection: {len(cluster_columns)} columns, took {time.time() - t0:.3f}s")
-    
-    # Validate columns
-    missing = [col for col in cluster_columns if col not in features_df.columns]
-    if missing:
-        raise ValueError(f"Columns not found: {missing}")
-    
-    # Prepare data exactly like GUI _prepare_clustering_data
-    t0 = time.time()
-    data = features_df[cluster_columns].copy()
-    print(f"[CORE.CLUSTER] Data copy: shape={data.shape}, took {time.time() - t0:.3f}s")
-    
-    # Handle missing/infinite values safely (matching GUI)
-    t0 = time.time()
-    data = data.replace([np.inf, -np.inf], np.nan).fillna(data.median(numeric_only=True))
-    print(f"[CORE.CLUSTER] Handle missing/infinite: took {time.time() - t0:.3f}s")
-    
-    # Apply scaling (matching GUI _apply_scaling)
-    t0 = time.time()
-    if scaling == 'zscore':
-        # Z-score normalization: (x - mean) / std
-        data_means = data.mean()
-        data_stds = data.std(ddof=1)
-        
-        # Handle columns with zero variance or NaN std/mean
-        zero_var_cols = (data_stds == 0) | data_stds.isna() | data_means.isna()
-        if zero_var_cols.any():
-            # Set zero variance/NaN columns to 0 (centered but not scaled)
-            data.loc[:, zero_var_cols] = 0
-            non_zero_var_cols = ~zero_var_cols
-            if non_zero_var_cols.any():
-                normalized_data = (data.loc[:, non_zero_var_cols] - data_means[non_zero_var_cols]) / data_stds[non_zero_var_cols]
-                data.loc[:, non_zero_var_cols] = normalized_data
-        else:
-            # Normalize all columns
-            data = (data - data_means) / data_stds
-    elif scaling == 'mad':
-        # MAD (Median Absolute Deviation) scaling: (x - median) / MAD
-        data_medians = data.median()
-        
-        # Calculate MAD for each column
-        mad_values = {}
-        for col in data.columns:
-            col_data = data[col].values
-            median_val = data_medians[col]
-            if pd.isna(median_val):
-                mad_values[col] = 0.0
-            else:
-                mad = np.median(np.abs(col_data - median_val))
-                mad_values[col] = 0.0 if pd.isna(mad) else mad
-        
-        mad_series = pd.Series(mad_values)
-        
-        # Handle columns with zero MAD or NaN
-        zero_mad_cols = (mad_series == 0) | mad_series.isna() | data_medians.isna()
-        if zero_mad_cols.any():
-            data.loc[:, zero_mad_cols] = 0
-            non_zero_mad_cols = ~zero_mad_cols
-            if non_zero_mad_cols.any():
-                for col in data.columns[non_zero_mad_cols]:
-                    data[col] = (data[col] - data_medians[col]) / mad_series[col]
-        else:
-            for col in data.columns:
-                data[col] = (data[col] - data_medians[col]) / mad_series[col]
-    # If scaling == 'none', skip scaling
-    
-    # Handle any infinities that might have been introduced
-    data = data.replace([np.inf, -np.inf], np.nan)
-    print(f"[CORE.CLUSTER] Scaling complete: took {time.time() - t0:.3f}s")
-    
-    # Drop any residual non-finite rows/cols (matching GUI)
-    t0 = time.time()
-    data = data.dropna(axis=0, how='any').dropna(axis=1, how='any')
-    print(f"[CORE.CLUSTER] Dropna: shape={data.shape}, took {time.time() - t0:.3f}s")
-    
-    # Guard: require at least 2 rows and 2 columns
-    if data.shape[0] < 2 or data.shape[1] < 2:
-        raise ValueError("Insufficient data for clustering. Need at least 2 rows and 2 columns after cleaning.")
+    data, cluster_columns, pca_metadata = _prepare_clustering_matrix(
+        features_df,
+        columns=columns,
+        scaling=scaling,
+        use_pca=use_pca,
+        pca_mode=pca_mode,
+        pca_variance=pca_variance,
+        pca_n_components=pca_n_components,
+        seed=seed,
+    )
     
     # Store original indices to map back
     original_indices = data.index
@@ -1509,6 +1616,7 @@ def cluster(
     result_df['cluster'] = cluster_series
     # Fill NaN with 0 (noise/unassigned) if needed
     result_df['cluster'] = result_df['cluster'].fillna(0).astype(int)
+    result_df.attrs["pca_metadata"] = pca_metadata
     print(f"[CORE.CLUSTER] Mapping labels back took {time.time() - t0:.3f}s")
     
     # Save output if path is provided

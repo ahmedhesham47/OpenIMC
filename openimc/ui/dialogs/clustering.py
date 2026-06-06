@@ -665,9 +665,58 @@ class CellClusteringDialog(QtWidgets.QDialog):
         self.clustering_scaling_combo.addItems(["None (no scaling)", "Z-score", "MAD (Median Absolute Deviation)"])
         self.clustering_scaling_combo.setCurrentText("None (no scaling)")
         self.clustering_scaling_combo.setToolTip("Scaling method applied to features before clustering")
+        self.clustering_scaling_combo.currentTextChanged.connect(self._update_clustering_settings_summary)
         options_grid.addWidget(self.clustering_scaling_combo, options_row, 3)
         options_row += 1
         
+        # PCA feature representation options
+        self.pca_options_group = QtWidgets.QGroupBox("Feature Representation")
+        pca_options_layout = QtWidgets.QGridLayout(self.pca_options_group)
+        pca_options_layout.setHorizontalSpacing(10)
+        pca_options_layout.setVerticalSpacing(6)
+        pca_options_layout.setColumnStretch(1, 1)
+        pca_options_layout.setColumnStretch(3, 1)
+
+        self.use_pca_checkbox = QtWidgets.QCheckBox("Cluster on principal components")
+        self.use_pca_checkbox.setChecked(False)
+        self.use_pca_checkbox.setToolTip("Project selected, scaled features into PC space before clustering")
+        if not _HAVE_SKLEARN:
+            self.use_pca_checkbox.setEnabled(False)
+            self.use_pca_checkbox.setToolTip("PCA clustering requires scikit-learn")
+        self.use_pca_checkbox.toggled.connect(self._on_pca_controls_changed)
+        pca_options_layout.addWidget(self.use_pca_checkbox, 0, 0, 1, 2)
+
+        self.pca_mode_label = QtWidgets.QLabel("PC selection:")
+        self.pca_mode_combo = QtWidgets.QComboBox()
+        self.pca_mode_combo.addItem("Variance retained", "variance")
+        self.pca_mode_combo.addItem("Number of PCs", "components")
+        self.pca_mode_combo.setCurrentIndex(0)
+        self.pca_mode_combo.currentIndexChanged.connect(self._on_pca_controls_changed)
+        pca_options_layout.addWidget(self.pca_mode_label, 1, 0)
+        pca_options_layout.addWidget(self.pca_mode_combo, 1, 1)
+
+        self.pca_variance_label = QtWidgets.QLabel("Variance retained:")
+        self.pca_variance_spinbox = QtWidgets.QDoubleSpinBox()
+        self.pca_variance_spinbox.setRange(1.0, 100.0)
+        self.pca_variance_spinbox.setDecimals(1)
+        self.pca_variance_spinbox.setSingleStep(1.0)
+        self.pca_variance_spinbox.setSuffix("%")
+        self.pca_variance_spinbox.setValue(95.0)
+        self.pca_variance_spinbox.setToolTip("Target cumulative variance retained by PCA")
+        self.pca_variance_spinbox.valueChanged.connect(self._on_pca_controls_changed)
+        pca_options_layout.addWidget(self.pca_variance_label, 1, 2)
+        pca_options_layout.addWidget(self.pca_variance_spinbox, 1, 3)
+
+        self.pca_n_components_label = QtWidgets.QLabel("Number of PCs:")
+        self.pca_n_components_spinbox = QtWidgets.QSpinBox()
+        self.pca_n_components_spinbox.setRange(1, 1000)
+        self.pca_n_components_spinbox.setValue(10)
+        self.pca_n_components_spinbox.setToolTip("Fixed number of principal components to retain")
+        self.pca_n_components_spinbox.valueChanged.connect(self._on_pca_controls_changed)
+        pca_options_layout.addWidget(self.pca_n_components_label, 2, 2)
+        pca_options_layout.addWidget(self.pca_n_components_spinbox, 2, 3)
+        self._on_pca_controls_changed()
+
         # Random seed
         options_grid.addWidget(QtWidgets.QLabel("Random Seed:"), options_row, 0)
         self.seed_spinbox = QtWidgets.QSpinBox()
@@ -758,6 +807,7 @@ class CellClusteringDialog(QtWidgets.QDialog):
         
         self.leiden_options_group.setVisible(False)
         options_layout.addLayout(options_grid)
+        options_layout.addWidget(self.pca_options_group)
         options_layout.addWidget(self.leiden_options_group)
 
         # HDBSCAN clustering options (initially hidden)
@@ -1234,6 +1284,13 @@ class CellClusteringDialog(QtWidgets.QDialog):
         method = self.clustering_type.currentText()
         feature_set = self.feature_set_combo.currentText() if hasattr(self, 'feature_set_combo') else "Original Features"
         scaling = self.clustering_scaling_combo.currentText() if hasattr(self, 'clustering_scaling_combo') else "None"
+        use_pca, pca_mode, pca_variance, pca_n_components = self._get_pca_settings() if hasattr(self, '_get_pca_settings') else (False, "variance", 0.95, None)
+        if use_pca and pca_mode == "variance":
+            representation_text = f"PCA ({pca_variance * 100:.1f}% variance)"
+        elif use_pca:
+            representation_text = f"PCA ({pca_n_components} PCs)"
+        else:
+            representation_text = "Raw features"
 
         if method == "Hierarchical":
             method_detail = self.hierarchical_method.currentText() if hasattr(self, 'hierarchical_method') else "ward"
@@ -1256,7 +1313,7 @@ class CellClusteringDialog(QtWidgets.QDialog):
         else:
             method_text = method
 
-        summary = f"{feature_set} | {method_text} | {scaling}"
+        summary = f"{feature_set} | {representation_text} | {method_text} | {scaling}"
         self.settings_summary_label.setText(summary)
         self.settings_summary_label.setToolTip(summary)
 
@@ -1582,6 +1639,33 @@ class CellClusteringDialog(QtWidgets.QDialog):
         self.resolution_label.setVisible(use_resolution)
         self.resolution_spinbox.setVisible(use_resolution)
         self._update_clustering_settings_summary()
+
+    def _get_pca_settings(self):
+        """Return PCA clustering settings from the UI."""
+        if not hasattr(self, 'use_pca_checkbox'):
+            return False, "variance", 0.95, None
+        use_pca = self.use_pca_checkbox.isChecked() and self.use_pca_checkbox.isEnabled()
+        mode = self.pca_mode_combo.currentData() if hasattr(self, 'pca_mode_combo') else "variance"
+        if mode not in {"variance", "components"}:
+            mode = "variance"
+        variance = self.pca_variance_spinbox.value() / 100.0 if hasattr(self, 'pca_variance_spinbox') else 0.95
+        n_components = self.pca_n_components_spinbox.value() if hasattr(self, 'pca_n_components_spinbox') else None
+        return use_pca, mode, variance, n_components
+
+    def _on_pca_controls_changed(self, *_args):
+        """Enable the relevant PCA controls and refresh the compact summary."""
+        if not hasattr(self, 'use_pca_checkbox'):
+            return
+        use_pca, mode, _variance, _n_components = self._get_pca_settings()
+        if hasattr(self, 'pca_mode_combo'):
+            self.pca_mode_combo.setEnabled(use_pca)
+        for widget_name in ('pca_variance_label', 'pca_variance_spinbox'):
+            if hasattr(self, widget_name):
+                getattr(self, widget_name).setEnabled(use_pca and mode == "variance")
+        for widget_name in ('pca_n_components_label', 'pca_n_components_spinbox'):
+            if hasattr(self, widget_name):
+                getattr(self, widget_name).setEnabled(use_pca and mode == "components")
+        self._update_clustering_settings_summary()
         
     def _run_clustering(self):
         """Run the clustering analysis."""
@@ -1632,10 +1716,12 @@ class CellClusteringDialog(QtWidgets.QDialog):
                 cluster_method = "leiden"
             elif clustering_type == "Louvain":
                 cluster_method = "louvain"
+            elif clustering_type == "K-means":
+                cluster_method = "kmeans"
             elif clustering_type == "HDBSCAN":
                 cluster_method = "hdbscan"
-            else:  # Hierarchical
-                cluster_method = self.hierarchical_method.currentText()
+            else:
+                cluster_method = "hierarchical"
             
             # Prepare data
             # Allow user to select features interactively
@@ -1673,6 +1759,7 @@ class CellClusteringDialog(QtWidgets.QDialog):
                 "MAD (Median Absolute Deviation)": "mad"
             }
             scaling_method = scaling_map.get(scaling_text, "zscore")
+            use_pca, pca_mode, pca_variance, pca_n_components = self._get_pca_settings()
             
             result = self._prepare_clustering_data(agg_method, include_morpho, selected_columns, scaling_method, filtered_df, filter_settings)
             
@@ -1703,6 +1790,10 @@ class CellClusteringDialog(QtWidgets.QDialog):
                 "output_path": None,
                 "seed": seed,
                 "n_clusters": n_clusters,
+                "use_pca": use_pca,
+                "pca_mode": pca_mode,
+                "pca_variance": pca_variance,
+                "pca_n_components": pca_n_components,
             }
 
             if cluster_method == "leiden":
@@ -1719,10 +1810,11 @@ class CellClusteringDialog(QtWidgets.QDialog):
                 cluster_kwargs["min_samples"] = self.min_samples_spinbox.value()
                 cluster_kwargs["cluster_selection_method"] = self.cluster_selection_combo.currentText()
                 cluster_kwargs["hdbscan_metric"] = self.metric_combo.currentText()
-            elif cluster_method in ["ward", "complete", "average", "single"]:
-                cluster_kwargs["linkage"] = cluster_method
+            elif cluster_method == "hierarchical":
+                cluster_kwargs["linkage"] = self.hierarchical_method.currentText()
 
             clustered_df = self._run_core_cluster_with_progress(cluster_kwargs, cluster_method)
+            pca_metadata = getattr(clustered_df, 'attrs', {}).get('pca_metadata', {})
 
             # Extract cluster labels and build clustered matrix for downstream visualizations.
             self.cluster_labels = clustered_df['cluster'].astype(int).values
@@ -1788,6 +1880,13 @@ class CellClusteringDialog(QtWidgets.QDialog):
                 "include_morphological": include_morpho,
                 "scaling_method": scaling_method,
                 "distance_metric": "euclidean",
+                "feature_representation": pca_metadata.get("feature_representation", "principal_components" if use_pca else "raw_features"),
+                "pca_selection_mode": pca_metadata.get("pca_selection_mode"),
+                "pca_requested_variance": pca_metadata.get("pca_requested_variance"),
+                "pca_requested_n_components": pca_metadata.get("pca_requested_n_components"),
+                "pca_n_components_retained": pca_metadata.get("pca_n_components_retained"),
+                "pca_variance_retained": pca_metadata.get("pca_variance_retained"),
+                "pca_input_feature_count": pca_metadata.get("pca_input_feature_count", len(selected_columns)),
                 "n_cells": int(len(self.clustered_data)) if self.clustered_data is not None else 0,
                 "source_files": self._get_source_files_for_logging(),
             }
@@ -1811,10 +1910,16 @@ class CellClusteringDialog(QtWidgets.QDialog):
                 params["metric"] = self.metric_combo.currentText()
                 params["distance_metric"] = self.metric_combo.currentText()
                 params["seed"] = self.seed_spinbox.value()
+            elif cluster_method == "kmeans":
+                params["seed"] = self.seed_spinbox.value()
+                params["n_init"] = 10
             else:
-                params["linkage_method"] = cluster_method
+                params["linkage_method"] = self.hierarchical_method.currentText()
                 # Hierarchical clustering is deterministic, but we log seed for consistency
                 params["seed"] = self.seed_spinbox.value()
+
+            self.last_clustering_method = cluster_method
+            self.last_clustering_params = params.copy()
             
             # Get acquisition IDs from clustered data
             acquisitions = self._get_logging_acquisitions()
@@ -1920,6 +2025,7 @@ class CellClusteringDialog(QtWidgets.QDialog):
             "leiden": "Building k-NN graph and optimizing Leiden partitions",
             "louvain": "Building k-NN graph and optimizing Louvain partitions",
             "hdbscan": "Running HDBSCAN density clustering",
+            "hierarchical": "Running hierarchical clustering",
             "ward": "Running hierarchical clustering",
             "complete": "Running hierarchical clustering",
             "average": "Running hierarchical clustering",
@@ -7928,7 +8034,7 @@ class CellClusteringDialog(QtWidgets.QDialog):
         layout.addLayout(button_layout)
         
         def run_analysis():
-            from openimc.core import cluster
+            from openimc.core import cluster, _prepare_clustering_matrix
             
             k_min = k_min_spin.value()
             k_max = k_max_spin.value()
@@ -7947,6 +8053,7 @@ class CellClusteringDialog(QtWidgets.QDialog):
                 "MAD (Median Absolute Deviation)": "mad"
             }
             selected_scaling = scaling_map.get(scaling_method, "zscore")
+            use_pca, pca_mode, pca_variance, pca_n_components = self._get_pca_settings()
             
             # Get full dataframe (core.cluster will handle column selection and scaling)
             full_data = self.feature_dataframe.copy()
@@ -7975,7 +8082,11 @@ class CellClusteringDialog(QtWidgets.QDialog):
                             output_path=None,
                             n_clusters=k,
                             seed=seed,
-                            n_init=10
+                            n_init=10,
+                            use_pca=use_pca,
+                            pca_mode=pca_mode,
+                            pca_variance=pca_variance,
+                            pca_n_components=pca_n_components
                         )
                         labels = clustered_df['cluster'].values - 1  # Convert back to 0-based for calculations
                         
@@ -7990,22 +8101,25 @@ class CellClusteringDialog(QtWidgets.QDialog):
                             output_path=None,
                             n_clusters=k,
                             linkage=linkage_method,
-                            seed=seed
+                            seed=seed,
+                            use_pca=use_pca,
+                            pca_mode=pca_mode,
+                            pca_variance=pca_variance,
+                            pca_n_components=pca_n_components
                         )
                         labels = clustered_df['cluster'].values - 1  # Convert back to 0-based for calculations
                     
-                    # Get scaled data for WCSS/inertia and silhouette calculations
-                    # (core.cluster returns original dataframe, but clustering was done on scaled data)
-                    # We need to match the exact data that was used for clustering
-                    data_for_calc = full_data[feature_cols].copy()
-                    
-                    # Apply same preprocessing as core.cluster (handle missing/infinite, then scale)
-                    data_for_calc = data_for_calc.replace([np.inf, -np.inf], np.nan)
-                    data_for_calc = data_for_calc.fillna(data_for_calc.median(numeric_only=True))
-                    data_scaled = self._apply_scaling(data_for_calc, selected_scaling)
-                    data_scaled = data_scaled.replace([np.inf, -np.inf], np.nan)
-                    # Drop rows/cols that would be dropped by core.cluster
-                    data_scaled = data_scaled.dropna(axis=0, how='any').dropna(axis=1, how='any')
+                    # Rebuild the same matrix used by core.cluster for scoring.
+                    data_scaled, _cluster_columns, _pca_metadata = _prepare_clustering_matrix(
+                        full_data,
+                        columns=feature_cols,
+                        scaling=selected_scaling,
+                        use_pca=use_pca,
+                        pca_mode=pca_mode,
+                        pca_variance=pca_variance,
+                        pca_n_components=pca_n_components,
+                        seed=seed,
+                    )
                     data_scaled = data_scaled.fillna(0)
                     
                     # Filter to only rows that have valid cluster labels (not NaN/0 from dropped rows)

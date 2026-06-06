@@ -141,6 +141,92 @@ def _build_clustering_dialog(
     return dialog
 
 
+
+
+def test_clustering_run_logs_pca_metadata_from_core_result(qtbot, monkeypatch):
+    df = _build_clustered_dataframe(n_clusters=3, cells_per_cluster=8, n_features=5)
+    dialog = CellClusteringDialog(df)
+    qtbot.addWidget(dialog)
+    selected_features = ['marker_0_mean', 'marker_1_mean', 'marker_2_mean']
+
+    from openimc.ui.dialogs import feature_selector_dialog as feature_selector_module
+
+    class FakeFeatureSelector:
+        def __init__(self, _available_cols, _parent):
+            pass
+
+        def set_filter_settings(self, _settings):
+            pass
+
+        def set_selected_features(self, _features):
+            pass
+
+        def exec_(self):
+            return QtWidgets.QDialog.Accepted
+
+        def get_selected_columns(self):
+            return list(selected_features)
+
+        def get_filter_settings(self):
+            return {}
+
+    captured_kwargs = {}
+    pca_metadata = {
+        'feature_representation': 'principal_components',
+        'use_pca': True,
+        'pca_selection_mode': 'variance',
+        'pca_requested_variance': 0.90,
+        'pca_requested_n_components': None,
+        'pca_n_components_retained': 2,
+        'pca_variance_retained': 0.934,
+        'pca_input_feature_count': 3,
+    }
+
+    def fake_run_core(cluster_kwargs, cluster_method):
+        captured_kwargs.update(cluster_kwargs)
+        assert cluster_method == 'leiden'
+        result = cluster_kwargs['features_df'].copy()
+        result['cluster'] = np.resize(np.array([1, 2, 3], dtype=int), len(result))
+        result.attrs['pca_metadata'] = pca_metadata
+        return result
+
+    captured_log = {}
+
+    class FakeLogger:
+        def log_clustering(self, **kwargs):
+            captured_log.update(kwargs)
+
+    def fail_critical(_parent, _title, message):
+        raise AssertionError(message)
+
+    monkeypatch.setattr(feature_selector_module, 'FeatureSelectorDialog', FakeFeatureSelector)
+    monkeypatch.setattr(dialog, '_run_core_cluster_with_progress', fake_run_core)
+    monkeypatch.setattr(dialog, '_create_heatmap', lambda: None)
+    monkeypatch.setattr(clustering_module, 'get_logger', lambda: FakeLogger())
+    monkeypatch.setattr(QtWidgets.QMessageBox, 'critical', fail_critical)
+
+    dialog.use_pca_checkbox.setChecked(True)
+    dialog.pca_mode_combo.setCurrentIndex(dialog.pca_mode_combo.findData('variance'))
+    dialog.pca_variance_spinbox.setValue(90.0)
+    dialog._run_clustering()
+
+    assert captured_kwargs['use_pca'] is True
+    assert captured_kwargs['pca_mode'] == 'variance'
+    assert captured_kwargs['pca_variance'] == pytest.approx(0.90)
+    assert captured_kwargs['columns'] == selected_features
+    assert dialog.selected_display_features == selected_features
+
+    params = captured_log['parameters']
+    assert params['feature_representation'] == 'principal_components'
+    assert params['pca_selection_mode'] == 'variance'
+    assert params['pca_requested_variance'] == pytest.approx(0.90)
+    assert params['pca_n_components_retained'] == 2
+    assert params['pca_variance_retained'] == pytest.approx(0.934)
+    assert params['pca_input_feature_count'] == 3
+    assert captured_log['features_used'] == selected_features
+    assert dialog.last_clustering_params['pca_n_components_retained'] == 2
+
+
 def _build_simple_spatial_dialog(qtbot, n_clusters: int = 14) -> SimpleSpatialAnalysisDialog:
     df = _build_spatial_dataframe(n_clusters=n_clusters)
     dialog = SimpleSpatialAnalysisDialog(df, clustered_cells_dataframe=df.copy())

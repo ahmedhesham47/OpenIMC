@@ -167,6 +167,10 @@ clustering:
   method: "leiden"                # Options: "leiden", "hierarchical", "hdbscan"
   columns: null                    # Optional: list of feature columns, auto-detected if not specified
   scaling: "zscore"               # Options: "none", "zscore", "mad"
+  use_pca: false                   # Cluster on principal components instead of selected features
+  pca_mode: "variance"             # Options: "variance", "components"
+  pca_variance: 0.95               # Retained variance when pca_mode is "variance"
+  pca_n_components: null           # Number of PCs when pca_mode is "components"
   
   # Leiden parameters
   resolution: 1.0

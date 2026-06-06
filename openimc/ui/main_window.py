@@ -10667,6 +10667,16 @@ class MainWindow(QtWidgets.QMainWindow):
         
         if hasattr(dlg, 'seed_spinbox'):
             ui_state["seed"] = dlg.seed_spinbox.value()
+
+        # PCA feature representation
+        if hasattr(dlg, 'use_pca_checkbox'):
+            ui_state["use_pca"] = dlg.use_pca_checkbox.isChecked()
+        if hasattr(dlg, 'pca_mode_combo'):
+            ui_state["pca_mode"] = dlg.pca_mode_combo.currentData() or dlg.pca_mode_combo.currentText()
+        if hasattr(dlg, 'pca_variance_spinbox'):
+            ui_state["pca_variance_percent"] = dlg.pca_variance_spinbox.value()
+        if hasattr(dlg, 'pca_n_components_spinbox'):
+            ui_state["pca_n_components"] = dlg.pca_n_components_spinbox.value()
         
         # Hierarchical clustering
         if hasattr(dlg, 'hierarchical_method'):
@@ -11707,12 +11717,10 @@ class MainWindow(QtWidgets.QMainWindow):
             
             # Restore clustering method and parameters (for reference)
             if "clustering_method" in state:
-                if hasattr(dialog, 'last_clustering_method'):
-                    dialog.last_clustering_method = state["clustering_method"]
+                dialog.last_clustering_method = state["clustering_method"]
             
             if "clustering_parameters" in state:
-                if hasattr(dialog, 'last_clustering_params'):
-                    dialog.last_clustering_params = state["clustering_parameters"]
+                dialog.last_clustering_params = state["clustering_parameters"]
             
             if "features_used" in state:
                 # Initialize attribute if it doesn't exist
@@ -11823,6 +11831,27 @@ class MainWindow(QtWidgets.QMainWindow):
                 
                 if "seed" in ui_state and hasattr(dialog, 'seed_spinbox'):
                     dialog.seed_spinbox.setValue(ui_state["seed"])
+
+                # PCA feature representation
+                if "use_pca" in ui_state and hasattr(dialog, 'use_pca_checkbox'):
+                    dialog.use_pca_checkbox.setChecked(bool(ui_state["use_pca"]))
+
+                if "pca_mode" in ui_state and hasattr(dialog, 'pca_mode_combo'):
+                    mode = ui_state["pca_mode"]
+                    index = dialog.pca_mode_combo.findData(mode)
+                    if index < 0:
+                        index = dialog.pca_mode_combo.findText(str(mode))
+                    if index >= 0:
+                        dialog.pca_mode_combo.setCurrentIndex(index)
+
+                if "pca_variance_percent" in ui_state and hasattr(dialog, 'pca_variance_spinbox'):
+                    dialog.pca_variance_spinbox.setValue(float(ui_state["pca_variance_percent"]))
+
+                if "pca_n_components" in ui_state and hasattr(dialog, 'pca_n_components_spinbox'):
+                    dialog.pca_n_components_spinbox.setValue(int(ui_state["pca_n_components"]))
+
+                if hasattr(dialog, '_on_pca_controls_changed'):
+                    dialog._on_pca_controls_changed()
                 
                 # Hierarchical clustering
                 if "hierarchical_method" in ui_state and hasattr(dialog, 'hierarchical_method'):

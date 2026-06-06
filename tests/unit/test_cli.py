@@ -235,3 +235,90 @@ def test_cli_module_import_defers_optional_segmentation_backends(monkeypatch):
     assert cli_module._HAVE_CELLPOSE is False
     assert cli_module._HAVE_CELLSAM is False
     assert attempted_imports == []
+
+
+def test_cluster_command_passes_pca_options(tmp_path, monkeypatch):
+    features_path = tmp_path / "features.csv"
+    output_path = tmp_path / "clustered.csv"
+    pd.DataFrame(
+        {
+            "marker_1_mean": [0.1, 0.2, 1.0, 1.1],
+            "marker_2_mean": [0.0, 0.1, 0.9, 1.0],
+        }
+    ).to_csv(features_path, index=False)
+
+    captured = {}
+
+    def fake_cluster(**kwargs):
+        captured.update(kwargs)
+        result = kwargs["features_df"].copy()
+        result["cluster"] = [1, 1, 2, 2]
+        return result
+
+    monkeypatch.setattr(cli_module, "cluster", fake_cluster)
+    args = SimpleNamespace(
+        features=str(features_path),
+        output=str(output_path),
+        method="kmeans",
+        columns="marker_1_mean,marker_2_mean",
+        scaling="zscore",
+        n_clusters=2,
+        linkage="ward",
+        resolution=1.0,
+        seed=123,
+        n_neighbors=15,
+        metric="euclidean",
+        use_jaccard=False,
+        n_init=10,
+        min_cluster_size=10,
+        min_samples=5,
+        cluster_selection_method="eom",
+        hdbscan_metric="euclidean",
+        use_pca=True,
+        pca_mode="components",
+        pca_variance=0.95,
+        pca_n_components=2,
+    )
+
+    cli_module.cluster_command(args)
+
+    assert captured["use_pca"] is True
+    assert captured["pca_mode"] == "components"
+    assert captured["pca_variance"] == pytest.approx(0.95)
+    assert captured["pca_n_components"] == 2
+    assert captured["columns"] == ["marker_1_mean", "marker_2_mean"]
+
+
+def test_workflow_clustering_passes_pca_config(tmp_path, monkeypatch):
+    features_path = tmp_path / "features.csv"
+    output_dir = tmp_path / "workflow_output"
+    config_path = tmp_path / "workflow.yaml"
+    pd.DataFrame({"marker_mean": [0.1, 0.2, 1.0]}).to_csv(features_path, index=False)
+    config_path.write_text(
+        f"output: {output_dir}\n"
+        "clustering:\n"
+        "  enabled: true\n"
+        f"  input_features: {features_path}\n"
+        "  method: kmeans\n"
+        "  n_clusters: 2\n"
+        "  use_pca: true\n"
+        "  pca_mode: components\n"
+        "  pca_n_components: 2\n"
+    )
+
+    captured = {}
+
+    def fake_cluster_command(args):
+        captured.update(vars(args))
+
+    monkeypatch.setattr(cli_module, "cluster_command", fake_cluster_command)
+    args = SimpleNamespace(config=str(config_path), output_dir=str(output_dir))
+
+    cli_module.workflow_command(args)
+
+    assert captured["use_pca"] is True
+    assert captured["pca_mode"] == "components"
+    assert captured["pca_variance"] == pytest.approx(0.95)
+    assert captured["pca_n_components"] == 2
+    assert captured["n_neighbors"] == 15
+    assert captured["hdbscan_metric"] == "euclidean"
