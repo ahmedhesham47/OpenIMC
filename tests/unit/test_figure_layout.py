@@ -98,6 +98,38 @@ def test_fit_canvas_and_draw_syncs_figure_size_and_keeps_heatmap_labels_visible(
     assert max(overflow.values()) <= 0.02
 
 
+
+def test_text_compaction_keeps_xy_and_colorbar_fonts_synchronized():
+    fig = Figure(figsize=(4.0, 3.0))
+    ax = fig.subplots()
+
+    image = ax.imshow(np.arange(25, dtype=float).reshape(5, 5), cmap='viridis')
+    ax.set_xlabel('X (um)', fontsize=10)
+    ax.set_ylabel('Y (um)', fontsize=10)
+    ax.tick_params(axis='both', labelsize=10)
+    colorbar = fig.colorbar(image, ax=ax)
+    colorbar.set_label('Marker intensity', fontsize=10)
+    colorbar.ax.tick_params(labelsize=10)
+
+    figure_layout._shrink_text(
+        fig,
+        {'left': 0.0, 'right': 0.0, 'top': 0.0, 'bottom': 0.08},
+    )
+
+    font_sizes = [
+        ax.xaxis.label.get_fontsize(),
+        ax.yaxis.label.get_fontsize(),
+        colorbar.ax.yaxis.label.get_fontsize(),
+        *[tick.get_fontsize() for tick in ax.get_xticklabels()],
+        *[tick.get_fontsize() for tick in ax.get_yticklabels()],
+        *[tick.get_fontsize() for tick in colorbar.ax.get_yticklabels()],
+    ]
+    rounded_sizes = {round(size, 6) for size in font_sizes}
+
+    assert rounded_sizes == {round(font_sizes[0], 6)}
+    assert font_sizes[0] < 10.0
+
+
 def test_sync_figure_to_canvas_accounts_for_hidpi_device_ratio():
     fig = Figure(figsize=(3.0, 2.4), dpi=100.0)
     canvas = _FakeCanvas(720, 520, device_pixel_ratio=2.0)

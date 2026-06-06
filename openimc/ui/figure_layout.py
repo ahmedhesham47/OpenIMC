@@ -201,7 +201,13 @@ def _shrink_text(figure: Figure, overflow: Dict[str, float]) -> None:
         return
 
     factor = 1.0 - min(0.18, max_overflow * 2.0)
-    for text in _iter_axis_text(figure, horizontal=horizontal, vertical=vertical):
+    # Keep paired axes and colorbars on one font scale when compaction is needed.
+    shrink_all_axis_text = horizontal or vertical
+    for text in _iter_axis_text(
+        figure,
+        horizontal=shrink_all_axis_text,
+        vertical=shrink_all_axis_text,
+    ):
         if text is None or not text.get_visible():
             continue
         try:
